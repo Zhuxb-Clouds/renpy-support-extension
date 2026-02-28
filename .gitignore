@@ -30,3 +30,4 @@ build
 .coverage
 /test_samples/
 /.vscode/
+*.vsix
