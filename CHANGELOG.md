@@ -1,5 +1,22 @@
 # Changelog
 
+## [1.0.2] - 2026-02-28
+
+### Added
+
+- Chinese documentation (README.zh-CN.md)
+
+### Fixed
+
+- Improved audio file path resolution
+
+## [1.0.1] - 2026-02-28
+
+### Fixed
+
+- Updated extension icon
+- Improved Python interpreter auto-detection
+
 ## [1.0.0] - 2026-02-28
 
 ### Added
