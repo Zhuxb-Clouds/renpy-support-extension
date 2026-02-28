@@ -1,6 +1,6 @@
 {
   "name": "renpy-support-extension",
-  "publisher": "zhucb-clouds",
+  "publisher": "zhuxb-clouds",
   "displayName": "Ren'Py Language Support",
   "version": "1.0.0",
   "description": "Language support for Ren'Py script files (.rpy)",
@@ -142,7 +142,7 @@
       "[renpy]": {
         "editor.tabSize": 4,
         "editor.insertSpaces": true,
-        "editor.defaultFormatter": "zhucb-clouds.renpy-support-extension"
+        "editor.defaultFormatter": "zhuxb-clouds.renpy-support-extension"
       }
     },
     "menus": {
@@ -179,7 +179,7 @@
     "language server",
     "formatter"
   ],
-  "author": "Zhucb-Clouds",
+  "author": "Zhuxb-Clouds",
   "license": "ISC",
   "repository": {
     "type": "git",
