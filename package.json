@@ -1,0 +1,213 @@
+{
+  "name": "renpy-support-extension",
+  "publisher": "zhucb-clouds",
+  "displayName": "Ren'Py Language Support",
+  "version": "1.0.0",
+  "description": "Language support for Ren'Py script files (.rpy)",
+  "icon": "icons/renpy.png",
+  "main": "./dist/extension.js",
+  "engines": {
+    "vscode": "^1.74.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Formatters"
+  ],
+  "activationEvents": [
+    "workspaceContains:**/*.rpy"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "renpy",
+        "aliases": [
+          "Ren'Py",
+          "renpy"
+        ],
+        "extensions": [
+          ".rpy",
+          ".rpym"
+        ],
+        "configuration": "./language-configuration.json",
+        "icon": {
+          "light": "./icons/renpy.svg",
+          "dark": "./icons/renpy.svg"
+        }
+      }
+    ],
+    "grammars": [
+      {
+        "language": "renpy",
+        "scopeName": "source.renpy",
+        "path": "./syntaxes/renpy.tmLanguage.json"
+      },
+      {
+        "scopeName": "source.renpy.screen",
+        "path": "./syntaxes/renpy.screen.tmLanguage.json"
+      },
+      {
+        "scopeName": "source.renpy.style",
+        "path": "./syntaxes/renpy.style.tmLanguage.json"
+      },
+      {
+        "scopeName": "source.renpy.atl",
+        "path": "./syntaxes/renpy.atl.tmLanguage.json"
+      },
+      {
+        "scopeName": "source.renpy.test",
+        "path": "./syntaxes/renpy.test.tmLanguage.json"
+      },
+      {
+        "scopeName": "source.renpy.python",
+        "path": "./syntaxes/renpy.python.tmLanguage.json"
+      },
+      {
+        "scopeName": "renpy.comment.injection",
+        "path": "./syntaxes/renpy.injection.json",
+        "injectTo": [
+          "source.python"
+        ],
+        "embeddedLanguages": {
+          "meta.embedded.renpy": "renpy"
+        }
+      },
+      {
+        "scopeName": "markdown.renpy.codeblock",
+        "path": "./syntaxes/renpy.markdown.json",
+        "injectTo": [
+          "text.html.markdown"
+        ],
+        "embeddedLanguages": {
+          "meta.embedded.renpy": "renpy"
+        }
+      },
+      {
+        "scopeName": "text.log.injection",
+        "path": "./syntaxes/log.injection.json",
+        "injectTo": [
+          "text.log"
+        ]
+      }
+    ],
+    "commands": [
+      {
+        "command": "renpy-lsp.startServer",
+        "title": "Start Language Server",
+        "category": "Ren'Py LSP"
+      },
+      {
+        "command": "renpy-lsp.stopServer",
+        "title": "Stop Language Server",
+        "category": "Ren'Py LSP"
+      },
+      {
+        "command": "renpy-lsp.restartServer",
+        "title": "Restart Language Server",
+        "category": "Ren'Py LSP"
+      },
+      {
+        "command": "renpy-lsp.formatAllFiles",
+        "title": "Format All Ren'Py Files",
+        "category": "Ren'Py LSP"
+      }
+    ],
+    "configuration": {
+      "title": "Ren'Py LSP",
+      "properties": {
+        "renpy-lsp.pythonPath": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Absolute path to the Python 3 interpreter used to run the language server. Leave empty to auto-detect (tries `.venv/bin/python3`, then system `python3`)."
+        },
+        "renpy-lsp.formatting.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable the built-in Ren'Py document formatter."
+        },
+        "renpy-lsp.formatting.indentSize": {
+          "type": "number",
+          "default": 4,
+          "minimum": 1,
+          "maximum": 8,
+          "description": "Number of spaces per indentation level when formatting."
+        },
+        "renpy-lsp.diagnostics.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable diagnostics (warnings, errors) for Ren'Py files."
+        }
+      }
+    },
+    "configurationDefaults": {
+      "[renpy]": {
+        "editor.tabSize": 4,
+        "editor.insertSpaces": true,
+        "editor.defaultFormatter": "zhucb-clouds.renpy-support-extension"
+      }
+    },
+    "menus": {
+      "command-palette": [
+        {
+          "command": "renpy-lsp.startServer"
+        },
+        {
+          "command": "renpy-lsp.stopServer"
+        },
+        {
+          "command": "renpy-lsp.restartServer"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run package",
+    "compile": "webpack",
+    "watch": "webpack --watch",
+    "package": "webpack --mode production --devtool hidden-source-map",
+    "compile-tests": "tsc -p . --outDir out",
+    "watch-tests": "tsc -p . -w --outDir out",
+    "pretest": "npm run compile-tests && npm run compile && npm run lint",
+    "lint": "eslint src --ext ts",
+    "format-check": "prettier --check 'src/**/*.ts' 'build/**/*.yml' '.github/**/*.yml'",
+    "test": "node ./out/test/runTest.js"
+  },
+  "keywords": [
+    "renpy",
+    "ren'py",
+    "visual novel",
+    "rpy",
+    "language server",
+    "formatter"
+  ],
+  "author": "Zhucb-Clouds",
+  "license": "ISC",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Zhuxb-Clouds/renpy-support-extension"
+  },
+  "bugs": {
+    "url": "https://github.com/Zhuxb-Clouds/renpy-support-extension/issues"
+  },
+  "homepage": "https://github.com/Zhuxb-Clouds/renpy-support-extension#readme",
+  "dependencies": {
+    "fs-extra": "^11.2.0",
+    "vscode-languageclient": "^8.1.0"
+  },
+  "devDependencies": {
+    "@types/fs-extra": "^11.0.4",
+    "@types/glob": "^8.1.0",
+    "@types/node": "16.x",
+    "@types/vscode": "^1.74.0",
+    "@typescript-eslint/eslint-plugin": "^7.4.0",
+    "@typescript-eslint/parser": "^7.4.0",
+    "@vscode/test-electron": "^2.3.9",
+    "@vscode/vsce": "^2.24.0",
+    "eslint": "^8.57.0",
+    "glob": "^10.3.12",
+    "prettier": "^3.2.5",
+    "ts-loader": "^9.5.1",
+    "typescript": "^5.4.3",
+    "webpack": "^5.91.0",
+    "webpack-cli": "^5.1.4"
+  }
+}

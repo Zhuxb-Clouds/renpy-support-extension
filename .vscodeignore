@@ -1,0 +1,46 @@
+# Source & config (webpack already bundles to dist/)
+src/**
+.vscode/**
+.github/**
+
+# Build tooling
+node_modules/**
+webpack.config.js
+tsconfig.json
+.eslintrc*
+.prettierrc*
+
+# Python dev files
+.venv/**
+__pycache__/**
+**/__pycache__/**
+**/*.pyc
+**/*.pyo
+pyproject.toml
+requirements.txt
+uv.lock
+.python-version
+
+# Package manager lock files
+pnpm-lock.yaml
+package-lock.json
+yarn.lock
+
+# Test & sample files
+test_samples/**
+out/**
+
+# Logs & temp files
+*.log
+*.bak
+*.tmp
+*.swp
+
+# Git & IDE
+.git/**
+.gitignore
+.idea/**
+*.sublime-*
+
+# Misc
+THIRD_PARTY_LICENSES.md

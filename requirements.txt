@@ -1,0 +1,5 @@
+attrs==25.4.0
+cattrs==25.3.0
+lsprotocol==2025.0.0
+pygls==2.0.0
+typing-extensions==4.15.0
