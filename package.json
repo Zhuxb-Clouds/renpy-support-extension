@@ -170,7 +170,8 @@
     "pretest": "npm run compile-tests && npm run compile && npm run lint",
     "lint": "eslint src --ext ts",
     "format-check": "prettier --check 'src/**/*.ts' 'build/**/*.yml' '.github/**/*.yml'",
-    "test": "node ./out/test/runTest.js"
+    "test": "node ./out/test/runTest.js",
+    "vsix": "npm run package && npx @vscode/vsce package --no-dependencies"
   },
   "keywords": [
     "renpy",
