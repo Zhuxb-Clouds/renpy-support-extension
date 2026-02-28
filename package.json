@@ -2,7 +2,7 @@
   "name": "renpy-support-extension",
   "publisher": "zhuxb-clouds",
   "displayName": "Ren'Py Language Support",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Language support for Ren'Py script files (.rpy)",
   "icon": "icons/renpy.png",
   "main": "./dist/extension.js",
