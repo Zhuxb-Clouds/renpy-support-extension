@@ -721,6 +721,29 @@ class RpyParser:
             kids.extend(node.body)
         return kids
 
+    @staticmethod
+    def _strip_trailing_comment(content: str) -> str:
+        """Remove trailing # or ## comments that are not inside quotes."""
+        in_single = False
+        in_double = False
+        i = 0
+        while i < len(content):
+            ch = content[i]
+            # Handle escape sequences
+            if ch == "\\" and i + 1 < len(content):
+                i += 2
+                continue
+            # Toggle quote state
+            if ch == "'" and not in_double:
+                in_single = not in_single
+            elif ch == '"' and not in_single:
+                in_double = not in_double
+            # Found comment outside quotes
+            elif ch == "#" and not in_single and not in_double:
+                return content[:i].rstrip()
+            i += 1
+        return content
+
     def _parse_line(self, content: str, lineno: int, indent: int):
         """Classify a single stripped line and return a Node (or a tuple sentinel for elif/else)."""
 
@@ -732,6 +755,9 @@ class RpyParser:
                 indent=indent,
                 text=content[1:].strip(),
             )
+
+        # ── Strip trailing comments (not inside quotes) ──
+        content = self._strip_trailing_comment(content)
 
         # ── Label ──
         m = _RE_LABEL.match(content)

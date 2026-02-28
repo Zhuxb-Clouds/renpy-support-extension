@@ -858,7 +858,7 @@ def _resolve_node_definition(
             return _make_file_location(resolved)
         return None
 
-    # ── Play / Queue → audio file ──
+    # ── Play / Queue → audio file or audio define ──
     if isinstance(node, PlayMusic):
         filename = node.filename.strip()
         if filename:
@@ -870,6 +870,10 @@ def _resolve_node_definition(
         # Try the raw text after channel as a define name
         if filename in all_defines:
             return [_make_node_location(u, d) for u, d in all_defines[filename]]
+        # Also try with "audio." prefix (common Ren'Py convention)
+        audio_prefixed = f"audio.{filename}"
+        if audio_prefixed in all_defines:
+            return [_make_node_location(u, d) for u, d in all_defines[audio_prefixed]]
         return None
 
     if isinstance(node, QueueMusic):
@@ -878,6 +882,14 @@ def _resolve_node_definition(
             resolved = _resolve_renpy_file(filename, source_uri=source_uri)
             if resolved:
                 return _make_file_location(resolved)
+        # filename might be a define name
+        all_defines = _get_all_workspace_defines()
+        if filename in all_defines:
+            return [_make_node_location(u, d) for u, d in all_defines[filename]]
+        # Also try with "audio." prefix
+        audio_prefixed = f"audio.{filename}"
+        if audio_prefixed in all_defines:
+            return [_make_node_location(u, d) for u, d in all_defines[audio_prefixed]]
         return None
 
     # ── ImageDef with expression → try to open the image file ──
