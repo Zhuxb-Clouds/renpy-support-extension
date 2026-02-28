@@ -2,6 +2,7 @@ node_modules
 .venv
 .vscode
 dist
+bundled/libs
 sample
 *.log
 **/__pycache__/

@@ -26,11 +26,35 @@ function findExecutable(candidates: string[]): string | undefined {
   return undefined;
 }
 
+/** Try to obtain the Python path from the official VS Code Python extension. */
+async function getPythonFromVSCodeExtension(): Promise<string | undefined> {
+  try {
+    const pythonExt = vscode.extensions.getExtension("ms-python.python");
+    if (!pythonExt) {
+      return undefined;
+    }
+    if (!pythonExt.isActive) {
+      await pythonExt.activate();
+    }
+    // The Python extension exposes an API with `environments.getActiveEnvironmentPath`
+    const api = pythonExt.exports;
+    const envPath = api?.environments?.getActiveEnvironmentPath?.();
+    if (envPath?.path && fs.existsSync(envPath.path)) {
+      console.log(`Ren'Py LSP: detected Python from VS Code Python extension: "${envPath.path}"`);
+      return envPath.path;
+    }
+  } catch (err) {
+    console.warn("Ren'Py LSP: failed to query VS Code Python extension:", err);
+  }
+  return undefined;
+}
+
 /** Resolve the Python interpreter path using configuration + auto-detect. */
-function resolvePythonPath(extensionPath: string): string | undefined {
+async function resolvePythonPath(extensionPath: string): Promise<string | undefined> {
   const cfg = vscode.workspace.getConfiguration("renpy-lsp");
   const explicit: string = cfg.get<string>("pythonPath", "").trim();
 
+  // 1. User-configured path
   if (explicit) {
     if (fs.existsSync(explicit)) {
       return explicit;
@@ -40,7 +64,13 @@ function resolvePythonPath(extensionPath: string): string | undefined {
     );
   }
 
-  // Auto-detect: extension-local venv → workspace venvs → system
+  // 2. VS Code Python extension's active interpreter
+  const fromVSCode = await getPythonFromVSCodeExtension();
+  if (fromVSCode) {
+    return fromVSCode;
+  }
+
+  // 3. Extension-local venv → workspace venvs
   const workspaceFolders = vscode.workspace.workspaceFolders ?? [];
   const candidates: string[] = [
     path.join(extensionPath, ".venv", "bin", "python3"),
@@ -58,7 +88,7 @@ function resolvePythonPath(extensionPath: string): string | undefined {
     return detected;
   }
 
-  // Last resort: bare "python3" (resolved by PATH at spawn time)
+  // 4. Last resort: bare "python3" (resolved by PATH at spawn time)
   return "python3";
 }
 
@@ -209,7 +239,7 @@ async function formatAllRpyFiles() {
 
 // ─── Server lifecycle ──────────────────────────────────────────────────
 
-function startLanguageServer(context: vscode.ExtensionContext) {
+async function startLanguageServer(context: vscode.ExtensionContext) {
   if (client) {
     console.log("Language server is already running");
     return;
@@ -223,11 +253,19 @@ function startLanguageServer(context: vscode.ExtensionContext) {
     return;
   }
 
-  const pythonPath = resolvePythonPath(context.extensionPath);
+  const pythonPath = await resolvePythonPath(context.extensionPath);
   if (!pythonPath) {
-    vscode.window.showErrorMessage(
-      "Ren'Py LSP: could not locate a Python 3 interpreter. Set renpy-lsp.pythonPath in settings.",
+    const choice = await vscode.window.showErrorMessage(
+      "Ren'Py LSP: could not locate a Python 3 interpreter. " +
+        "Please install Python 3.11+ or set the path manually.",
+      "Open Settings",
+      "Install Python Extension",
     );
+    if (choice === "Open Settings") {
+      vscode.commands.executeCommand("workbench.action.openSettings", "renpy-lsp.pythonPath");
+    } else if (choice === "Install Python Extension") {
+      vscode.commands.executeCommand("workbench.extensions.installExtension", "ms-python.python");
+    }
     return;
   }
   console.log(`Ren'Py LSP: using Python interpreter "${pythonPath}"`);

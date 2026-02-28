@@ -7,7 +7,13 @@ import os
 import re
 
 # Ensure the bundled/tools directory is on sys.path so we can import ast_parser.
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _TOOLS_DIR)
+
+# Ensure bundled third-party libraries (pygls, lsprotocol, …) are importable.
+_LIBS_DIR = os.path.join(os.path.dirname(_TOOLS_DIR), "libs")
+if os.path.isdir(_LIBS_DIR):
+    sys.path.insert(0, _LIBS_DIR)
 
 from lsprotocol import types
 from pygls.lsp.server import LanguageServer
