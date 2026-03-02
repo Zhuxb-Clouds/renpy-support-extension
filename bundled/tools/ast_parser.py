@@ -434,12 +434,15 @@ _RE_SHOW_SCREEN = re.compile(
     r"^show\s+screen\s+([\w\u4e00-\u9fff\u3400-\u4dbf]+)\s*(?:\((.*)\))?\s*$"
 )
 
-_RE_SCENE = re.compile(r"^scene\s+(.+?)(?:\s+at\s+(.+?))?(?:\s+with\s+(\w+))?\s*:?\s*$")
-_RE_SHOW = re.compile(
-    r"^show\s+(.+?)(?:\s+at\s+(.+?))?(?:\s+with\s+(\w+))?(?:\s+behind\s+(\w+))?\s*:?\s*$"
+_RE_SCENE = re.compile(
+    r"^scene\s+(.+?)(?:\s+at\s+(.+?))?(?:\s+with\s+(\w+(?:\([^)]*\))?))?\s*:?\s*$"
 )
-_RE_HIDE = re.compile(r"^hide\s+(.+?)(?:\s+with\s+(\w+))?\s*:?\s*$")
-_RE_WITH = re.compile(r"^with\s+(\w+)$")
+_RE_SCENE_BARE = re.compile(r"^scene\s*:?\s*$")
+_RE_SHOW = re.compile(
+    r"^show\s+(.+?)(?:\s+at\s+(.+?))?(?:\s+with\s+(\w+(?:\([^)]*\))?))?(?:\s+behind\s+(\w+))?\s*:?\s*$"
+)
+_RE_HIDE = re.compile(r"^hide\s+(.+?)(?:\s+with\s+(\w+(?:\([^)]*\))?))?\s*:?\s*$")
+_RE_WITH = re.compile(r"^with\s+(.+)$")
 
 _RE_PLAY = re.compile(
     r"^play\s+(\w+)\s+(?:[\"']([^\"']+)[\"']|([a-zA-Z_\u4e00-\u9fff\u3400-\u4dbf]\w*))(.*)$"
@@ -471,7 +474,7 @@ _RE_NARRATOR = re.compile(r'^"(.*)"(?:\s+with\s+\w+)?$')
 
 # window / pause
 _RE_WINDOW = re.compile(r"^window\s+(show|hide|auto)$")
-_RE_PAUSE = re.compile(r"^pause(?:\s+(.+))?$")
+_RE_PAUSE = re.compile(r"^pause(?:\s*\((.+?)\)|\s+(.+))?$")
 
 
 # ──────────────────────────── Parser ─────────────────────────────────────
@@ -578,6 +581,30 @@ class RpyParser:
                 _continuation_start = lineno
                 _continuation_indent = indent
                 continue
+
+            # ── Check for unclosed double-quoted strings (multi-line continuation) ──
+            # If the line has an odd number of double quotes and is not a comment,
+            # it's an unclosed string that continues on the next line(s).
+            if not content.startswith("#"):
+                _qcount = content.count('"')
+                if _qcount % 2 == 1:
+                    _str_lines = [content]
+                    _str_start = lineno
+                    _str_indent = indent
+                    while self.pos < len(self.lines):
+                        nxt_raw = self.lines[self.pos]
+                        self.pos += 1
+                        nxt = nxt_raw.strip()
+                        if not nxt:
+                            _str_lines.append("")
+                            continue
+                        _str_lines.append(nxt)
+                        _qcount += nxt.count('"')
+                        if _qcount % 2 == 0:
+                            break
+                    content = " ".join(ln for ln in _str_lines if ln)
+                    lineno = _str_start
+                    indent = _str_indent
 
             # ── Pop stack to correct parent level ──
             while len(stack) > 1 and indent <= stack[-1].indent:
@@ -999,6 +1026,16 @@ class RpyParser:
             return Pass(lineno=lineno, end_lineno=lineno, indent=indent)
 
         # ── Visual: scene / show / hide / with ──
+        m = _RE_SCENE_BARE.match(content)
+        if m:
+            return Scene(
+                lineno=lineno,
+                end_lineno=lineno,
+                indent=indent,
+                image="",
+                has_block=content.rstrip().endswith(":"),
+            )
+
         m = _RE_SCENE.match(content)
         if m:
             return Scene(
@@ -1115,7 +1152,7 @@ class RpyParser:
                 lineno=lineno,
                 end_lineno=lineno,
                 indent=indent,
-                duration=m.group(1),
+                duration=m.group(1) or m.group(2),
             )
 
         # ── Say dialogue ──

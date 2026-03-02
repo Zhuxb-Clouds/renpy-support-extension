@@ -70,6 +70,25 @@ LSP_SERVER = LanguageServer(
     name="renpy-server", version="1.0.0", max_workers=MAX_WORKERS
 )
 
+# Suppress noisy "Cancel notification for unknown message id" warnings.
+# These occur normally when VS Code cancels requests the server already finished.
+import logging as _logging
+
+_logging.getLogger("pygls.protocol.json_rpc").setLevel(_logging.ERROR)
+
+# ── Server logger (prints to stderr, which VS Code captures in the Output channel) ──
+import time as _time
+
+_log = _logging.getLogger("renpy-lsp")
+_log.setLevel(_logging.DEBUG)
+_handler = _logging.StreamHandler(sys.stderr)
+_handler.setFormatter(
+    _logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
+)
+_log.addHandler(_handler)
+
+_log.info("Ren'Py LSP server module loaded")
+
 
 # ─────────────────────── Cache / Index ───────────────────────────────────
 
@@ -83,11 +102,26 @@ def _get_parse(uri: str, source: Optional[str] = None) -> Tuple[Script, RpyParse
     text = source if source is not None else doc.source
     cached = _parse_cache.get(uri)
     if cached and cached[0] == text:
+        _log.debug("_get_parse: cache hit for %s", _short_uri(uri))
         return cached[1], cached[2]
+    _log.info("_get_parse: parsing %s (%d chars)", _short_uri(uri), len(text))
+    t0 = _time.monotonic()
     parser = RpyParser(text)
     ast = parser.parse()
+    elapsed = (_time.monotonic() - t0) * 1000
+    _log.info(
+        "_get_parse: parsed %s in %.1f ms (%d top-level nodes)",
+        _short_uri(uri),
+        elapsed,
+        len(ast.body),
+    )
     _parse_cache[uri] = (text, ast, parser)
     return ast, parser
+
+
+def _short_uri(uri: str) -> str:
+    """Return a short display name for a URI (just the filename)."""
+    return os.path.basename(_path_from_uri(uri))
 
 
 def _uri_from_path(path: str) -> str:
@@ -114,6 +148,7 @@ def _get_workspace_rpy_files() -> List[str]:
                 if abs_fp not in seen:
                     seen.add(abs_fp)
                     results.append(abs_fp)
+    _log.debug("_get_workspace_rpy_files: found %d file(s)", len(results))
     return results
 
 
@@ -553,6 +588,8 @@ def _dedup_locations(locations: List[types.Location]) -> List[types.Location]:
 
 def _publish_diagnostics(uri: str):
     """Parse the document and push diagnostics."""
+    _log.info("_publish_diagnostics: %s", _short_uri(uri))
+    t0 = _time.monotonic()
     ast, parser = _get_parse(uri)
     diags: List[types.Diagnostic] = []
 
@@ -572,6 +609,11 @@ def _publish_diagnostics(uri: str):
 
     # 2) Check jump/call targets exist across the whole workspace.
     all_labels = _get_all_workspace_labels()
+    # Also include labels from the current document (covers the case where
+    # the file is outside the workspace folders or URI format differs).
+    for lb in parser.get_all_labels():
+        if lb.name not in all_labels:
+            all_labels[lb.name] = [(uri, lb)]
     for j in parser.get_all_jumps():
         if not j.is_expression and j.target not in all_labels:
             diags.append(
@@ -703,6 +745,16 @@ def _publish_diagnostics(uri: str):
             if not c.is_expression:
                 all_call_targets.add(c.target)
 
+    # Also include the current document's targets — covers the case where
+    # the file is opened outside of a workspace folder or the workspace
+    # scanner hasn't discovered it yet.
+    for j in parser.get_all_jumps():
+        if not j.is_expression:
+            all_jump_targets.add(j.target)
+    for c in parser.get_all_calls():
+        if not c.is_expression:
+            all_call_targets.add(c.target)
+
     all_used_labels = all_jump_targets | all_call_targets
     # Special labels that are entry points (never directly called)
     ENTRY_LABELS = {"start", "main_menu", "splashscreen", "after_load", "quit"}
@@ -725,6 +777,13 @@ def _publish_diagnostics(uri: str):
                 )
             )
 
+    elapsed = (_time.monotonic() - t0) * 1000
+    _log.info(
+        "_publish_diagnostics: %s → %d diagnostic(s) in %.1f ms",
+        _short_uri(uri),
+        len(diags),
+        elapsed,
+    )
     LSP_SERVER.text_document_publish_diagnostics(
         types.PublishDiagnosticsParams(uri=uri, diagnostics=diags)
     )
@@ -735,17 +794,20 @@ def _publish_diagnostics(uri: str):
 
 @LSP_SERVER.feature(types.TEXT_DOCUMENT_DID_OPEN)
 def did_open(ls: LanguageServer, params: types.DidOpenTextDocumentParams):
+    _log.info("didOpen: %s", _short_uri(params.text_document.uri))
     _publish_diagnostics(params.text_document.uri)
 
 
 @LSP_SERVER.feature(types.TEXT_DOCUMENT_DID_CHANGE)
 def did_change(ls: LanguageServer, params: types.DidChangeTextDocumentParams):
+    _log.debug("didChange: %s", _short_uri(params.text_document.uri))
     _publish_diagnostics(params.text_document.uri)
 
 
 @LSP_SERVER.feature(types.TEXT_DOCUMENT_DID_CLOSE)
 def did_close(ls: LanguageServer, params: types.DidCloseTextDocumentParams):
     uri = params.text_document.uri
+    _log.info("didClose: %s", _short_uri(uri))
     _parse_cache.pop(uri, None)
     ls.text_document_publish_diagnostics(
         types.PublishDiagnosticsParams(uri=uri, diagnostics=[])
@@ -759,8 +821,15 @@ def did_close(ls: LanguageServer, params: types.DidCloseTextDocumentParams):
 def document_symbols(
     ls: LanguageServer, params: types.DocumentSymbolParams
 ) -> List[types.DocumentSymbol]:
+    _log.debug("documentSymbol: %s", _short_uri(params.text_document.uri))
     ast, parser = _get_parse(params.text_document.uri)
-    return _build_symbols(ast.body)
+    symbols = _build_symbols(ast.body)
+    _log.debug(
+        "documentSymbol: %s → %d symbol(s)",
+        _short_uri(params.text_document.uri),
+        len(symbols),
+    )
+    return symbols
 
 
 def _build_symbols(nodes: List[Node]) -> List[types.DocumentSymbol]:
@@ -899,9 +968,15 @@ def folding_ranges(
     ls: LanguageServer, params: types.FoldingRangeParams
 ) -> List[types.FoldingRange]:
     """Return folding ranges for block-level constructs."""
+    _log.debug("foldingRange: %s", _short_uri(params.text_document.uri))
     ast, parser = _get_parse(params.text_document.uri)
     ranges: List[types.FoldingRange] = []
     _collect_folding_ranges(ast, ranges)
+    _log.debug(
+        "foldingRange: %s → %d range(s)",
+        _short_uri(params.text_document.uri),
+        len(ranges),
+    )
     return ranges
 
 
@@ -948,6 +1023,13 @@ def goto_definition(
     pos = params.position
     line_text = doc.lines[pos.line] if pos.line < len(doc.lines) else ""
     word = _word_at_position(line_text, pos.character)
+    _log.info(
+        "gotoDefinition: %s L%d C%d word=%r",
+        _short_uri(uri),
+        pos.line + 1,
+        pos.character,
+        word,
+    )
     ast, parser = _get_parse(uri)
 
     # ── 0) If cursor is on a label/screen definition, show all usages ──
@@ -1337,6 +1419,9 @@ def completions(
     pos = params.position
     line_text = doc.lines[pos.line] if pos.line < len(doc.lines) else ""
     line_prefix = line_text[: pos.character].strip()
+    _log.debug(
+        "completion: %s L%d prefix=%r", _short_uri(uri), pos.line + 1, line_prefix[-30:]
+    )
 
     items: List[types.CompletionItem] = []
 
@@ -1414,6 +1499,7 @@ def completions(
                 )
             )
 
+    _log.debug("completion: %s → %d item(s)", _short_uri(uri), len(items))
     return types.CompletionList(is_incomplete=False, items=items)
 
 
@@ -1489,6 +1575,7 @@ def hover(ls: LanguageServer, params: types.HoverParams) -> Optional[types.Hover
         doc.lines[params.position.line] if params.position.line < len(doc.lines) else ""
     )
     word = _word_at_position(line_text, params.position.character)
+    _log.debug("hover: %s L%d word=%r", _short_uri(uri), params.position.line + 1, word)
     if not word:
         return None
 
@@ -1599,6 +1686,11 @@ def _leading_spaces(line: str) -> int:
 
 @LSP_SERVER.feature(types.TEXT_DOCUMENT_FORMATTING)
 def format_document(ls: LanguageServer, params: types.DocumentFormattingParams):
+    _log.info(
+        "formatting: %s (tabSize=%d)",
+        _short_uri(params.text_document.uri),
+        params.options.tab_size,
+    )
     """Re-indent the document using a consistent indent width.
 
     Strategy:
@@ -1667,6 +1759,7 @@ def find_references(
     pos = params.position
     line_text = doc.lines[pos.line] if pos.line < len(doc.lines) else ""
     word = _word_at_position(line_text, pos.character)
+    _log.info("references: %s L%d word=%r", _short_uri(uri), pos.line + 1, word)
     if not word:
         return None
 
@@ -1761,6 +1854,7 @@ def document_color(
     ls: LanguageServer, params: types.DocumentColorParams
 ) -> List[types.ColorInformation]:
     """Return color information for hex color strings in the document."""
+    _log.debug("documentColor: %s", _short_uri(params.text_document.uri))
     doc = ls.workspace.get_text_document(params.text_document.uri)
     colors: List[types.ColorInformation] = []
 
@@ -1873,6 +1967,7 @@ def prepare_rename(
     pos = params.position
     line_text = doc.lines[pos.line] if pos.line < len(doc.lines) else ""
     word = _word_at_position(line_text, pos.character)
+    _log.info("prepareRename: %s L%d word=%r", _short_uri(uri), pos.line + 1, word)
     if not word:
         return None
 
@@ -1922,6 +2017,7 @@ def rename(
     line_text = doc.lines[pos.line] if pos.line < len(doc.lines) else ""
     old_name = _word_at_position(line_text, pos.character)
     new_name = params.new_name
+    _log.info("rename: %s %r → %r", _short_uri(uri), old_name, new_name)
 
     if not old_name or not new_name:
         return None
@@ -2169,13 +2265,19 @@ def _count_words(text: str) -> int:
 def cmd_refresh_workspace() -> Dict[str, object]:
     """Clear parse cache and re-parse all workspace files."""
     global _parse_cache
+    _log.info("command refreshWorkspace: clearing %d cached entries", len(_parse_cache))
     old_count = len(_parse_cache)
     _parse_cache.clear()
 
     # Re-parse all .rpy files
     files = _get_workspace_rpy_files()
+    t0 = _time.monotonic()
     for fp in files:
         _get_parse_for_file(fp)
+    elapsed = (_time.monotonic() - t0) * 1000
+    _log.info(
+        "command refreshWorkspace: re-parsed %d file(s) in %.1f ms", len(files), elapsed
+    )
 
     return {
         "success": True,
@@ -2187,6 +2289,7 @@ def cmd_refresh_workspace() -> Dict[str, object]:
 @LSP_SERVER.command("renpy.showStats")
 def cmd_show_stats() -> Dict[str, object]:
     """Collect and return project statistics."""
+    _log.info("command showStats: collecting statistics")
     files = _get_workspace_rpy_files()
     total_lines = 0
     total_labels = 0
@@ -2242,4 +2345,5 @@ def cmd_show_stats() -> Dict[str, object]:
 # ─────────────────────── Entry Point ─────────────────────────────────────
 
 if __name__ == "__main__":
+    _log.info("Starting Ren'Py LSP server (stdio)…")
     LSP_SERVER.start_io()

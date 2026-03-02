@@ -11,54 +11,86 @@ import {
 let client: LanguageClient | undefined;
 let extensionContext: vscode.ExtensionContext | undefined;
 
+// ─── Output Channel Logger ─────────────────────────────────────────────
+const outputChannel = vscode.window.createOutputChannel("Ren'Py LSP");
+
+function log(msg: string) {
+  const ts = new Date().toISOString();
+  outputChannel.appendLine(`[${ts}] ${msg}`);
+  console.log(`Ren'Py LSP: ${msg}`);
+}
+
+function logWarn(msg: string) {
+  const ts = new Date().toISOString();
+  outputChannel.appendLine(`[${ts}] [WARN] ${msg}`);
+  console.warn(`Ren'Py LSP: ${msg}`);
+}
+
+function logError(msg: string, err?: unknown) {
+  const ts = new Date().toISOString();
+  const errStr = err instanceof Error ? `${err.message}\n${err.stack}` : String(err ?? "");
+  outputChannel.appendLine(`[${ts}] [ERROR] ${msg} ${errStr}`);
+  console.error(`Ren'Py LSP: ${msg}`, err);
+}
+
 // ─── Helpers ───────────────────────────────────────────────────────────
 
 /** Return the first existing executable from a list of candidate paths. */
 function findExecutable(candidates: string[]): string | undefined {
+  log(`findExecutable: searching ${candidates.length} candidate(s)…`);
   for (const p of candidates) {
     try {
       fs.accessSync(p, fs.constants.X_OK);
+      log(`findExecutable: found executable "${p}"`);
       return p;
     } catch {
-      // not found / not executable – try next
+      log(`findExecutable: candidate not executable: "${p}"`);
     }
   }
+  logWarn("findExecutable: no executable found among candidates");
   return undefined;
 }
 
 /** Try to obtain the Python path from the official VS Code Python extension. */
 async function getPythonFromVSCodeExtension(): Promise<string | undefined> {
+  log("getPythonFromVSCodeExtension: querying ms-python.python extension…");
   try {
     const pythonExt = vscode.extensions.getExtension("ms-python.python");
     if (!pythonExt) {
+      log("getPythonFromVSCodeExtension: ms-python.python extension not installed");
       return undefined;
     }
     if (!pythonExt.isActive) {
+      log("getPythonFromVSCodeExtension: activating ms-python.python…");
       await pythonExt.activate();
     }
-    // The Python extension exposes an API with `environments.getActiveEnvironmentPath`
     const api = pythonExt.exports;
     const envPath = api?.environments?.getActiveEnvironmentPath?.();
     if (envPath?.path && fs.existsSync(envPath.path)) {
-      console.log(`Ren'Py LSP: detected Python from VS Code Python extension: "${envPath.path}"`);
+      log(`getPythonFromVSCodeExtension: detected Python: "${envPath.path}"`);
       return envPath.path;
     }
+    log("getPythonFromVSCodeExtension: extension active but no valid environment path");
   } catch (err) {
-    console.warn("Ren'Py LSP: failed to query VS Code Python extension:", err);
+    logError("getPythonFromVSCodeExtension: failed to query", err);
   }
   return undefined;
 }
 
 /** Resolve the Python interpreter path using configuration + auto-detect. */
 async function resolvePythonPath(extensionPath: string): Promise<string | undefined> {
+  log("resolvePythonPath: resolving Python interpreter…");
   const cfg = vscode.workspace.getConfiguration("renpy-lsp");
   const explicit: string = cfg.get<string>("pythonPath", "").trim();
 
   // 1. User-configured path
   if (explicit) {
+    log(`resolvePythonPath: user configured pythonPath = "${explicit}"`);
     if (fs.existsSync(explicit)) {
+      log(`resolvePythonPath: using configured path "${explicit}"`);
       return explicit;
     }
+    logWarn(`resolvePythonPath: configured path "${explicit}" does not exist`);
     vscode.window.showWarningMessage(
       `Ren'Py LSP: configured pythonPath "${explicit}" does not exist. Falling back to auto-detect.`,
     );
@@ -67,10 +99,12 @@ async function resolvePythonPath(extensionPath: string): Promise<string | undefi
   // 2. VS Code Python extension's active interpreter
   const fromVSCode = await getPythonFromVSCodeExtension();
   if (fromVSCode) {
+    log(`resolvePythonPath: resolved via VS Code Python extension: "${fromVSCode}"`);
     return fromVSCode;
   }
 
   // 3. Extension-local venv → workspace venvs
+  log("resolvePythonPath: scanning local venvs…");
   const workspaceFolders = vscode.workspace.workspaceFolders ?? [];
   const candidates: string[] = [
     path.join(extensionPath, ".venv", "bin", "python3"),
@@ -85,38 +119,50 @@ async function resolvePythonPath(extensionPath: string): Promise<string | undefi
 
   const detected = findExecutable(candidates);
   if (detected) {
+    log(`resolvePythonPath: resolved via local venv: "${detected}"`);
     return detected;
   }
 
   // 4. Last resort: bare "python3" (resolved by PATH at spawn time)
+  logWarn('resolvePythonPath: falling back to bare "python3" on PATH');
   return "python3";
 }
 
 // ─── Activation ────────────────────────────────────────────────────────
 
 export function activate(context: vscode.ExtensionContext) {
-  console.log("Ren'Py LSP extension is now active!");
+  log("Extension activating…");
+  log(`Extension path: ${context.extensionPath}`);
+  log(
+    `Workspace folders: ${(vscode.workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath).join(", ") || "(none)"}`,
+  );
   extensionContext = context;
 
   // Commands
   context.subscriptions.push(
     vscode.commands.registerCommand("renpy-lsp.startServer", () => {
+      log("Command: startServer");
       startLanguageServer(context);
     }),
     vscode.commands.registerCommand("renpy-lsp.stopServer", () => {
+      log("Command: stopServer");
       stopLanguageServer();
     }),
     vscode.commands.registerCommand("renpy-lsp.restartServer", async () => {
+      log("Command: restartServer");
       await stopLanguageServer();
       startLanguageServer(context);
     }),
     vscode.commands.registerCommand("renpy-lsp.formatAllFiles", () => {
+      log("Command: formatAllFiles");
       formatAllRpyFiles();
     }),
     vscode.commands.registerCommand("renpy-lsp.refreshWorkspace", () => {
+      log("Command: refreshWorkspace");
       refreshWorkspace();
     }),
     vscode.commands.registerCommand("renpy-lsp.showStats", () => {
+      log("Command: showStats");
       showProjectStats();
     }),
   );
@@ -124,16 +170,19 @@ export function activate(context: vscode.ExtensionContext) {
   // Auto-start when .rpy files are present
   checkForRpyFiles().then((has) => {
     if (has) {
-      console.log("Detected .rpy files in workspace, starting language server...");
+      log("Detected .rpy files in workspace — auto-starting language server");
       startLanguageServer(context);
+    } else {
+      log("No .rpy files detected in workspace, server will not auto-start");
     }
   });
 
   // Watch for new .rpy files
   const fileWatcher = vscode.workspace.createFileSystemWatcher("**/*.rpy");
-  fileWatcher.onDidCreate(() => {
+  fileWatcher.onDidCreate((uri) => {
+    log(`File watcher: new .rpy file created: ${uri.fsPath}`);
     if (!client) {
-      console.log("New .rpy file created, starting language server...");
+      log("No running client — starting language server…");
       startLanguageServer(context);
     }
   });
@@ -143,14 +192,18 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration("renpy-lsp")) {
+        log("Configuration changed for renpy-lsp — restarting server");
         vscode.window.showInformationMessage("Ren'Py LSP config changed — restarting server…");
         stopLanguageServer().then(() => startLanguageServer(context));
       }
     }),
   );
+
+  log("Extension activation complete");
 }
 
 export function deactivate(): Thenable<void> | undefined {
+  log("Extension deactivating…");
   return stopLanguageServer();
 }
 
@@ -158,13 +211,15 @@ export function deactivate(): Thenable<void> | undefined {
 
 async function checkForRpyFiles(): Promise<boolean> {
   if (!vscode.workspace.workspaceFolders) {
+    log("checkForRpyFiles: no workspace folders open");
     return false;
   }
   try {
     const files = await vscode.workspace.findFiles("**/*.rpy", "**/node_modules/**", 1);
+    log(`checkForRpyFiles: found ${files.length} .rpy file(s)`);
     return files.length > 0;
   } catch (error) {
-    console.error("Error checking for .rpy files:", error);
+    logError("checkForRpyFiles: error searching for .rpy files", error);
     return false;
   }
 }
@@ -172,12 +227,15 @@ async function checkForRpyFiles(): Promise<boolean> {
 // ─── Format all .rpy files ─────────────────────────────────────────────
 
 async function formatAllRpyFiles() {
+  log("formatAllRpyFiles: starting batch format");
   if (!client) {
+    logWarn("formatAllRpyFiles: server not running");
     vscode.window.showWarningMessage("Ren'Py LSP: Language server is not running.");
     return;
   }
 
   const files = await vscode.workspace.findFiles("**/*.{rpy,rpym}", "**/node_modules/**");
+  log(`formatAllRpyFiles: found ${files.length} file(s)`);
   if (files.length === 0) {
     vscode.window.showInformationMessage("No .rpy/.rpym files found in workspace.");
     return;
@@ -227,9 +285,10 @@ async function formatAllRpyFiles() {
             await vscode.workspace.applyEdit(wsEdit);
             await doc.save();
             formatted++;
+            log(`formatAllRpyFiles: formatted ${basename}`);
           }
         } catch (err) {
-          console.error(`Failed to format ${uri.fsPath}:`, err);
+          logError(`formatAllRpyFiles: failed to format ${uri.fsPath}`, err);
           failed++;
         }
       }
@@ -240,13 +299,16 @@ async function formatAllRpyFiles() {
   if (failed > 0) {
     parts.push(`${failed} failed`);
   }
+  log(`formatAllRpyFiles: done — ${parts.join(", ")}`);
   vscode.window.showInformationMessage(`Ren'Py LSP: ${parts.join(", ")}.`);
 }
 
 // ─── Refresh Workspace ─────────────────────────────────────────────────
 
 async function refreshWorkspace() {
+  log("refreshWorkspace: sending request to server");
   if (!client) {
+    logWarn("refreshWorkspace: server not running");
     vscode.window.showWarningMessage("Ren'Py LSP: Language server is not running.");
     return;
   }
@@ -258,12 +320,14 @@ async function refreshWorkspace() {
     })) as { success: boolean; message: string; fileCount: number };
 
     if (result && result.success) {
+      log(`refreshWorkspace: success — ${result.message} (${result.fileCount} files)`);
       vscode.window.showInformationMessage(`Ren'Py LSP: ${result.message}`);
     } else {
+      logWarn("refreshWorkspace: server returned failure");
       vscode.window.showWarningMessage("Ren'Py LSP: Failed to refresh workspace.");
     }
   } catch (err) {
-    console.error("Failed to refresh workspace:", err);
+    logError("refreshWorkspace: request failed", err);
     vscode.window.showErrorMessage(`Ren'Py LSP: Error refreshing workspace: ${err}`);
   }
 }
@@ -284,7 +348,9 @@ interface ProjectStats {
 }
 
 async function showProjectStats() {
+  log("showProjectStats: requesting stats from server");
   if (!client) {
+    logWarn("showProjectStats: server not running");
     vscode.window.showWarningMessage("Ren'Py LSP: Language server is not running.");
     return;
   }
@@ -296,9 +362,13 @@ async function showProjectStats() {
     })) as ProjectStats;
 
     if (!stats) {
+      logWarn("showProjectStats: server returned null stats");
       vscode.window.showWarningMessage("Ren'Py LSP: Failed to get project statistics.");
       return;
     }
+    log(
+      `showProjectStats: ${stats.files} files, ${stats.lines} lines, ${stats.labels} labels, ${stats.screens} screens`,
+    );
 
     // Format the stats as a nice message
     const message = [
@@ -326,7 +396,7 @@ async function showProjectStats() {
       vscode.window.showInformationMessage("Statistics copied to clipboard!");
     }
   } catch (err) {
-    console.error("Failed to get project stats:", err);
+    logError("showProjectStats: request failed", err);
     vscode.window.showErrorMessage(`Ren'Py LSP: Error getting statistics: ${err}`);
   }
 }
@@ -334,13 +404,16 @@ async function showProjectStats() {
 // ─── Server lifecycle ──────────────────────────────────────────────────
 
 async function startLanguageServer(context: vscode.ExtensionContext) {
+  log("startLanguageServer: starting…");
   if (client) {
-    console.log("Language server is already running");
+    log("startLanguageServer: server already running, skipping");
     return;
   }
 
   const serverScript = context.asAbsolutePath(path.join("bundled", "tools", "lsp_server.py"));
+  log(`startLanguageServer: server script path = "${serverScript}"`);
   if (!fs.existsSync(serverScript)) {
+    logError(`startLanguageServer: server script not found at "${serverScript}"`);
     vscode.window.showWarningMessage(
       "Ren'Py language server not found in bundled/tools directory. Please ensure the server is properly installed.",
     );
@@ -362,7 +435,7 @@ async function startLanguageServer(context: vscode.ExtensionContext) {
     }
     return;
   }
-  console.log(`Ren'Py LSP: using Python interpreter "${pythonPath}"`);
+  log(`startLanguageServer: using Python interpreter "${pythonPath}"`);
 
   const serverOptions: ServerOptions = {
     run: {
@@ -391,13 +464,14 @@ async function startLanguageServer(context: vscode.ExtensionContext) {
   };
 
   client = new LanguageClient("renpy-lsp", "Ren'Py Language Server", serverOptions, clientOptions);
+  log("startLanguageServer: LanguageClient created, starting…");
 
   client.start().then(
     () => {
-      console.log("Ren'Py language server started successfully");
+      log("startLanguageServer: server started successfully");
     },
     (error: Error) => {
-      console.error("Failed to start language server:", error);
+      logError("startLanguageServer: failed to start server", error);
       vscode.window.showErrorMessage(`Failed to start Ren'Py Language Server: ${error.message}`);
       client = undefined;
     },
@@ -406,13 +480,15 @@ async function startLanguageServer(context: vscode.ExtensionContext) {
 
 async function stopLanguageServer(): Promise<void> {
   if (!client) {
+    log("stopLanguageServer: no client running");
     return;
   }
   try {
+    log("stopLanguageServer: stopping…");
     await client.stop();
     client = undefined;
-    console.log("Ren'Py language server stopped");
+    log("stopLanguageServer: server stopped");
   } catch (error) {
-    console.error("Error stopping language server:", error);
+    logError("stopLanguageServer: error while stopping", error);
   }
 }
