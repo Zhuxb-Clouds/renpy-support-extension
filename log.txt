@@ -1,0 +1,10 @@
+[_make_node_location] uri=file:///home/zhuxb/renpy-dev/project/Umi-Den-Pa/game/scenario/bright/bright_0.rpy, node.lineno=241, node type=Jump
+  Result: line=240, start_char=0, end_char=10000
+[_make_node_location] uri=file:///home/zhuxb/renpy-dev/project/Umi-Den-Pa/game/scenario/bright/bright_0.rpy, node.lineno=241, node type=Jump
+  Result: line=240, start_char=0, end_char=10000
+[_make_node_location] uri=file:///home/zhuxb/renpy-dev/project/Umi-Den-Pa/game/scenario/bright/bright_0.rpy, node.lineno=241, node type=Jump
+  Result: line=240, start_char=0, end_char=10000
+[_make_node_location] uri=file:///home/zhuxb/renpy-dev/project/Umi-Den-Pa/game/scenario/bright/bright_0.rpy, node.lineno=241, node type=Jump
+  Result: line=240, start_char=0, end_char=10000
+[_make_node_location] uri=file:///home/zhuxb/renpy-dev/project/Umi-Den-Pa/game/scenario/bright/bright_0.rpy, node.lineno=241, node type=Jump
+  Result: line=240, start_char=0, end_char=10000

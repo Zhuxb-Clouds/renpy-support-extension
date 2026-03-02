@@ -109,6 +109,16 @@
         "command": "renpy-lsp.formatAllFiles",
         "title": "Format All Ren'Py Files",
         "category": "Ren'Py LSP"
+      },
+      {
+        "command": "renpy-lsp.refreshWorkspace",
+        "title": "Refresh Workspace Cache",
+        "category": "Ren'Py LSP"
+      },
+      {
+        "command": "renpy-lsp.showStats",
+        "title": "Show Project Statistics",
+        "category": "Ren'Py LSP"
       }
     ],
     "configuration": {
@@ -155,6 +165,12 @@
         },
         {
           "command": "renpy-lsp.restartServer"
+        },
+        {
+          "command": "renpy-lsp.refreshWorkspace"
+        },
+        {
+          "command": "renpy-lsp.showStats"
         }
       ]
     }

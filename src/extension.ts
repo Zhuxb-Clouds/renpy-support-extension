@@ -113,6 +113,12 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand("renpy-lsp.formatAllFiles", () => {
       formatAllRpyFiles();
     }),
+    vscode.commands.registerCommand("renpy-lsp.refreshWorkspace", () => {
+      refreshWorkspace();
+    }),
+    vscode.commands.registerCommand("renpy-lsp.showStats", () => {
+      showProjectStats();
+    }),
   );
 
   // Auto-start when .rpy files are present
@@ -235,6 +241,94 @@ async function formatAllRpyFiles() {
     parts.push(`${failed} failed`);
   }
   vscode.window.showInformationMessage(`Ren'Py LSP: ${parts.join(", ")}.`);
+}
+
+// ─── Refresh Workspace ─────────────────────────────────────────────────
+
+async function refreshWorkspace() {
+  if (!client) {
+    vscode.window.showWarningMessage("Ren'Py LSP: Language server is not running.");
+    return;
+  }
+
+  try {
+    const result = (await client.sendRequest("workspace/executeCommand", {
+      command: "renpy.refreshWorkspace",
+      arguments: [],
+    })) as { success: boolean; message: string; fileCount: number };
+
+    if (result && result.success) {
+      vscode.window.showInformationMessage(`Ren'Py LSP: ${result.message}`);
+    } else {
+      vscode.window.showWarningMessage("Ren'Py LSP: Failed to refresh workspace.");
+    }
+  } catch (err) {
+    console.error("Failed to refresh workspace:", err);
+    vscode.window.showErrorMessage(`Ren'Py LSP: Error refreshing workspace: ${err}`);
+  }
+}
+
+// ─── Show Project Stats ────────────────────────────────────────────────
+
+interface ProjectStats {
+  files: number;
+  lines: number;
+  labels: number;
+  screens: number;
+  defines: number;
+  defaults: number;
+  images: number;
+  transforms: number;
+  dialogueLines: number;
+  words: number;
+}
+
+async function showProjectStats() {
+  if (!client) {
+    vscode.window.showWarningMessage("Ren'Py LSP: Language server is not running.");
+    return;
+  }
+
+  try {
+    const stats = (await client.sendRequest("workspace/executeCommand", {
+      command: "renpy.showStats",
+      arguments: [],
+    })) as ProjectStats;
+
+    if (!stats) {
+      vscode.window.showWarningMessage("Ren'Py LSP: Failed to get project statistics.");
+      return;
+    }
+
+    // Format the stats as a nice message
+    const message = [
+      `📁 Files: ${stats.files}`,
+      `📝 Lines: ${stats.lines.toLocaleString()}`,
+      `🏷️ Labels: ${stats.labels}`,
+      `🖥️ Screens: ${stats.screens}`,
+      `📌 Defines: ${stats.defines}`,
+      `📋 Defaults: ${stats.defaults}`,
+      `🖼️ Images: ${stats.images}`,
+      `🔄 Transforms: ${stats.transforms}`,
+      `💬 Dialogue: ${stats.dialogueLines.toLocaleString()} lines`,
+      `📖 Words: ${stats.words.toLocaleString()}`,
+    ].join("\n");
+
+    // Show as an information message with a "Copy" button
+    const choice = await vscode.window.showInformationMessage(
+      `Ren'Py Project Statistics:\n\n${message}`,
+      { modal: true },
+      "Copy to Clipboard",
+    );
+
+    if (choice === "Copy to Clipboard") {
+      await vscode.env.clipboard.writeText(message);
+      vscode.window.showInformationMessage("Statistics copied to clipboard!");
+    }
+  } catch (err) {
+    console.error("Failed to get project stats:", err);
+    vscode.window.showErrorMessage(`Ren'Py LSP: Error getting statistics: ${err}`);
+  }
 }
 
 // ─── Server lifecycle ──────────────────────────────────────────────────

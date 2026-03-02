@@ -695,6 +695,26 @@ class RpyParser:
     def get_all_calls(self, root: Optional[Script] = None) -> List[Call]:
         return self._collect(root or self.root, Call)
 
+    def get_empty_block_errors(
+        self, root: Optional[Script] = None
+    ) -> List[Union[Show, Scene, Hide]]:
+        """Return nodes that have a trailing colon but no body content.
+
+        In Ren'Py, ``show image:`` (with colon) expects an ATL block.
+        If no indented content follows, it's an error.
+        """
+        result: List[Union[Show, Scene, Hide]] = []
+        for node in self._collect(root or self.root, Show):
+            if node.has_block and not node.body:
+                result.append(node)
+        for node in self._collect(root or self.root, Scene):
+            if node.has_block and not node.body:
+                result.append(node)
+        for node in self._collect(root or self.root, Hide):
+            if node.has_block and not node.body:
+                result.append(node)
+        return result
+
     # ── private helpers ──
 
     def _collect(self, node: Node, cls: type) -> list:

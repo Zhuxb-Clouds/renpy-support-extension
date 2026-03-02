@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.0.3] - 2026-03-02
+
+### Added
+
+- "Show Project Statistics" command (`renpy-lsp.showStats`) displaying:
+  - File count, total lines, labels, screens, defines, defaults, images, transforms
+  - Dialogue line count and word count
+- "Refresh Workspace" command (`renpy-lsp.refreshWorkspace`) to re-parse all files
+
+### Fixed
+
+- Word counting now correctly handles CJK (Chinese/Japanese/Korean) characters
+  - Each CJK character counts as one word
+  - Non-CJK text is split by whitespace as before
+
 ## [1.0.2] - 2026-02-28
 
 ### Added
