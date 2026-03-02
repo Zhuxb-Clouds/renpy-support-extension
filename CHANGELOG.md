@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.2.0] - 2026-03-02
+
+### Added
+
+- GLSL (OpenGL Shading Language) syntax highlighting inside `renpy.register_shader()` strings
+  - Supports `vertex_*`, `fragment_*`, `variables`, and other shader keyword arguments
+  - Highlights types, qualifiers, built-in functions/variables, comments, numbers, operators, and swizzle
+
 ## [1.1.0] - 2026-03-02
 
 ### Added

@@ -87,6 +87,22 @@
         "injectTo": [
           "text.log"
         ]
+      },
+      {
+        "scopeName": "source.glsl.renpy",
+        "path": "./syntaxes/glsl.tmLanguage.json"
+      },
+      {
+        "scopeName": "renpy.glsl.injection",
+        "path": "./syntaxes/renpy.glsl.injection.json",
+        "injectTo": [
+          "source.python",
+          "source.renpy",
+          "source.renpy.python"
+        ],
+        "embeddedLanguages": {
+          "meta.embedded.block.glsl": "glsl"
+        }
       }
     ],
     "commands": [

@@ -1,0 +1,38 @@
+{
+  "scopeName": "renpy.glsl.injection",
+  "injectionSelector": "L:source.python, L:source.renpy, L:source.renpy.python",
+  "patterns": [
+    { "include": "#glsl-triple-double-quote" },
+    { "include": "#glsl-triple-single-quote" }
+  ],
+  "repository": {
+    "glsl-triple-double-quote": {
+      "contentName": "meta.embedded.block.glsl",
+      "begin": "(vertex_\\d+|fragment_\\d+|variables|vertex_functions|fragment_functions|vertex_variables|fragment_variables)\\s*(=)\\s*(\"{3})",
+      "beginCaptures": {
+        "1": { "name": "variable.parameter.shader.renpy" },
+        "2": { "name": "keyword.operator.assignment.python" },
+        "3": { "name": "punctuation.definition.string.begin.python" }
+      },
+      "end": "(\"{3})",
+      "endCaptures": {
+        "1": { "name": "punctuation.definition.string.end.python" }
+      },
+      "patterns": [{ "include": "source.glsl.renpy" }]
+    },
+    "glsl-triple-single-quote": {
+      "contentName": "meta.embedded.block.glsl",
+      "begin": "(vertex_\\d+|fragment_\\d+|variables|vertex_functions|fragment_functions|vertex_variables|fragment_variables)\\s*(=)\\s*('{3})",
+      "beginCaptures": {
+        "1": { "name": "variable.parameter.shader.renpy" },
+        "2": { "name": "keyword.operator.assignment.python" },
+        "3": { "name": "punctuation.definition.string.begin.python" }
+      },
+      "end": "('{3})",
+      "endCaptures": {
+        "1": { "name": "punctuation.definition.string.end.python" }
+      },
+      "patterns": [{ "include": "source.glsl.renpy" }]
+    }
+  }
+}
