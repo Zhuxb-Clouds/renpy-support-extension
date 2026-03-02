@@ -17,6 +17,10 @@ if os.path.isdir(_LIBS_DIR):
 
 from lsprotocol import types
 from pygls.lsp.server import LanguageServer
+from pygls.uris import (
+    from_fs_path as _pygls_from_fs_path,
+    to_fs_path as _pygls_to_fs_path,
+)
 
 from ast_parser import (
     RpyParser,
@@ -81,13 +85,38 @@ import time as _time
 
 _log = _logging.getLogger("renpy-lsp")
 _log.setLevel(_logging.DEBUG)
-_handler = _logging.StreamHandler(sys.stderr)
+# On Windows the default stderr encoding may not be UTF-8, which garbles CJK
+# characters in log output.  Force UTF-8 so diagnostics are readable.
+_handler = _logging.StreamHandler(
+    open(sys.stderr.fileno(), mode="w", encoding="utf-8", closefd=False)
+    if sys.platform == "win32"
+    else sys.stderr
+)
 _handler.setFormatter(
     _logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
 )
 _log.addHandler(_handler)
 
 _log.info("Ren'Py LSP server module loaded")
+
+
+# ── UTF-16 → Python (UTF-32) column offset conversion ──────────────────
+
+
+def _utf16_col_to_utf32(line: str, utf16_col: int) -> int:
+    """Convert a UTF-16 character offset to a Python string index.
+
+    LSP positions use UTF-16 code units by default.  Characters outside the
+    Basic Multilingual Plane (e.g. emoji) take 2 UTF-16 units but 1 Python
+    character.  This helper walks the line to map the offset correctly.
+    """
+    utf16_pos = 0
+    for i, ch in enumerate(line):
+        units = 2 if ord(ch) > 0xFFFF else 1
+        if utf16_pos + units > utf16_col:
+            return i
+        utf16_pos += units
+    return len(line)
 
 
 # ─────────────────────── Cache / Index ───────────────────────────────────
@@ -126,13 +155,21 @@ def _short_uri(uri: str) -> str:
 
 def _uri_from_path(path: str) -> str:
     """Convert a filesystem path to a file:// URI."""
+    result = _pygls_from_fs_path(os.path.abspath(path))
+    if result is not None:
+        return result
+    # Fallback for non-file paths
     return Path(os.path.abspath(path)).as_uri()
 
 
 def _path_from_uri(uri: str) -> str:
-    """Convert a file:// URI to a filesystem path."""
+    """Convert a file:// URI to a filesystem path (Windows-safe)."""
+    result = _pygls_to_fs_path(uri)
+    if result is not None:
+        return result
+    # Fallback: strip scheme for non-file URIs
     if uri.startswith("file://"):
-        return url_unquote(uri[7:])
+        return url_unquote(uri[len("file://") :])
     return uri
 
 
@@ -1022,7 +1059,8 @@ def goto_definition(
     doc = ls.workspace.get_text_document(uri)
     pos = params.position
     line_text = doc.lines[pos.line] if pos.line < len(doc.lines) else ""
-    word = _word_at_position(line_text, pos.character)
+    col = _utf16_col_to_utf32(line_text, pos.character)
+    word = _word_at_position(line_text, col)
     _log.info(
         "gotoDefinition: %s L%d C%d word=%r",
         _short_uri(uri),
@@ -1083,13 +1121,13 @@ def goto_definition(
     # ── 1) AST-based resolution: find node at cursor line ──
     for node in nodes:
         loc = _resolve_node_definition(
-            node, source_uri=uri, line_text=line_text, col=pos.character
+            node, source_uri=uri, line_text=line_text, col=col
         )
         if loc:
             return loc if isinstance(loc, list) else [loc]
 
     # ── 2) Quoted string → file path ──
-    quoted = _extract_quoted_string(line_text, pos.character)
+    quoted = _extract_quoted_string(line_text, col)
     if quoted:
         resolved = _resolve_renpy_file(quoted, source_uri=uri)
         if resolved:
@@ -1418,7 +1456,8 @@ def completions(
     doc = ls.workspace.get_text_document(uri)
     pos = params.position
     line_text = doc.lines[pos.line] if pos.line < len(doc.lines) else ""
-    line_prefix = line_text[: pos.character].strip()
+    col = _utf16_col_to_utf32(line_text, pos.character)
+    line_prefix = line_text[:col].strip()
     _log.debug(
         "completion: %s L%d prefix=%r", _short_uri(uri), pos.line + 1, line_prefix[-30:]
     )
@@ -1574,7 +1613,8 @@ def hover(ls: LanguageServer, params: types.HoverParams) -> Optional[types.Hover
     line_text = (
         doc.lines[params.position.line] if params.position.line < len(doc.lines) else ""
     )
-    word = _word_at_position(line_text, params.position.character)
+    col = _utf16_col_to_utf32(line_text, params.position.character)
+    word = _word_at_position(line_text, col)
     _log.debug("hover: %s L%d word=%r", _short_uri(uri), params.position.line + 1, word)
     if not word:
         return None
@@ -1758,7 +1798,8 @@ def find_references(
     doc = ls.workspace.get_text_document(uri)
     pos = params.position
     line_text = doc.lines[pos.line] if pos.line < len(doc.lines) else ""
-    word = _word_at_position(line_text, pos.character)
+    col = _utf16_col_to_utf32(line_text, pos.character)
+    word = _word_at_position(line_text, col)
     _log.info("references: %s L%d word=%r", _short_uri(uri), pos.line + 1, word)
     if not word:
         return None
@@ -1966,7 +2007,8 @@ def prepare_rename(
     doc = ls.workspace.get_text_document(uri)
     pos = params.position
     line_text = doc.lines[pos.line] if pos.line < len(doc.lines) else ""
-    word = _word_at_position(line_text, pos.character)
+    col = _utf16_col_to_utf32(line_text, pos.character)
+    word = _word_at_position(line_text, col)
     _log.info("prepareRename: %s L%d word=%r", _short_uri(uri), pos.line + 1, word)
     if not word:
         return None
@@ -1977,7 +2019,7 @@ def prepare_rename(
 
     if word in all_labels or word in all_screens:
         # Find the word boundaries
-        start, end = _word_boundaries(line_text, pos.character)
+        start, end = _word_boundaries(line_text, col)
         return types.Range(
             start=types.Position(line=pos.line, character=start),
             end=types.Position(line=pos.line, character=end),
@@ -2015,7 +2057,8 @@ def rename(
     doc = ls.workspace.get_text_document(uri)
     pos = params.position
     line_text = doc.lines[pos.line] if pos.line < len(doc.lines) else ""
-    old_name = _word_at_position(line_text, pos.character)
+    col = _utf16_col_to_utf32(line_text, pos.character)
+    old_name = _word_at_position(line_text, col)
     new_name = params.new_name
     _log.info("rename: %s %r → %r", _short_uri(uri), old_name, new_name)
 
