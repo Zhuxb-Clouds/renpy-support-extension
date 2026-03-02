@@ -1,12 +1,23 @@
 # Changelog
 
-## [1.2.0] - 2026-03-02
+## [1.2.0] - 2026-03-03
 
 ### Added
 
+- Comprehensive logging throughout the extension and language server
+  - New "Ren'Py LSP" Output Channel in VS Code for client-side logs
+  - Server-side logging for all LSP features (parse, diagnostics, hover, completion, etc.)
+  - Timestamped log entries with severity levels (INFO / WARN / ERROR)
+  - Detailed logs for Python interpreter resolution, server lifecycle, and command execution
 - GLSL (OpenGL Shading Language) syntax highlighting inside `renpy.register_shader()` strings
   - Supports `vertex_*`, `fragment_*`, `variables`, and other shader keyword arguments
   - Highlights types, qualifiers, built-in functions/variables, comments, numbers, operators, and swizzle
+
+
+### Fixed
+
+- Suppressed noisy "Cancel notification for unknown message id" warnings from pygls
+  - These are harmless and occur when VS Code cancels already-completed requests
 
 ## [1.1.0] - 2026-03-02
 
