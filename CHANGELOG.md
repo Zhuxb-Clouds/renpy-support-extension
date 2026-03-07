@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.2.1] - 2026-03-07
+
+### Improved
+
+- **Major performance optimization for the language server**
+  - Added 300ms debounce on `didChange` — typing no longer triggers diagnostics on every keystroke
+  - Split diagnostics into lightweight (syntax-only, on change) and full (cross-workspace, on save/open)
+  - Introduced `_WorkspaceIndex` for incremental workspace indexing — file lists and symbol indices are cached and updated incrementally instead of re-globbing and re-parsing all files on every request
+  - Parse cache now uses content hashing (`hash()`) instead of full-text string comparison
+  - `_get_parse_for_file` uses O(1) path→URI mapping instead of O(n) cache scan
+  - Added `didSave` handler for full diagnostics on save
+  - Added `workspace/didChangeWatchedFiles` handler to invalidate caches on file create/delete/external changes
+  - `refreshWorkspace` command now rebuilds the workspace index
+
 ## [1.2.0] - 2026-03-03
 
 ### Added

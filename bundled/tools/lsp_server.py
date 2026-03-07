@@ -65,6 +65,7 @@ from ast_parser import (
 
 from typing import Dict, List, Optional, Tuple, Union
 import glob
+import threading
 from pathlib import Path
 from urllib.parse import quote as url_quote
 from urllib.parse import unquote as url_unquote
@@ -122,17 +123,22 @@ def _utf16_col_to_utf32(line: str, utf16_col: int) -> int:
 # ─────────────────────── Cache / Index ───────────────────────────────────
 
 # Per-URI parse cache so we don't re-parse on every request.
-_parse_cache: Dict[str, Tuple[str, Script, RpyParser]] = {}
+# Value: (content_hash, source_text, ast, parser)
+_parse_cache: Dict[str, Tuple[int, str, Script, RpyParser]] = {}
+
+# Fast path→URI mapping: avoids O(n) scan in _get_parse_for_file.
+_path_to_uri: Dict[str, str] = {}
 
 
 def _get_parse(uri: str, source: Optional[str] = None) -> Tuple[Script, RpyParser]:
     """Return cached (ast, parser) for *uri*, re-parsing only when source changes."""
     doc = LSP_SERVER.workspace.get_text_document(uri)
     text = source if source is not None else doc.source
+    text_hash = hash(text)
     cached = _parse_cache.get(uri)
-    if cached and cached[0] == text:
+    if cached and cached[0] == text_hash:
         _log.debug("_get_parse: cache hit for %s", _short_uri(uri))
-        return cached[1], cached[2]
+        return cached[2], cached[3]
     _log.info("_get_parse: parsing %s (%d chars)", _short_uri(uri), len(text))
     t0 = _time.monotonic()
     parser = RpyParser(text)
@@ -144,7 +150,13 @@ def _get_parse(uri: str, source: Optional[str] = None) -> Tuple[Script, RpyParse
         elapsed,
         len(ast.body),
     )
-    _parse_cache[uri] = (text, ast, parser)
+    _parse_cache[uri] = (text_hash, text, ast, parser)
+    # Maintain path→URI mapping
+    try:
+        abs_path = os.path.abspath(_path_from_uri(uri))
+        _path_to_uri[abs_path] = uri
+    except Exception:
+        pass
     return ast, parser
 
 
@@ -174,19 +186,8 @@ def _path_from_uri(uri: str) -> str:
 
 
 def _get_workspace_rpy_files() -> List[str]:
-    """Return all .rpy / .rpym file paths in the workspace."""
-    seen: set = set()
-    results: List[str] = []
-    for folder in LSP_SERVER.workspace.folders.values():
-        root = _path_from_uri(folder.uri)
-        for pattern in ("**/*.rpy", "**/*.rpym"):
-            for fp in glob.glob(os.path.join(root, pattern), recursive=True):
-                abs_fp = os.path.abspath(fp)
-                if abs_fp not in seen:
-                    seen.add(abs_fp)
-                    results.append(abs_fp)
-    _log.debug("_get_workspace_rpy_files: found %d file(s)", len(results))
-    return results
+    """Return all .rpy / .rpym file paths in the workspace (uses cached list)."""
+    return _workspace_index.get_file_list()
 
 
 def _get_workspace_renpy_py_files() -> List[str]:
@@ -204,16 +205,18 @@ def _get_workspace_renpy_py_files() -> List[str]:
 
 def _get_parse_for_file(filepath: str) -> Tuple[str, Script, RpyParser]:
     """Parse (or cache-hit) a file by filesystem path. Returns (uri, ast, parser)."""
-    uri = _uri_from_path(filepath)
-    # Check for existing cache entry with the same file path (handle URI format differences)
     abs_path = os.path.abspath(filepath)
-    for cached_uri, cached_data in list(_parse_cache.items()):
-        try:
-            cached_path = os.path.abspath(_path_from_uri(cached_uri))
-            if cached_path == abs_path:
-                return cached_uri, cached_data[1], cached_data[2]
-        except Exception:
-            continue
+    # O(1) lookup via path→URI map
+    cached_uri = _path_to_uri.get(abs_path)
+    if cached_uri and cached_uri in _parse_cache:
+        cached_data = _parse_cache[cached_uri]
+        return cached_uri, cached_data[2], cached_data[3]
+    # Compute URI and try cache directly
+    uri = _uri_from_path(filepath)
+    cached_data = _parse_cache.get(uri)
+    if cached_data:
+        _path_to_uri[abs_path] = uri
+        return uri, cached_data[2], cached_data[3]
     # No existing cache entry found, parse and cache
     try:
         text = Path(filepath).read_text(encoding="utf-8", errors="replace")
@@ -221,68 +224,204 @@ def _get_parse_for_file(filepath: str) -> Tuple[str, Script, RpyParser]:
         text = ""
     parser = RpyParser(text)
     ast = parser.parse()
-    _parse_cache[uri] = (text, ast, parser)
+    _parse_cache[uri] = (hash(text), text, ast, parser)
+    _path_to_uri[abs_path] = uri
     return uri, ast, parser
+
+
+# ─────────────────────── Workspace Index ─────────────────────────────────
+
+
+class _WorkspaceIndex:
+    """Incrementally maintained index of all workspace .rpy/.rpym files.
+
+    Instead of re-globbing and re-parsing *all* files on every request, the
+    index caches file lists and per-file symbol data.  It is updated
+    incrementally when individual files change.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        # Cached file list
+        self._rpy_files: Optional[List[str]] = None
+        self._files_dirty = True
+        # Per-URI symbol indices  {uri: {name: [node, ...]}}
+        self._labels: Dict[str, Dict[str, List[Label]]] = {}
+        self._defines: Dict[str, Dict[str, List[Define]]] = {}
+        self._defaults: Dict[str, Dict[str, List[Default]]] = {}
+        self._screens: Dict[str, Dict[str, List[ScreenDef]]] = {}
+        self._images: Dict[str, Dict[str, List[ImageDef]]] = {}
+        self._transforms: Dict[str, Dict[str, List[TransformDef]]] = {}
+        # Track which URIs have been indexed and with which content hash
+        self._indexed_hashes: Dict[str, int] = {}
+
+    # ── File list management ──
+
+    def invalidate_file_list(self) -> None:
+        """Mark the file list as stale (call on file create/delete)."""
+        with self._lock:
+            self._files_dirty = True
+
+    def get_file_list(self) -> List[str]:
+        """Return cached workspace .rpy/.rpym files, re-globbing only if dirty."""
+        with self._lock:
+            if self._files_dirty or self._rpy_files is None:
+                self._rpy_files = self._glob_rpy_files()
+                self._files_dirty = False
+                _log.debug(
+                    "_WorkspaceIndex: re-globbed %d file(s)",
+                    len(self._rpy_files),
+                )
+            return list(self._rpy_files)
+
+    @staticmethod
+    def _glob_rpy_files() -> List[str]:
+        seen: set = set()
+        results: List[str] = []
+        for folder in LSP_SERVER.workspace.folders.values():
+            root = _path_from_uri(folder.uri)
+            for pattern in ("**/*.rpy", "**/*.rpym"):
+                for fp in glob.glob(os.path.join(root, pattern), recursive=True):
+                    abs_fp = os.path.abspath(fp)
+                    if abs_fp not in seen:
+                        seen.add(abs_fp)
+                        results.append(abs_fp)
+        return results
+
+    # ── Incremental index updates ──
+
+    def update_file(self, uri: str) -> None:
+        """Re-index a single file (called after parse cache is updated)."""
+        cached = _parse_cache.get(uri)
+        if not cached:
+            return
+        content_hash, _text, ast, parser = cached
+        if self._indexed_hashes.get(uri) == content_hash:
+            return  # Already indexed this version
+        with self._lock:
+            self._labels[uri] = {}
+            for lb in parser.get_all_labels():
+                self._labels[uri].setdefault(lb.name, []).append(lb)
+            self._defines[uri] = {}
+            for d in parser.get_all_defines():
+                self._defines[uri].setdefault(d.name, []).append(d)
+            self._defaults[uri] = {}
+            for d in parser.get_all_defaults():
+                self._defaults[uri].setdefault(d.name, []).append(d)
+            self._screens[uri] = {}
+            for s in parser.get_all_screens():
+                self._screens[uri].setdefault(s.name, []).append(s)
+            self._images[uri] = {}
+            for img in parser.get_all_images():
+                self._images[uri].setdefault(img.name, []).append(img)
+            self._transforms[uri] = {}
+            for t in parser._collect(ast, TransformDef):
+                self._transforms[uri].setdefault(t.name, []).append(t)
+            self._indexed_hashes[uri] = content_hash
+        _log.debug("_WorkspaceIndex: updated index for %s", _short_uri(uri))
+
+    def remove_file(self, uri: str) -> None:
+        """Remove a file from the index."""
+        with self._lock:
+            self._labels.pop(uri, None)
+            self._defines.pop(uri, None)
+            self._defaults.pop(uri, None)
+            self._screens.pop(uri, None)
+            self._images.pop(uri, None)
+            self._transforms.pop(uri, None)
+            self._indexed_hashes.pop(uri, None)
+
+    def ensure_current(self) -> None:
+        """Ensure all workspace files are indexed (lazy full rebuild)."""
+        for fp in self.get_file_list():
+            uri, _ast, _parser = _get_parse_for_file(fp)
+            self.update_file(uri)
+
+    def rebuild(self) -> None:
+        """Force a full rebuild of the index."""
+        with self._lock:
+            self._files_dirty = True
+            self._labels.clear()
+            self._defines.clear()
+            self._defaults.clear()
+            self._screens.clear()
+            self._images.clear()
+            self._transforms.clear()
+            self._indexed_hashes.clear()
+        self.ensure_current()
+
+    # ── Query methods (aggregate across all files) ──
+
+    def _aggregate(
+        self, store: Dict[str, Dict[str, list]]
+    ) -> Dict[str, List[Tuple[str, object]]]:
+        """Merge per-URI sub-dicts into {name: [(uri, node), ...]}."""
+        result: dict = {}
+        with self._lock:
+            for uri, name_map in store.items():
+                for name, nodes in name_map.items():
+                    if name not in result:
+                        result[name] = []
+                    for n in nodes:
+                        result[name].append((uri, n))
+        return result
+
+    def get_labels(self) -> Dict[str, List[Tuple[str, Label]]]:
+        self.ensure_current()
+        return self._aggregate(self._labels)
+
+    def get_defines(self) -> Dict[str, List[Tuple[str, Define]]]:
+        self.ensure_current()
+        return self._aggregate(self._defines)
+
+    def get_defaults(self) -> Dict[str, List[Tuple[str, Default]]]:
+        self.ensure_current()
+        return self._aggregate(self._defaults)
+
+    def get_screens(self) -> Dict[str, List[Tuple[str, ScreenDef]]]:
+        self.ensure_current()
+        return self._aggregate(self._screens)
+
+    def get_images(self) -> Dict[str, List[Tuple[str, ImageDef]]]:
+        self.ensure_current()
+        return self._aggregate(self._images)
+
+    def get_transforms(self) -> Dict[str, List[Tuple[str, TransformDef]]]:
+        self.ensure_current()
+        return self._aggregate(self._transforms)
+
+
+_workspace_index = _WorkspaceIndex()
 
 
 def _get_all_workspace_labels() -> Dict[str, List[Tuple[str, "Label"]]]:
     """Return {label_name: [(uri, Label), ...]} across all workspace .rpy files."""
-    result: Dict[str, List[Tuple[str, Label]]] = {}
-    for fp in _get_workspace_rpy_files():
-        uri, ast, parser = _get_parse_for_file(fp)
-        for lb in parser.get_all_labels():
-            result.setdefault(lb.name, []).append((uri, lb))
-    return result
+    return _workspace_index.get_labels()
 
 
 def _get_all_workspace_defines() -> Dict[str, List[Tuple[str, "Define"]]]:
     """Return {name: [(uri, Define), ...]} across all workspace .rpy files."""
-    result: Dict[str, List[Tuple[str, Define]]] = {}
-    for fp in _get_workspace_rpy_files():
-        uri, ast, parser = _get_parse_for_file(fp)
-        for d in parser.get_all_defines():
-            result.setdefault(d.name, []).append((uri, d))
-    return result
+    return _workspace_index.get_defines()
 
 
 def _get_all_workspace_defaults() -> Dict[str, List[Tuple[str, "Default"]]]:
     """Return {name: [(uri, Default), ...]} across all workspace .rpy files."""
-    result: Dict[str, List[Tuple[str, Default]]] = {}
-    for fp in _get_workspace_rpy_files():
-        uri, ast, parser = _get_parse_for_file(fp)
-        for d in parser.get_all_defaults():
-            result.setdefault(d.name, []).append((uri, d))
-    return result
+    return _workspace_index.get_defaults()
 
 
 def _get_all_workspace_screens() -> Dict[str, List[Tuple[str, "ScreenDef"]]]:
     """Return {name: [(uri, ScreenDef), ...]} across all workspace .rpy files."""
-    result: Dict[str, List[Tuple[str, ScreenDef]]] = {}
-    for fp in _get_workspace_rpy_files():
-        uri, ast, parser = _get_parse_for_file(fp)
-        for s in parser.get_all_screens():
-            result.setdefault(s.name, []).append((uri, s))
-    return result
+    return _workspace_index.get_screens()
 
 
 def _get_all_workspace_images() -> Dict[str, List[Tuple[str, "ImageDef"]]]:
     """Return {image_name: [(uri, ImageDef), ...]} across all workspace .rpy files."""
-    result: Dict[str, List[Tuple[str, ImageDef]]] = {}
-    for fp in _get_workspace_rpy_files():
-        uri, ast, parser = _get_parse_for_file(fp)
-        for img in parser.get_all_images():
-            result.setdefault(img.name, []).append((uri, img))
-    return result
+    return _workspace_index.get_images()
 
 
 def _get_all_workspace_transforms() -> Dict[str, List[Tuple[str, "TransformDef"]]]:
     """Return {name: [(uri, TransformDef), ...]} across all workspace .rpy files."""
-    result: Dict[str, List[Tuple[str, TransformDef]]] = {}
-    for fp in _get_workspace_rpy_files():
-        uri, ast, parser = _get_parse_for_file(fp)
-        for node in parser._collect(ast, TransformDef):
-            result.setdefault(node.name, []).append((uri, node))
-    return result
+    return _workspace_index.get_transforms()
 
 
 # ── Python variable / class / function definition helpers ──
@@ -575,7 +714,7 @@ def _make_node_location(uri: str, node: Node) -> types.Location:
         # Get the raw line from parse cache or file
         raw_line = ""
         if uri in _parse_cache:
-            source = _parse_cache[uri][0]
+            source = _parse_cache[uri][1]
             lines = source.splitlines()
             if 0 <= line < len(lines):
                 raw_line = lines[line]
@@ -623,11 +762,73 @@ def _dedup_locations(locations: List[types.Location]) -> List[types.Location]:
     return result
 
 
+def _publish_diagnostics_light(uri: str):
+    """Fast diagnostics: only current-file syntax checks (no workspace scan).
+
+    Called from ``didChange`` (debounced).  This covers parser errors and
+    empty-ATL-block errors — the things the user wants instant feedback on.
+    """
+    _log.info("_publish_diagnostics_light: %s", _short_uri(uri))
+    t0 = _time.monotonic()
+    ast, parser = _get_parse(uri)
+    # Update the workspace index for this single file so subsequent
+    # queries (hover, goto-def, …) see the latest symbols.
+    _workspace_index.update_file(uri)
+    diags: List[types.Diagnostic] = []
+
+    # 1) Parser-level errors (Unknown lines).
+    for lineno, msg in parser.errors:
+        diags.append(
+            types.Diagnostic(
+                range=types.Range(
+                    start=types.Position(line=lineno - 1, character=0),
+                    end=types.Position(line=lineno - 1, character=999),
+                ),
+                message=msg,
+                severity=types.DiagnosticSeverity.Warning,
+                source="renpy-lsp",
+            )
+        )
+
+    # 2) Check for empty ATL blocks (show/scene/hide with colon but no body).
+    for node in parser.get_empty_block_errors():
+        stmt_type = type(node).__name__.lower()
+        diags.append(
+            types.Diagnostic(
+                range=types.Range(
+                    start=types.Position(line=node.lineno - 1, character=0),
+                    end=types.Position(line=node.lineno - 1, character=999),
+                ),
+                message=f'"{stmt_type}" statement ends with ":" but has no indented block',
+                severity=types.DiagnosticSeverity.Error,
+                source="renpy-lsp",
+            )
+        )
+
+    elapsed = (_time.monotonic() - t0) * 1000
+    _log.info(
+        "_publish_diagnostics_light: %s → %d diagnostic(s) in %.1f ms",
+        _short_uri(uri),
+        len(diags),
+        elapsed,
+    )
+    LSP_SERVER.text_document_publish_diagnostics(
+        types.PublishDiagnosticsParams(uri=uri, diagnostics=diags)
+    )
+
+
 def _publish_diagnostics(uri: str):
-    """Parse the document and push diagnostics."""
+    """Full diagnostics: parse the document and push all diagnostics.
+
+    This includes cross-workspace checks (undefined labels, duplicate
+    definitions, unused labels, missing image files).  Called from
+    ``didOpen`` and ``didSave``.
+    """
     _log.info("_publish_diagnostics: %s", _short_uri(uri))
     t0 = _time.monotonic()
     ast, parser = _get_parse(uri)
+    # Ensure workspace index is up-to-date for the current file
+    _workspace_index.update_file(uri)
     diags: List[types.Diagnostic] = []
 
     # 1) Parser-level errors (Unknown lines).
@@ -770,7 +971,7 @@ def _publish_diagnostics(uri: str):
                     )
 
     # 6) Check for unused labels (defined but never jumped/called).
-    # Collect all jump/call targets across the workspace
+    # Collect all jump/call targets across the workspace using the index.
     all_jump_targets: set = set()
     all_call_targets: set = set()
     for fp in _get_workspace_rpy_files():
@@ -828,6 +1029,30 @@ def _publish_diagnostics(uri: str):
 
 # ─────────────────────── Document Sync ───────────────────────────────────
 
+# Debounce timers for didChange → lightweight diagnostics.
+_DEBOUNCE_DELAY = 0.3  # seconds
+_debounce_timers: Dict[str, threading.Timer] = {}
+
+
+def _schedule_light_diagnostics(uri: str) -> None:
+    """Schedule a debounced lightweight diagnostic run for *uri*."""
+    # Cancel any pending timer for this URI
+    old = _debounce_timers.pop(uri, None)
+    if old is not None:
+        old.cancel()
+
+    def _run():
+        _debounce_timers.pop(uri, None)
+        try:
+            _publish_diagnostics_light(uri)
+        except Exception:
+            _log.exception("Error in debounced light diagnostics for %s", uri)
+
+    timer = threading.Timer(_DEBOUNCE_DELAY, _run)
+    timer.daemon = True
+    _debounce_timers[uri] = timer
+    timer.start()
+
 
 @LSP_SERVER.feature(types.TEXT_DOCUMENT_DID_OPEN)
 def did_open(ls: LanguageServer, params: types.DidOpenTextDocumentParams):
@@ -838,17 +1063,58 @@ def did_open(ls: LanguageServer, params: types.DidOpenTextDocumentParams):
 @LSP_SERVER.feature(types.TEXT_DOCUMENT_DID_CHANGE)
 def did_change(ls: LanguageServer, params: types.DidChangeTextDocumentParams):
     _log.debug("didChange: %s", _short_uri(params.text_document.uri))
-    _publish_diagnostics(params.text_document.uri)
+    # Parse immediately so the cache is warm for completions/hover, but
+    # defer diagnostics behind a debounce timer.
+    _get_parse(params.text_document.uri)
+    _schedule_light_diagnostics(params.text_document.uri)
+
+
+@LSP_SERVER.feature(types.TEXT_DOCUMENT_DID_SAVE)
+def did_save(ls: LanguageServer, params: types.DidSaveTextDocumentParams):
+    uri = params.text_document.uri
+    _log.info("didSave: %s", _short_uri(uri))
+    # Cancel any pending light-diagnostics timer — we'll do a full pass now.
+    old = _debounce_timers.pop(uri, None)
+    if old is not None:
+        old.cancel()
+    _publish_diagnostics(uri)
 
 
 @LSP_SERVER.feature(types.TEXT_DOCUMENT_DID_CLOSE)
 def did_close(ls: LanguageServer, params: types.DidCloseTextDocumentParams):
     uri = params.text_document.uri
     _log.info("didClose: %s", _short_uri(uri))
+    # Cancel pending timer
+    old = _debounce_timers.pop(uri, None)
+    if old is not None:
+        old.cancel()
     _parse_cache.pop(uri, None)
+    _workspace_index.remove_file(uri)
     ls.text_document_publish_diagnostics(
         types.PublishDiagnosticsParams(uri=uri, diagnostics=[])
     )
+
+
+@LSP_SERVER.feature(types.WORKSPACE_DID_CHANGE_WATCHED_FILES)
+def did_change_watched_files(
+    ls: LanguageServer, params: types.DidChangeWatchedFilesParams
+):
+    """Handle workspace file create/delete/rename events.
+
+    Invalidates the cached file list and removes deleted files from the index.
+    """
+    for change in params.changes:
+        _log.debug("watchedFile: %s type=%s", _short_uri(change.uri), change.type)
+        if change.type == types.FileChangeType.Created:
+            _workspace_index.invalidate_file_list()
+        elif change.type == types.FileChangeType.Deleted:
+            _workspace_index.invalidate_file_list()
+            _workspace_index.remove_file(change.uri)
+            _parse_cache.pop(change.uri, None)
+        elif change.type == types.FileChangeType.Changed:
+            # An external change — evict the old cache entry so next access re-reads.
+            _parse_cache.pop(change.uri, None)
+            _workspace_index.remove_file(change.uri)
 
 
 # ─────────────────────── Document Symbols ────────────────────────────────
@@ -2307,16 +2573,16 @@ def _count_words(text: str) -> int:
 @LSP_SERVER.command("renpy.refreshWorkspace")
 def cmd_refresh_workspace() -> Dict[str, object]:
     """Clear parse cache and re-parse all workspace files."""
-    global _parse_cache
     _log.info("command refreshWorkspace: clearing %d cached entries", len(_parse_cache))
     old_count = len(_parse_cache)
     _parse_cache.clear()
+    _path_to_uri.clear()
+    _renpy_py_cache.clear()
 
-    # Re-parse all .rpy files
-    files = _get_workspace_rpy_files()
+    # Full rebuild of workspace index (re-globs + re-parses all files)
     t0 = _time.monotonic()
-    for fp in files:
-        _get_parse_for_file(fp)
+    _workspace_index.rebuild()
+    files = _workspace_index.get_file_list()
     elapsed = (_time.monotonic() - t0) * 1000
     _log.info(
         "command refreshWorkspace: re-parsed %d file(s) in %.1f ms", len(files), elapsed
