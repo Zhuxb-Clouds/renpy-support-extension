@@ -1,5 +1,30 @@
 # Changelog
 
+## [1.2.3] - 2026-03-13
+
+### Improved
+
+- **Label hover now shows leading comment block as description**
+  - Comments immediately following `label name:` are extracted and displayed in the hover popup
+  - Each comment line is shown on a separate line with proper Markdown line breaks
+
+### Fixed
+
+- **Removed erroneous dialogue text from label hover**
+  - Fixed `textDocument/definition` returning a self-referential location for label/screen definitions, which caused VS Code to render a source-code preview (including unrelated dialogue) in the hover popup
+  - Label/screen definition lines now only return jump/call usage locations (or `None` if no usages exist)
+
+- **Fixed Windows label name self-conflict**
+  - Path normalization (`os.path.normcase`) prevents the same file from being indexed under multiple URI variants on case-insensitive file systems
+  - Duplicate label/screen checks now use case-insensitive URI comparison
+
+- **Fixed format request blocking on diagnostics**
+  - `didOpen`/`didSave` diagnostics now run in a background thread, so formatting and other requests are no longer blocked
+  - Added `_cache_lock` and `_diag_lock` for thread safety
+
+- **Improved unused-label check performance**
+  - Replaced full workspace file scan with pre-indexed jump/call targets (`_WorkspaceIndex.get_used_labels()`)
+
 ## [1.2.1] - 2026-03-07
 
 ### Improved

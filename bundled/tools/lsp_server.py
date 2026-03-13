@@ -129,16 +129,47 @@ _parse_cache: Dict[str, Tuple[int, str, Script, RpyParser]] = {}
 # Fast path→URI mapping: avoids O(n) scan in _get_parse_for_file.
 _path_to_uri: Dict[str, str] = {}
 
+# Lock protecting _parse_cache and _path_to_uri from concurrent access
+# (background diagnostics thread vs. main event-loop).
+_cache_lock = threading.Lock()
+
+
+def _normalize_path_key(path: str) -> str:
+    """Normalize a filesystem path for use as a dictionary key.
+
+    On Windows (case-insensitive FS) this lowercases the whole path so that
+    ``C:\\Foo\\bar.rpy`` and ``c:\\foo\\bar.rpy`` map to the same key.
+    On Linux/macOS it's a no-op beyond ``abspath``.
+    """
+    return os.path.normcase(os.path.abspath(path))
+
+
+def _same_file_uri(uri1: str, uri2: str) -> bool:
+    """Return *True* if two file URIs refer to the same file.
+
+    Fast-path: exact string match.  Slow-path (Windows): normalise
+    both sides through *normcase* before comparing.
+    """
+    if uri1 == uri2:
+        return True
+    try:
+        return _normalize_path_key(_path_from_uri(uri1)) == _normalize_path_key(
+            _path_from_uri(uri2)
+        )
+    except Exception:
+        return False
+
 
 def _get_parse(uri: str, source: Optional[str] = None) -> Tuple[Script, RpyParser]:
     """Return cached (ast, parser) for *uri*, re-parsing only when source changes."""
     doc = LSP_SERVER.workspace.get_text_document(uri)
     text = source if source is not None else doc.source
     text_hash = hash(text)
-    cached = _parse_cache.get(uri)
-    if cached and cached[0] == text_hash:
-        _log.debug("_get_parse: cache hit for %s", _short_uri(uri))
-        return cached[2], cached[3]
+    with _cache_lock:
+        cached = _parse_cache.get(uri)
+        if cached and cached[0] == text_hash:
+            _log.debug("_get_parse: cache hit for %s", _short_uri(uri))
+            return cached[2], cached[3]
     _log.info("_get_parse: parsing %s (%d chars)", _short_uri(uri), len(text))
     t0 = _time.monotonic()
     parser = RpyParser(text)
@@ -150,13 +181,14 @@ def _get_parse(uri: str, source: Optional[str] = None) -> Tuple[Script, RpyParse
         elapsed,
         len(ast.body),
     )
-    _parse_cache[uri] = (text_hash, text, ast, parser)
-    # Maintain path→URI mapping
-    try:
-        abs_path = os.path.abspath(_path_from_uri(uri))
-        _path_to_uri[abs_path] = uri
-    except Exception:
-        pass
+    with _cache_lock:
+        _parse_cache[uri] = (text_hash, text, ast, parser)
+        # Maintain path→URI mapping (normalized key for Windows compat)
+        try:
+            norm_key = _normalize_path_key(_path_from_uri(uri))
+            _path_to_uri[norm_key] = uri
+        except Exception:
+            pass
     return ast, parser
 
 
@@ -205,27 +237,29 @@ def _get_workspace_renpy_py_files() -> List[str]:
 
 def _get_parse_for_file(filepath: str) -> Tuple[str, Script, RpyParser]:
     """Parse (or cache-hit) a file by filesystem path. Returns (uri, ast, parser)."""
-    abs_path = os.path.abspath(filepath)
-    # O(1) lookup via path→URI map
-    cached_uri = _path_to_uri.get(abs_path)
-    if cached_uri and cached_uri in _parse_cache:
-        cached_data = _parse_cache[cached_uri]
-        return cached_uri, cached_data[2], cached_data[3]
-    # Compute URI and try cache directly
-    uri = _uri_from_path(filepath)
-    cached_data = _parse_cache.get(uri)
-    if cached_data:
-        _path_to_uri[abs_path] = uri
-        return uri, cached_data[2], cached_data[3]
-    # No existing cache entry found, parse and cache
+    norm_key = _normalize_path_key(filepath)
+    with _cache_lock:
+        # O(1) lookup via path→URI map
+        cached_uri = _path_to_uri.get(norm_key)
+        if cached_uri and cached_uri in _parse_cache:
+            cached_data = _parse_cache[cached_uri]
+            return cached_uri, cached_data[2], cached_data[3]
+        # Compute URI and try cache directly
+        uri = _uri_from_path(filepath)
+        cached_data = _parse_cache.get(uri)
+        if cached_data:
+            _path_to_uri[norm_key] = uri
+            return uri, cached_data[2], cached_data[3]
+    # No existing cache entry found — parse and cache
     try:
         text = Path(filepath).read_text(encoding="utf-8", errors="replace")
     except OSError:
         text = ""
     parser = RpyParser(text)
     ast = parser.parse()
-    _parse_cache[uri] = (hash(text), text, ast, parser)
-    _path_to_uri[abs_path] = uri
+    with _cache_lock:
+        _parse_cache[uri] = (hash(text), text, ast, parser)
+        _path_to_uri[norm_key] = uri
     return uri, ast, parser
 
 
@@ -252,6 +286,9 @@ class _WorkspaceIndex:
         self._screens: Dict[str, Dict[str, List[ScreenDef]]] = {}
         self._images: Dict[str, Dict[str, List[ImageDef]]] = {}
         self._transforms: Dict[str, Dict[str, List[TransformDef]]] = {}
+        # Per-URI jump/call targets  {uri: set_of_target_names}
+        self._jump_targets: Dict[str, set] = {}
+        self._call_targets: Dict[str, set] = {}
         # Track which URIs have been indexed and with which content hash
         self._indexed_hashes: Dict[str, int] = {}
 
@@ -282,17 +319,18 @@ class _WorkspaceIndex:
             root = _path_from_uri(folder.uri)
             for pattern in ("**/*.rpy", "**/*.rpym"):
                 for fp in glob.glob(os.path.join(root, pattern), recursive=True):
-                    abs_fp = os.path.abspath(fp)
-                    if abs_fp not in seen:
-                        seen.add(abs_fp)
-                        results.append(abs_fp)
+                    norm_key = _normalize_path_key(fp)
+                    if norm_key not in seen:
+                        seen.add(norm_key)
+                        results.append(os.path.abspath(fp))
         return results
 
     # ── Incremental index updates ──
 
     def update_file(self, uri: str) -> None:
         """Re-index a single file (called after parse cache is updated)."""
-        cached = _parse_cache.get(uri)
+        with _cache_lock:
+            cached = _parse_cache.get(uri)
         if not cached:
             return
         content_hash, _text, ast, parser = cached
@@ -317,6 +355,17 @@ class _WorkspaceIndex:
             self._transforms[uri] = {}
             for t in parser._collect(ast, TransformDef):
                 self._transforms[uri].setdefault(t.name, []).append(t)
+            # Jump/call targets (for unused-label check)
+            jt: set = set()
+            for j in parser.get_all_jumps():
+                if not j.is_expression:
+                    jt.add(j.target)
+            self._jump_targets[uri] = jt
+            ct: set = set()
+            for c in parser.get_all_calls():
+                if not c.is_expression:
+                    ct.add(c.target)
+            self._call_targets[uri] = ct
             self._indexed_hashes[uri] = content_hash
         _log.debug("_WorkspaceIndex: updated index for %s", _short_uri(uri))
 
@@ -329,6 +378,8 @@ class _WorkspaceIndex:
             self._screens.pop(uri, None)
             self._images.pop(uri, None)
             self._transforms.pop(uri, None)
+            self._jump_targets.pop(uri, None)
+            self._call_targets.pop(uri, None)
             self._indexed_hashes.pop(uri, None)
 
     def ensure_current(self) -> None:
@@ -347,6 +398,8 @@ class _WorkspaceIndex:
             self._screens.clear()
             self._images.clear()
             self._transforms.clear()
+            self._jump_targets.clear()
+            self._call_targets.clear()
             self._indexed_hashes.clear()
         self.ensure_current()
 
@@ -389,6 +442,17 @@ class _WorkspaceIndex:
     def get_transforms(self) -> Dict[str, List[Tuple[str, TransformDef]]]:
         self.ensure_current()
         return self._aggregate(self._transforms)
+
+    def get_used_labels(self) -> set:
+        """Return the set of all label names that are jump/call targets."""
+        self.ensure_current()
+        result: set = set()
+        with self._lock:
+            for targets in self._jump_targets.values():
+                result |= targets
+            for targets in self._call_targets.values():
+                result |= targets
+        return result
 
 
 _workspace_index = _WorkspaceIndex()
@@ -713,8 +777,10 @@ def _make_node_location(uri: str, node: Node) -> types.Location:
         name = node.name
         # Get the raw line from parse cache or file
         raw_line = ""
-        if uri in _parse_cache:
-            source = _parse_cache[uri][1]
+        with _cache_lock:
+            cached = _parse_cache.get(uri)
+        if cached:
+            source = cached[1]
             lines = source.splitlines()
             if 0 <= line < len(lines):
                 raw_line = lines[line]
@@ -899,11 +965,11 @@ def _publish_diagnostics(uri: str):
     for name, locations in all_labels.items():
         if len(locations) > 1:
             for loc_uri, label in locations:
-                if loc_uri == uri:
+                if _same_file_uri(loc_uri, uri):
                     other_files = [
-                        _path_from_uri(u).split("/")[-1]
+                        os.path.basename(_path_from_uri(u))
                         for u, _ in locations
-                        if u != uri or _.lineno != label.lineno
+                        if not _same_file_uri(u, uri) or _.lineno != label.lineno
                     ]
                     if other_files:
                         diags.append(
@@ -927,11 +993,11 @@ def _publish_diagnostics(uri: str):
     for name, locations in all_screens.items():
         if len(locations) > 1:
             for loc_uri, screen in locations:
-                if loc_uri == uri:
+                if _same_file_uri(loc_uri, uri):
                     other_files = [
-                        _path_from_uri(u).split("/")[-1]
+                        os.path.basename(_path_from_uri(u))
                         for u, _ in locations
-                        if u != uri or _.lineno != screen.lineno
+                        if not _same_file_uri(u, uri) or _.lineno != screen.lineno
                     ]
                     if other_files:
                         diags.append(
@@ -971,29 +1037,17 @@ def _publish_diagnostics(uri: str):
                     )
 
     # 6) Check for unused labels (defined but never jumped/called).
-    # Collect all jump/call targets across the workspace using the index.
-    all_jump_targets: set = set()
-    all_call_targets: set = set()
-    for fp in _get_workspace_rpy_files():
-        _, _, fp_parser = _get_parse_for_file(fp)
-        for j in fp_parser.get_all_jumps():
-            if not j.is_expression:
-                all_jump_targets.add(j.target)
-        for c in fp_parser.get_all_calls():
-            if not c.is_expression:
-                all_call_targets.add(c.target)
-
+    # Use the pre-indexed jump/call targets from the workspace index.
+    all_used_labels = _workspace_index.get_used_labels()
     # Also include the current document's targets — covers the case where
     # the file is opened outside of a workspace folder or the workspace
     # scanner hasn't discovered it yet.
     for j in parser.get_all_jumps():
         if not j.is_expression:
-            all_jump_targets.add(j.target)
+            all_used_labels.add(j.target)
     for c in parser.get_all_calls():
         if not c.is_expression:
-            all_call_targets.add(c.target)
-
-    all_used_labels = all_jump_targets | all_call_targets
+            all_used_labels.add(c.target)
     # Special labels that are entry points (never directly called)
     ENTRY_LABELS = {"start", "main_menu", "splashscreen", "after_load", "quit"}
 
@@ -1033,6 +1087,24 @@ def _publish_diagnostics(uri: str):
 _DEBOUNCE_DELAY = 0.3  # seconds
 _debounce_timers: Dict[str, threading.Timer] = {}
 
+# Lock to serialise background diagnostic runs so at most one runs at a time.
+_diag_lock = threading.Lock()
+
+
+def _schedule_full_diagnostics(uri: str) -> None:
+    """Run ``_publish_diagnostics`` in a background thread so the LSP
+    event-loop stays responsive for formatting / completion requests."""
+
+    def _run():
+        with _diag_lock:
+            try:
+                _publish_diagnostics(uri)
+            except Exception:
+                _log.exception("Error in background full diagnostics for %s", uri)
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+
 
 def _schedule_light_diagnostics(uri: str) -> None:
     """Schedule a debounced lightweight diagnostic run for *uri*."""
@@ -1056,8 +1128,13 @@ def _schedule_light_diagnostics(uri: str) -> None:
 
 @LSP_SERVER.feature(types.TEXT_DOCUMENT_DID_OPEN)
 def did_open(ls: LanguageServer, params: types.DidOpenTextDocumentParams):
-    _log.info("didOpen: %s", _short_uri(params.text_document.uri))
-    _publish_diagnostics(params.text_document.uri)
+    uri = params.text_document.uri
+    _log.info("didOpen: %s", _short_uri(uri))
+    # Warm the cache synchronously (fast) so completions/hover work immediately.
+    _get_parse(uri)
+    _workspace_index.update_file(uri)
+    # Run the expensive full diagnostics in a background thread.
+    _schedule_full_diagnostics(uri)
 
 
 @LSP_SERVER.feature(types.TEXT_DOCUMENT_DID_CHANGE)
@@ -1077,7 +1154,11 @@ def did_save(ls: LanguageServer, params: types.DidSaveTextDocumentParams):
     old = _debounce_timers.pop(uri, None)
     if old is not None:
         old.cancel()
-    _publish_diagnostics(uri)
+    # Warm the cache synchronously.
+    _get_parse(uri)
+    _workspace_index.update_file(uri)
+    # Run the expensive full diagnostics in a background thread.
+    _schedule_full_diagnostics(uri)
 
 
 @LSP_SERVER.feature(types.TEXT_DOCUMENT_DID_CLOSE)
@@ -1088,7 +1169,8 @@ def did_close(ls: LanguageServer, params: types.DidCloseTextDocumentParams):
     old = _debounce_timers.pop(uri, None)
     if old is not None:
         old.cancel()
-    _parse_cache.pop(uri, None)
+    with _cache_lock:
+        _parse_cache.pop(uri, None)
     _workspace_index.remove_file(uri)
     ls.text_document_publish_diagnostics(
         types.PublishDiagnosticsParams(uri=uri, diagnostics=[])
@@ -1110,10 +1192,12 @@ def did_change_watched_files(
         elif change.type == types.FileChangeType.Deleted:
             _workspace_index.invalidate_file_list()
             _workspace_index.remove_file(change.uri)
-            _parse_cache.pop(change.uri, None)
+            with _cache_lock:
+                _parse_cache.pop(change.uri, None)
         elif change.type == types.FileChangeType.Changed:
             # An external change — evict the old cache entry so next access re-reads.
-            _parse_cache.pop(change.uri, None)
+            with _cache_lock:
+                _parse_cache.pop(change.uri, None)
             _workspace_index.remove_file(change.uri)
 
 
@@ -1359,8 +1443,11 @@ def goto_definition(
                         if key not in seen:
                             seen.add(key)
                             results.append(_make_node_location(file_uri, c))
-            if results:
-                return results
+            # Always return here — usages if found, else None.
+            # Never fall through to the general label lookup (step 4)
+            # which would return a self-referential definition and
+            # cause VS Code to show a source-code preview in hover.
+            return results if results else None
 
         # Screen definition → show all call screen/show screen usages
         if isinstance(node, ScreenDef):
@@ -1381,8 +1468,7 @@ def goto_definition(
                         if key not in seen:
                             seen.add(key)
                             results.append(_make_node_location(file_uri, n))
-            if results:
-                return results
+            return results if results else None
 
     # ── 1) AST-based resolution: find node at cursor line ──
     for node in nodes:
@@ -1901,11 +1987,24 @@ def hover(ls: LanguageServer, params: types.HoverParams) -> Optional[types.Hover
     if word in all_labels:
         target_uri, lb = all_labels[word][0]
         fname = os.path.basename(_path_from_uri(target_uri))
-        info = f"**label** `{lb.name}`\n\nDefined in `{fname}` at line {lb.lineno}"
+        parts = [f"**label** `{lb.name}`"]
         if lb.parameters:
-            info += f"\n\nParameters: `{lb.parameters}`"
+            parts.append(f"Parameters: `{lb.parameters}`")
+        # Extract leading comment block from label body as description
+        if hasattr(lb, "body") and lb.body:
+            comment_lines: List[str] = []
+            for child in lb.body:
+                if isinstance(child, Comment) and child.text:
+                    comment_lines.append(child.text)
+                else:
+                    break
+            if comment_lines:
+                parts.append("  \n".join(comment_lines))
+        parts.append(f"`{fname}` line {lb.lineno}")
         return types.Hover(
-            contents=types.MarkupContent(kind=types.MarkupKind.Markdown, value=info)
+            contents=types.MarkupContent(
+                kind=types.MarkupKind.Markdown, value="\n\n".join(parts)
+            )
         )
 
     # 3) Check defines (characters, etc.) across workspace
@@ -2575,8 +2674,9 @@ def cmd_refresh_workspace() -> Dict[str, object]:
     """Clear parse cache and re-parse all workspace files."""
     _log.info("command refreshWorkspace: clearing %d cached entries", len(_parse_cache))
     old_count = len(_parse_cache)
-    _parse_cache.clear()
-    _path_to_uri.clear()
+    with _cache_lock:
+        _parse_cache.clear()
+        _path_to_uri.clear()
     _renpy_py_cache.clear()
 
     # Full rebuild of workspace index (re-globs + re-parses all files)
