@@ -1443,7 +1443,7 @@
         {
           "name": "meta.say.statement.renpy",
           "contentName": "renpy.meta.say.$1 string.quoted.renpy",
-          "begin": "(?<=^[ \\t]*)(?:((?:character\\.)?[a-zA-Z_]\\w*)\\b|\"([a-zA-Z_]\\w*)\\b\")((?:[ \\t]+(?:@|\\w+))*)?(?=[ \\t]*r?(?:\"|'|`))",
+          "begin": "(?<=^[ \\t]*)(?:((?:character\\.)?[a-zA-Z_\\p{L}][\\w\\p{L}]*)(?=[\\s\"'`])|\"([a-zA-Z_\\p{L}][\\w\\p{L}]*)\")((?:[ \\t]+(?:@|[\\w\\p{L}]+))*)?(?=[ \\t]*r?(?:\"|'|`))",
           "beginCaptures": {
             "1": {
               "name": "renpy.meta.character.$1 variable.other.renpy",

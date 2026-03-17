@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.2.4] - 2026-03-17
+
+### Fixed
+
+- **Fixed syntax highlighting for Chinese (Unicode) character names in say statements**
+  - The `say-statements` TextMate grammar now uses `\p{L}` (Unicode letter) in character name patterns, so non-ASCII identifiers like `小明 "你好"` are correctly highlighted
+
+- **Formatter now normalizes spacing between character name and dialogue to exactly 1 space**
+  - e.g. `小明    "你好"` → `小明 "你好"` on format
+  - Works with ASCII and Unicode character names, including `character.` prefix
+
 ## [1.2.3] - 2026-03-13
 
 ### Improved

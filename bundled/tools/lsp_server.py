@@ -2089,6 +2089,17 @@ def _leading_spaces(line: str) -> int:
     return n
 
 
+# Pattern that matches a say-statement line (after stripping indent):
+#   character_name  <spaces>  "dialog..."
+# Captures: (character_name)(whitespace)(rest starting with quote)
+_SAY_SPACE_RE = re.compile(
+    r"^((?:character\.)?\w+)"  # character name (ASCII or Unicode \w)
+    r"([ \t]+)"  # whitespace between name and dialog
+    r'(r?(?:"|\'|`).*)',  # the dialog string
+    re.UNICODE,
+)
+
+
 @LSP_SERVER.feature(types.TEXT_DOCUMENT_FORMATTING)
 def format_document(ls: LanguageServer, params: types.DocumentFormattingParams):
     _log.info(
@@ -2133,6 +2144,10 @@ def format_document(ls: LanguageServer, params: types.DocumentFormattingParams):
         level = round(spaces / src_unit) if src_unit else 0
 
         # ── emit with normalized indent ──
+        # Normalize: exactly 1 space between character name and dialog string
+        m = _SAY_SPACE_RE.match(stripped)
+        if m:
+            stripped = m.group(1) + " " + m.group(3)
         formatted.append(target_indent * level + stripped)
 
     # Trailing newline
