@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.3.0] - 2026-04-03
+
+### Added
+
+- **Translation ID hover for dialogue lines**
+  - Hovering over any `say` or narrator say line now shows the Ren'Py translation identifier (e.g. `start_a1b2c3d4`)
+  - Uses the same MD5-based algorithm as Ren'Py itself, so IDs match what `renpy.translation` generates
+  - Works with labeled and unlabeled blocks, character names, and narrator dialogue
+
 ## [1.2.4] - 2026-03-17
 
 ### Fixed
