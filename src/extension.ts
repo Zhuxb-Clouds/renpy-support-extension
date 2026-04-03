@@ -165,6 +165,7 @@ export function activate(context: vscode.ExtensionContext) {
       log("Command: showStats");
       showProjectStats();
     }),
+
   );
 
   // Auto-start when .rpy files are present
@@ -424,7 +425,7 @@ async function startLanguageServer(context: vscode.ExtensionContext) {
   if (!pythonPath) {
     const choice = await vscode.window.showErrorMessage(
       "Ren'Py LSP: could not locate a Python 3 interpreter. " +
-        "Please install Python 3.11+ or set the path manually.",
+      "Please install Python 3.11+ or set the path manually.",
       "Open Settings",
       "Install Python Extension",
     );
@@ -469,6 +470,7 @@ async function startLanguageServer(context: vscode.ExtensionContext) {
   client.start().then(
     () => {
       log("startLanguageServer: server started successfully");
+
     },
     (error: Error) => {
       logError("startLanguageServer: failed to start server", error);

@@ -63,8 +63,9 @@ from ast_parser import (
     ShowScreen,
 )
 
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, Generator, List, Optional, Tuple, Union
 import glob
+import hashlib
 import threading
 from pathlib import Path
 from urllib.parse import quote as url_quote
@@ -2056,6 +2057,92 @@ def hover(ls: LanguageServer, params: types.HoverParams) -> Optional[types.Hover
             )
         )
 
+    # 7) Check if the line is a Say/NarratorSay — show translation ID on hover
+    say_hit = _find_say_at_line(uri, params.position.line)
+    if say_hit is not None:
+        node, label_name = say_hit
+        who = node.who if isinstance(node, Say) else None
+        tid = _renpy_translate_id(label_name, who, node.what)
+        return types.Hover(
+            contents=types.MarkupContent(
+                kind=types.MarkupKind.Markdown,
+                value=f"**Translation ID**: `{tid}`",
+            )
+        )
+
+    return None
+
+
+# ─────────────────────── Translation ID helpers ─────────────────────────
+
+
+def _say_get_code(who: Optional[str], what: str) -> str:
+    """Reproduce Ren'Py ``Say.get_code()`` for simple say statements.
+
+    Our parser's ``Say.what`` is captured verbatim from the source between
+    quotes (escapes preserved), which matches the output of Ren'Py's
+    ``encode_say_string(parsed_what)``. So we just wrap it in quotes.
+    """
+    parts: List[str] = []
+    if who:
+        parts.append(who)
+    parts.append('"' + what + '"')
+    return " ".join(parts)
+
+
+def _renpy_translate_id(label: Optional[str], who: Optional[str], what: str) -> str:
+    """Compute a Ren'Py-compatible translation identifier.
+
+    Algorithm (from ``renpy/translation/__init__.py`` — ``Restructurer``):
+      1. ``code = Say.get_code()``
+      2. ``md5.update((code + '\\r\\n').encode('utf-8'))``
+      3. ``digest = md5.hexdigest()[:8]``
+      4. With label: ``label.replace('.', '_') + '_' + digest``
+         Without label: just ``digest``
+    """
+    code = _say_get_code(who, what)
+    md5 = hashlib.md5()
+    md5.update((code + "\r\n").encode("utf-8"))
+    digest = md5.hexdigest()[:8]
+    if label is None:
+        return digest
+    return label.replace(".", "_") + "_" + digest
+
+
+def _collect_dialogue_with_labels(
+    nodes: List[Node], current_label: Optional[str] = None
+) -> Generator[Tuple[Union[Say, NarratorSay], Optional[str]], None, None]:
+    """Walk *nodes* recursively, yielding ``(say_node, enclosing_label_name)``."""
+    for node in nodes:
+        if isinstance(node, Label):
+            current_label = node.name
+        if isinstance(node, (Say, NarratorSay)):
+            yield node, current_label
+        # Recurse into children (body, elif, else, menu items, …)
+        children: List[Node] = []
+        if hasattr(node, "body") and isinstance(node.body, list):
+            children.extend(node.body)
+        if isinstance(node, If):
+            for ec in node.elif_clauses:
+                children.append(ec)
+                children.extend(ec.body)
+            children.extend(node.else_body)
+        if isinstance(node, Menu):
+            children.extend(node.body)
+        if children:
+            yield from _collect_dialogue_with_labels(children, current_label)
+
+
+def _find_say_at_line(
+    uri: str, line: int
+) -> Optional[Tuple[Union[Say, NarratorSay], Optional[str]]]:
+    """Return the Say/NarratorSay node at *line* (0-based) and its enclosing label, if any."""
+    ast, parser = _get_parse(uri)
+    if ast is None:
+        return None
+    for node, label_name in _collect_dialogue_with_labels(ast.body):
+        if node.lineno - 1 == line:
+            return node, label_name
     return None
 
 
