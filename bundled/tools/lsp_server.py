@@ -63,10 +63,20 @@ from ast_parser import (
     ShowScreen,
 )
 
+from renpy_data import (
+    RENPY_KEYWORDS,
+    RENPY_TRANSITIONS,
+    RENPY_TRANSFORMS,
+    KEYWORD_DOCS,
+    count_words,
+)
+from workspace_index import WorkspaceIndex
+
 from typing import Dict, Generator, List, Optional, Tuple, Union
 import glob
 import hashlib
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.parse import quote as url_quote
 from urllib.parse import unquote as url_unquote
@@ -266,197 +276,17 @@ def _get_parse_for_file(filepath: str) -> Tuple[str, Script, RpyParser]:
 
 # ─────────────────────── Workspace Index ─────────────────────────────────
 
-
-class _WorkspaceIndex:
-    """Incrementally maintained index of all workspace .rpy/.rpym files.
-
-    Instead of re-globbing and re-parsing *all* files on every request, the
-    index caches file lists and per-file symbol data.  It is updated
-    incrementally when individual files change.
-    """
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        # Cached file list
-        self._rpy_files: Optional[List[str]] = None
-        self._files_dirty = True
-        # Per-URI symbol indices  {uri: {name: [node, ...]}}
-        self._labels: Dict[str, Dict[str, List[Label]]] = {}
-        self._defines: Dict[str, Dict[str, List[Define]]] = {}
-        self._defaults: Dict[str, Dict[str, List[Default]]] = {}
-        self._screens: Dict[str, Dict[str, List[ScreenDef]]] = {}
-        self._images: Dict[str, Dict[str, List[ImageDef]]] = {}
-        self._transforms: Dict[str, Dict[str, List[TransformDef]]] = {}
-        # Per-URI jump/call targets  {uri: set_of_target_names}
-        self._jump_targets: Dict[str, set] = {}
-        self._call_targets: Dict[str, set] = {}
-        # Track which URIs have been indexed and with which content hash
-        self._indexed_hashes: Dict[str, int] = {}
-
-    # ── File list management ──
-
-    def invalidate_file_list(self) -> None:
-        """Mark the file list as stale (call on file create/delete)."""
-        with self._lock:
-            self._files_dirty = True
-
-    def get_file_list(self) -> List[str]:
-        """Return cached workspace .rpy/.rpym files, re-globbing only if dirty."""
-        with self._lock:
-            if self._files_dirty or self._rpy_files is None:
-                self._rpy_files = self._glob_rpy_files()
-                self._files_dirty = False
-                _log.debug(
-                    "_WorkspaceIndex: re-globbed %d file(s)",
-                    len(self._rpy_files),
-                )
-            return list(self._rpy_files)
-
-    @staticmethod
-    def _glob_rpy_files() -> List[str]:
-        seen: set = set()
-        results: List[str] = []
-        for folder in LSP_SERVER.workspace.folders.values():
-            root = _path_from_uri(folder.uri)
-            for pattern in ("**/*.rpy", "**/*.rpym"):
-                for fp in glob.glob(os.path.join(root, pattern), recursive=True):
-                    norm_key = _normalize_path_key(fp)
-                    if norm_key not in seen:
-                        seen.add(norm_key)
-                        results.append(os.path.abspath(fp))
-        return results
-
-    # ── Incremental index updates ──
-
-    def update_file(self, uri: str) -> None:
-        """Re-index a single file (called after parse cache is updated)."""
-        with _cache_lock:
-            cached = _parse_cache.get(uri)
-        if not cached:
-            return
-        content_hash, _text, ast, parser = cached
-        if self._indexed_hashes.get(uri) == content_hash:
-            return  # Already indexed this version
-        with self._lock:
-            self._labels[uri] = {}
-            for lb in parser.get_all_labels():
-                self._labels[uri].setdefault(lb.name, []).append(lb)
-            self._defines[uri] = {}
-            for d in parser.get_all_defines():
-                self._defines[uri].setdefault(d.name, []).append(d)
-            self._defaults[uri] = {}
-            for d in parser.get_all_defaults():
-                self._defaults[uri].setdefault(d.name, []).append(d)
-            self._screens[uri] = {}
-            for s in parser.get_all_screens():
-                self._screens[uri].setdefault(s.name, []).append(s)
-            self._images[uri] = {}
-            for img in parser.get_all_images():
-                self._images[uri].setdefault(img.name, []).append(img)
-            self._transforms[uri] = {}
-            for t in parser._collect(ast, TransformDef):
-                self._transforms[uri].setdefault(t.name, []).append(t)
-            # Jump/call targets (for unused-label check)
-            jt: set = set()
-            for j in parser.get_all_jumps():
-                if not j.is_expression:
-                    jt.add(j.target)
-            self._jump_targets[uri] = jt
-            ct: set = set()
-            for c in parser.get_all_calls():
-                if not c.is_expression:
-                    ct.add(c.target)
-            self._call_targets[uri] = ct
-            self._indexed_hashes[uri] = content_hash
-        _log.debug("_WorkspaceIndex: updated index for %s", _short_uri(uri))
-
-    def remove_file(self, uri: str) -> None:
-        """Remove a file from the index."""
-        with self._lock:
-            self._labels.pop(uri, None)
-            self._defines.pop(uri, None)
-            self._defaults.pop(uri, None)
-            self._screens.pop(uri, None)
-            self._images.pop(uri, None)
-            self._transforms.pop(uri, None)
-            self._jump_targets.pop(uri, None)
-            self._call_targets.pop(uri, None)
-            self._indexed_hashes.pop(uri, None)
-
-    def ensure_current(self) -> None:
-        """Ensure all workspace files are indexed (lazy full rebuild)."""
-        for fp in self.get_file_list():
-            uri, _ast, _parser = _get_parse_for_file(fp)
-            self.update_file(uri)
-
-    def rebuild(self) -> None:
-        """Force a full rebuild of the index."""
-        with self._lock:
-            self._files_dirty = True
-            self._labels.clear()
-            self._defines.clear()
-            self._defaults.clear()
-            self._screens.clear()
-            self._images.clear()
-            self._transforms.clear()
-            self._jump_targets.clear()
-            self._call_targets.clear()
-            self._indexed_hashes.clear()
-        self.ensure_current()
-
-    # ── Query methods (aggregate across all files) ──
-
-    def _aggregate(
-        self, store: Dict[str, Dict[str, list]]
-    ) -> Dict[str, List[Tuple[str, object]]]:
-        """Merge per-URI sub-dicts into {name: [(uri, node), ...]}."""
-        result: dict = {}
-        with self._lock:
-            for uri, name_map in store.items():
-                for name, nodes in name_map.items():
-                    if name not in result:
-                        result[name] = []
-                    for n in nodes:
-                        result[name].append((uri, n))
-        return result
-
-    def get_labels(self) -> Dict[str, List[Tuple[str, Label]]]:
-        self.ensure_current()
-        return self._aggregate(self._labels)
-
-    def get_defines(self) -> Dict[str, List[Tuple[str, Define]]]:
-        self.ensure_current()
-        return self._aggregate(self._defines)
-
-    def get_defaults(self) -> Dict[str, List[Tuple[str, Default]]]:
-        self.ensure_current()
-        return self._aggregate(self._defaults)
-
-    def get_screens(self) -> Dict[str, List[Tuple[str, ScreenDef]]]:
-        self.ensure_current()
-        return self._aggregate(self._screens)
-
-    def get_images(self) -> Dict[str, List[Tuple[str, ImageDef]]]:
-        self.ensure_current()
-        return self._aggregate(self._images)
-
-    def get_transforms(self) -> Dict[str, List[Tuple[str, TransformDef]]]:
-        self.ensure_current()
-        return self._aggregate(self._transforms)
-
-    def get_used_labels(self) -> set:
-        """Return the set of all label names that are jump/call targets."""
-        self.ensure_current()
-        result: set = set()
-        with self._lock:
-            for targets in self._jump_targets.values():
-                result |= targets
-            for targets in self._call_targets.values():
-                result |= targets
-        return result
-
-
-_workspace_index = _WorkspaceIndex()
+# The WorkspaceIndex class lives in workspace_index.py.
+# We instantiate it here with injected dependencies (cache, utils).
+_workspace_index = WorkspaceIndex(
+    server=LSP_SERVER,
+    parse_cache=_parse_cache,
+    cache_lock=_cache_lock,
+    path_to_uri=_path_to_uri,
+    path_from_uri_fn=_path_from_uri,
+    normalize_path_fn=_normalize_path_key,
+    get_parse_for_file_fn=_get_parse_for_file,
+)
 
 
 def _get_all_workspace_labels() -> Dict[str, List[Tuple[str, "Label"]]]:
@@ -672,34 +502,50 @@ def _resolve_renpy_file(
     return None
 
 
-def _resolve_image_name_to_file(image_name: str) -> Optional[str]:
-    """Try to find an image file matching *image_name* via Ren'Py auto-detection.
+# ── Image auto-name cache ──
+# Maps lowercased image name → absolute file path.
+# Invalidated on file create/delete (see did_change_watched_files).
+_image_cache: Dict[str, str] = {}
+_image_cache_built = False
 
-    Ren'Py scans ``config.image_directories`` (default ``['images']``) and
-    creates image names from file paths: ``images/bg/room.png`` → ``bg room``.
-    Also supports flat naming: ``images/bg_room.png`` → ``bg_room``.
-    """
+
+def _ensure_image_cache() -> None:
+    """Build the image auto-name → filepath index if not yet populated."""
+    global _image_cache_built
+    if _image_cache_built:
+        return
     IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".avif", ".svg")
+    cache: Dict[str, str] = {}
     for search_dir in _get_renpy_search_dirs():
         images_dir = os.path.join(search_dir, "images")
         if not os.path.isdir(images_dir):
             continue
-        # Walk images directory looking for matching files
         for dirpath, _dirnames, filenames in os.walk(images_dir):
             for fn in filenames:
                 base, ext = os.path.splitext(fn)
                 if ext.lower() not in IMAGE_EXTENSIONS:
                     continue
-                # Build Ren'Py auto-image name: relative path with / replaced by space
+                abs_path = os.path.abspath(os.path.join(dirpath, fn))
                 rel = os.path.relpath(os.path.join(dirpath, fn), images_dir)
                 rel_no_ext = os.path.splitext(rel)[0]
-                auto_name = rel_no_ext.replace(os.sep, " ").replace("/", " ")
-                if auto_name.lower() == image_name.lower():
-                    return os.path.abspath(os.path.join(dirpath, fn))
-                # Also try matching just the filename without extension
-                if base.lower() == image_name.lower():
-                    return os.path.abspath(os.path.join(dirpath, fn))
-    return None
+                auto_name = rel_no_ext.replace(os.sep, " ").replace("/", " ").lower()
+                if auto_name not in cache:
+                    cache[auto_name] = abs_path
+                base_lower = base.lower()
+                if base_lower not in cache:
+                    cache[base_lower] = abs_path
+    _image_cache.update(cache)
+    _image_cache_built = True
+    _log.debug("_ensure_image_cache: indexed %d image entries", len(cache))
+
+
+def _resolve_image_name_to_file(image_name: str) -> Optional[str]:
+    """Try to find an image file matching *image_name* via Ren'Py auto-detection.
+
+    Results are cached in ``_image_cache`` to avoid repeated directory walks.
+    """
+    _ensure_image_cache()
+    return _image_cache.get(image_name.lower())
 
 
 # ── AST / line analysis helpers ──
@@ -1091,19 +937,54 @@ _debounce_timers: Dict[str, threading.Timer] = {}
 # Lock to serialise background diagnostic runs so at most one runs at a time.
 _diag_lock = threading.Lock()
 
+# Coalescing queue for full diagnostics — avoids spawning one thread per save.
+_diag_queue: Dict[str, float] = {}  # uri → timestamp when queued
+_diag_queue_lock = threading.Lock()
+_diag_thread_running = False
+_DIAG_COALESCE_DELAY = 0.15  # seconds — wait briefly to batch rapid saves
+
 
 def _schedule_full_diagnostics(uri: str) -> None:
-    """Run ``_publish_diagnostics`` in a background thread so the LSP
-    event-loop stays responsive for formatting / completion requests."""
+    """Queue *uri* for background index update + diagnostics.
 
-    def _run():
-        with _diag_lock:
-            try:
-                _publish_diagnostics(uri)
-            except Exception:
-                _log.exception("Error in background full diagnostics for %s", uri)
+    Multiple saves within ``_DIAG_COALESCE_DELAY`` are batched into a single
+    diagnostic pass so that e.g. "Format All Files" doesn't spawn N threads.
+    """
+    global _diag_thread_running
+    with _diag_queue_lock:
+        _diag_queue[uri] = _time.monotonic()
+        if _diag_thread_running:
+            return  # existing thread will pick up the new entry
+        _diag_thread_running = True
 
-    t = threading.Thread(target=_run, daemon=True)
+    def _drain():
+        global _diag_thread_running
+        try:
+            while True:
+                # Wait a short window to coalesce rapid saves
+                _time.sleep(_DIAG_COALESCE_DELAY)
+                with _diag_queue_lock:
+                    if not _diag_queue:
+                        _diag_thread_running = False
+                        return
+                    batch = dict(_diag_queue)
+                    _diag_queue.clear()
+                with _diag_lock:
+                    for batch_uri in batch:
+                        try:
+                            _workspace_index.update_file(batch_uri)
+                            _publish_diagnostics(batch_uri)
+                        except Exception:
+                            _log.exception(
+                                "Error in background diagnostics for %s", batch_uri
+                            )
+        except Exception:
+            _log.exception("Error in diagnostics drain thread")
+        finally:
+            with _diag_queue_lock:
+                _diag_thread_running = False
+
+    t = threading.Thread(target=_drain, daemon=True, name="diag-drain")
     t.start()
 
 
@@ -1133,8 +1014,10 @@ def did_open(ls: LanguageServer, params: types.DidOpenTextDocumentParams):
     _log.info("didOpen: %s", _short_uri(uri))
     # Warm the cache synchronously (fast) so completions/hover work immediately.
     _get_parse(uri)
-    _workspace_index.update_file(uri)
-    # Run the expensive full diagnostics in a background thread.
+    # Kick off background index warm-up on the first file open.
+    if not _workspace_index.is_ready() and not _workspace_index._warming:
+        _workspace_index.warm()
+    # Run index update + full diagnostics in a background thread.
     _schedule_full_diagnostics(uri)
 
 
@@ -1155,10 +1038,9 @@ def did_save(ls: LanguageServer, params: types.DidSaveTextDocumentParams):
     old = _debounce_timers.pop(uri, None)
     if old is not None:
         old.cancel()
-    # Warm the cache synchronously.
+    # Warm the parse cache synchronously (fast).
     _get_parse(uri)
-    _workspace_index.update_file(uri)
-    # Run the expensive full diagnostics in a background thread.
+    # Index update + full diagnostics run in a background thread.
     _schedule_full_diagnostics(uri)
 
 
@@ -1188,13 +1070,22 @@ def did_change_watched_files(
     """
     for change in params.changes:
         _log.debug("watchedFile: %s type=%s", _short_uri(change.uri), change.type)
+        change_path = _path_from_uri(change.uri)
+        is_rpy = change_path.endswith((".rpy", ".rpym"))
         if change.type == types.FileChangeType.Created:
-            _workspace_index.invalidate_file_list()
+            if is_rpy:
+                _workspace_index.add_file(change_path)
+            else:
+                # Might be an image file — invalidate image cache
+                _image_cache.clear()
         elif change.type == types.FileChangeType.Deleted:
-            _workspace_index.invalidate_file_list()
-            _workspace_index.remove_file(change.uri)
-            with _cache_lock:
-                _parse_cache.pop(change.uri, None)
+            if is_rpy:
+                _workspace_index.remove_file_from_list(change_path)
+                _workspace_index.remove_file(change.uri)
+                with _cache_lock:
+                    _parse_cache.pop(change.uri, None)
+            else:
+                _image_cache.clear()
         elif change.type == types.FileChangeType.Changed:
             # An external change — evict the old cache entry so next access re-reads.
             with _cache_lock:
@@ -1706,96 +1597,8 @@ def _word_at_position(line: str, col: int) -> str:
 
 # ─────────────────────── Completion ──────────────────────────────────────
 
-# Ren'Py keywords for completion.
-_RENPY_KEYWORDS = [
-    "label",
-    "jump",
-    "call",
-    "return",
-    "pass",
-    "menu",
-    "if",
-    "elif",
-    "else",
-    "while",
-    "for",
-    "in",
-    "define",
-    "default",
-    "image",
-    "transform",
-    "screen",
-    "style",
-    "scene",
-    "show",
-    "hide",
-    "with",
-    "at",
-    "behind",
-    "play",
-    "stop",
-    "queue",
-    "voice",
-    "init",
-    "python",
-    "translate",
-    "pause",
-    "nvl",
-    "window",
-    "show screen",
-    "hide screen",
-    "call screen",
-]
-
-_RENPY_TRANSITIONS = [
-    "dissolve",
-    "fade",
-    "pixellate",
-    "move",
-    "moveinright",
-    "moveinleft",
-    "moveintop",
-    "moveinbottom",
-    "moveoutright",
-    "moveoutleft",
-    "moveouttop",
-    "moveoutbottom",
-    "ease",
-    "easeinright",
-    "easeinleft",
-    "easeintop",
-    "easeinbottom",
-    "easeoutright",
-    "easeoutleft",
-    "easeouttop",
-    "easeoutbottom",
-    "zoomin",
-    "zoomout",
-    "vpunch",
-    "hpunch",
-    "blinds",
-    "squares",
-    "wipeleft",
-    "wiperight",
-    "wipeup",
-    "wipedown",
-    "None",
-]
-
-_RENPY_TRANSFORMS = [
-    "left",
-    "right",
-    "center",
-    "truecenter",
-    "topleft",
-    "topright",
-    "top",
-    "bottom",
-    "offscreenleft",
-    "offscreenright",
-    "default",
-    "reset",
-]
+# Ren'Py keyword/transition/transform lists are in renpy_data.py:
+#   RENPY_KEYWORDS, RENPY_TRANSITIONS, RENPY_TRANSFORMS
 
 
 @LSP_SERVER.feature(
@@ -1836,7 +1639,7 @@ def completions(
             )
     elif line_prefix.endswith("with "):
         # Complete transitions
-        for t in _RENPY_TRANSITIONS:
+        for t in RENPY_TRANSITIONS:
             items.append(
                 types.CompletionItem(
                     label=t,
@@ -1845,8 +1648,8 @@ def completions(
                 )
             )
     elif line_prefix.endswith("at "):
-        # Complete transforms
-        for t in _RENPY_TRANSFORMS:
+        # Complete built-in transforms
+        for t in RENPY_TRANSFORMS:
             items.append(
                 types.CompletionItem(
                     label=t,
@@ -1854,20 +1657,77 @@ def completions(
                     detail="transform position",
                 )
             )
-        # Also suggest user-defined transforms — not implemented yet for cross-file.
-    elif line_prefix.endswith(("show screen ", "hide screen ", "call screen ")):
-        # Complete screen names
-        for s in parser.get_all_screens():
+        # User-defined transforms from entire workspace
+        all_transforms = _get_all_workspace_transforms()
+        for tname, entries in all_transforms.items():
+            t_uri, tdef = entries[0]
+            fname = os.path.basename(_path_from_uri(t_uri))
             items.append(
                 types.CompletionItem(
-                    label=s.name,
-                    kind=types.CompletionItemKind.Class,
-                    detail=f"screen (line {s.lineno})",
+                    label=tname,
+                    kind=types.CompletionItemKind.Function,
+                    detail=f"transform ({fname}:{tdef.lineno})",
                 )
             )
+    elif line_prefix.endswith(("show screen ", "hide screen ", "call screen ")):
+        # Complete screen names from workspace
+        all_screens = _get_all_workspace_screens()
+        for sname, entries in all_screens.items():
+            s_uri, sdef = entries[0]
+            fname = os.path.basename(_path_from_uri(s_uri))
+            items.append(
+                types.CompletionItem(
+                    label=sname,
+                    kind=types.CompletionItemKind.Class,
+                    detail=f"screen ({fname}:{sdef.lineno})",
+                )
+            )
+    elif re.match(r"^\s*(?:show|scene|hide)\s+$", line_prefix, re.IGNORECASE):
+        # Complete image names after show/scene/hide
+        # 1) image definitions from .rpy files
+        all_images = _get_all_workspace_images()
+        for img_name, entries in all_images.items():
+            img_uri, img_def = entries[0]
+            fname = os.path.basename(_path_from_uri(img_uri))
+            items.append(
+                types.CompletionItem(
+                    label=img_name,
+                    kind=types.CompletionItemKind.File,
+                    detail=f"image ({fname}:{img_def.lineno})",
+                )
+            )
+        # 2) auto-detected image files from images/ directory
+        _ensure_image_cache()
+        seen = {n.lower() for n in all_images}
+        for auto_name in sorted(_image_cache):
+            if auto_name not in seen:
+                items.append(
+                    types.CompletionItem(
+                        label=auto_name,
+                        kind=types.CompletionItemKind.File,
+                        detail="image (auto)",
+                    )
+                )
+                seen.add(auto_name)
+    elif re.match(r"^\s*(?:play|queue)\s+\w+\s+$", line_prefix, re.IGNORECASE):
+        # Complete audio names after "play music ", "play sound ", "queue music ", etc.
+        # Suggest define names with "audio." prefix (Ren'Py convention: define audio.xxx = "file.ogg")
+        all_defines = _get_all_workspace_defines()
+        for dname, entries in all_defines.items():
+            if dname.startswith("audio."):
+                short = dname[len("audio.") :]
+                d_uri, ddef = entries[0]
+                fname = os.path.basename(_path_from_uri(d_uri))
+                items.append(
+                    types.CompletionItem(
+                        label=short,
+                        kind=types.CompletionItemKind.Variable,
+                        detail=f"{dname} ({fname}:{ddef.lineno})",
+                    )
+                )
     else:
         # General: keywords + characters + labels
-        for kw in _RENPY_KEYWORDS:
+        for kw in RENPY_KEYWORDS:
             items.append(
                 types.CompletionItem(
                     label=kw,
@@ -1897,66 +1757,7 @@ def completions(
 
 # ─────────────────────── Hover ───────────────────────────────────────────
 
-_KEYWORD_DOCS = {
-    "label": "**label** *name*:\n\nDefines a named point in the script that can be jumped to or called.\n\n[📖 Ren'Py Docs](https://www.renpy.org/doc/html/label.html)",
-    "jump": "**jump** *label_name*\n\nTransfers control to the named label. Does not return.\n\n[📖 Ren'Py Docs](https://www.renpy.org/doc/html/label.html#jump-statement)",
-    "call": "**call** *label_name* [**from** *id*]\n\nCalls the named label as a subroutine. Use `return` to come back.\n\n[📖 Ren'Py Docs](https://www.renpy.org/doc/html/label.html#call-statement)",
-    "return": "**return** [*expression*]\n\nReturns from a `call` statement, optionally with a value.\n\n[📖 Ren'Py Docs](https://www.renpy.org/doc/html/label.html#return-statement)",
-    "menu": "**menu** [*name*]:\n\nDisplays a menu of choices to the player.\n\n[📖 Ren'Py Docs](https://www.renpy.org/doc/html/menus.html)",
-    "define": "**define** *name* = *expression*\n\nDefines a name at init time. Commonly used for `Character()` definitions.\n\n[📖 Ren'Py Docs](https://www.renpy.org/doc/html/python.html#define-statement)",
-    "default": "**default** *name* = *expression*\n\nSets the default value of a variable, created at game start.\n\n[📖 Ren'Py Docs](https://www.renpy.org/doc/html/python.html#default-statement)",
-    "scene": "**scene** *image* [**at** *transform*] [**with** *transition*]\n\nClears all images and shows a new background.\n\n[📖 Ren'Py Docs](https://www.renpy.org/doc/html/displaying_images.html#scene-statement)",
-    "show": "**show** *image* [**at** *transform*] [**with** *transition*]\n\nShows an image on the screen.\n\n[📖 Ren'Py Docs](https://www.renpy.org/doc/html/displaying_images.html#show-statement)",
-    "hide": "**hide** *image* [**with** *transition*]\n\nHides the named image.\n\n[📖 Ren'Py Docs](https://www.renpy.org/doc/html/displaying_images.html#hide-statement)",
-    "with": "**with** *transition*\n\nApplies a transition effect (e.g., dissolve, fade).\n\n[📖 Ren'Py Docs](https://www.renpy.org/doc/html/displaying_images.html#with-statement)",
-    "play": '**play** *channel* "*file*" [**fadein** *sec*]\n\nPlays audio on the specified channel.\n\n[📖 Ren\'Py Docs](https://www.renpy.org/doc/html/audio.html#play-statement)',
-    "stop": "**stop** *channel* [**fadeout** *sec*]\n\nStops audio on the specified channel.\n\n[📖 Ren'Py Docs](https://www.renpy.org/doc/html/audio.html#stop-statement)",
-    "voice": '**voice** "*file*"\n\nPlays a voice file for the next line of dialogue.\n\n[📖 Ren\'Py Docs](https://www.renpy.org/doc/html/voice.html)',
-    "screen": "**screen** *name*([*params*]):\n\nDefines a screen for the screen language.\n\n[📖 Ren'Py Docs](https://www.renpy.org/doc/html/screens.html)",
-    "transform": "**transform** *name*([*params*]):\n\nDefines an ATL transform.\n\n[📖 Ren'Py Docs](https://www.renpy.org/doc/html/atl.html#transform-statement)",
-    "image": "**image** *name* = *expression*\n\nDefines an image that can be used with `show` or `scene`.\n\n[📖 Ren'Py Docs](https://www.renpy.org/doc/html/displaying_images.html#image-statement)",
-    "init": "**init** [*priority*] [**python**]:\n\nRuns code at initialization time, before the game starts.\n\n[📖 Ren'Py Docs](https://www.renpy.org/doc/html/python.html#init-python-statement)",
-    "python": "**python**:\n\nA block of Python code to execute.\n\n[📖 Ren'Py Docs](https://www.renpy.org/doc/html/python.html)",
-    "if": "**if** *condition*:\n\nConditional branch. Can be followed by `elif` and `else`.\n\n[📖 Ren'Py Docs](https://www.renpy.org/doc/html/conditional.html)",
-    "elif": "**elif** *condition*:\n\nAlternative branch in an if/elif/else chain.\n\n[📖 Ren'Py Docs](https://www.renpy.org/doc/html/conditional.html)",
-    "else": "**else**:\n\nFinal fallback branch in an if/elif/else chain.\n\n[📖 Ren'Py Docs](https://www.renpy.org/doc/html/conditional.html)",
-    "while": "**while** *condition*:\n\nRepeats the indented block as long as the condition is true.\n\n[📖 Ren'Py Docs](https://www.renpy.org/doc/html/conditional.html#while-statement)",
-    "for": "**for** *var* **in** *iterable*:\n\nIterates over items in a collection.\n\n[📖 Ren'Py Docs](https://www.renpy.org/doc/html/conditional.html#while-statement)",
-    "pass": "**pass**\n\nA no-op statement. Used as a placeholder.\n\n[📖 Ren'Py Docs](https://www.renpy.org/doc/html/label.html)",
-    "translate": "**translate** *language* *identifier*:\n\nProvides a translation for a block of dialogue.\n\n[📖 Ren'Py Docs](https://www.renpy.org/doc/html/translation.html)",
-    "style": "**style** *name* [**is** *parent*]:\n\nDefines or modifies a style.\n\n[📖 Ren'Py Docs](https://www.renpy.org/doc/html/style.html)",
-    # ── ATL keywords ──
-    "contains": "**contains**:\n\nIn ATL, creates a child displayable within a transform. Multiple `contains` blocks display layered children.\n\n[📖 Ren'Py Docs](https://www.renpy.org/doc/html/atl.html#contains-statement)",
-    "parallel": "**parallel**:\n\nRuns multiple ATL blocks simultaneously.\n\n[📖 Ren'Py Docs](https://www.renpy.org/doc/html/atl.html#parallel-statement)",
-    "block": "**block**:\n\nGroups a set of ATL statements together as one unit.\n\n[📖 Ren'Py Docs](https://www.renpy.org/doc/html/atl.html#block-statement)",
-    "choice": "**choice** [*weight*]:\n\nIn ATL, randomly picks one of several branches to execute.\n\n[📖 Ren'Py Docs](https://www.renpy.org/doc/html/atl.html#choice-statement)",
-    "linear": "**linear** *duration*\n\nATL warper: interpolates properties linearly over *duration* seconds.\n\n[📖 Ren'Py Docs](https://www.renpy.org/doc/html/atl.html#warpers)",
-    "ease": "**ease** *duration*\n\nATL warper: interpolates with ease-in/ease-out (slow start and end).\n\n[📖 Ren'Py Docs](https://www.renpy.org/doc/html/atl.html#warpers)",
-    "easein": "**easein** *duration*\n\nATL warper: slow at the start, fast at the end.\n\n[📖 Ren'Py Docs](https://www.renpy.org/doc/html/atl.html#warpers)",
-    "easeout": "**easeout** *duration*\n\nATL warper: fast at the start, slow at the end.\n\n[📖 Ren'Py Docs](https://www.renpy.org/doc/html/atl.html#warpers)",
-    "repeat": "**repeat** [*count*]\n\nRepeats the ATL block. Without a count, repeats forever.\n\n[📖 Ren'Py Docs](https://www.renpy.org/doc/html/atl.html#repeat-statement)",
-    "pause": "**pause** [*duration*]\n\nPauses execution for the given number of seconds.\n\n[📖 Ren'Py Docs](https://www.renpy.org/doc/html/atl.html#pause-statement)",
-    # ── ATL / Style properties ──
-    "xpos": "**xpos** *value*\n\nHorizontal position in pixels.\n\n[📖 Ren'Py Docs](https://www.renpy.org/doc/html/style_properties.html#style-property-xpos)",
-    "ypos": "**ypos** *value*\n\nVertical position in pixels.\n\n[📖 Ren'Py Docs](https://www.renpy.org/doc/html/style_properties.html#style-property-ypos)",
-    "xanchor": "**xanchor** *value*\n\nHorizontal anchor point (0.0 = left, 0.5 = center, 1.0 = right).\n\n[📖 Ren'Py Docs](https://www.renpy.org/doc/html/style_properties.html#style-property-xanchor)",
-    "yanchor": "**yanchor** *value*\n\nVertical anchor point (0.0 = top, 0.5 = center, 1.0 = bottom).\n\n[📖 Ren'Py Docs](https://www.renpy.org/doc/html/style_properties.html#style-property-yanchor)",
-    "xalign": "**xalign** *value*\n\nSets both `xpos` and `xanchor` to the same value. 0.0 = left, 0.5 = center, 1.0 = right.\n\n[📖 Ren'Py Docs](https://www.renpy.org/doc/html/style_properties.html#style-property-xalign)",
-    "yalign": "**yalign** *value*\n\nSets both `ypos` and `yanchor` to the same value. 0.0 = top, 0.5 = center, 1.0 = bottom.\n\n[📖 Ren'Py Docs](https://www.renpy.org/doc/html/style_properties.html#style-property-yalign)",
-    "align": "**align** (*xalign*, *yalign*)\n\nShorthand for setting `xalign` and `yalign` together.\n\n[📖 Ren'Py Docs](https://www.renpy.org/doc/html/style_properties.html#style-property-align)",
-    "xoffset": "**xoffset** *pixels*\n\nHorizontal offset from the computed position, in pixels.\n\n[📖 Ren'Py Docs](https://www.renpy.org/doc/html/style_properties.html#style-property-xoffset)",
-    "yoffset": "**yoffset** *pixels*\n\nVertical offset from the computed position, in pixels.\n\n[📖 Ren'Py Docs](https://www.renpy.org/doc/html/style_properties.html#style-property-yoffset)",
-    "xsize": "**xsize** *pixels*\n\nSets the width of the displayable.\n\n[📖 Ren'Py Docs](https://www.renpy.org/doc/html/style_properties.html#style-property-xsize)",
-    "ysize": "**ysize** *pixels*\n\nSets the height of the displayable.\n\n[📖 Ren'Py Docs](https://www.renpy.org/doc/html/style_properties.html#style-property-ysize)",
-    "xysize": "**xysize** (*width*, *height*)\n\nShorthand for setting `xsize` and `ysize` together.\n\n[📖 Ren'Py Docs](https://www.renpy.org/doc/html/style_properties.html#style-property-xysize)",
-    "rotate": "**rotate** *degrees*\n\nRotates the displayable by the given number of degrees.\n\n[📖 Ren'Py Docs](https://www.renpy.org/doc/html/atl.html#transform-properties)",
-    "zoom": "**zoom** *factor*\n\nScales the displayable by the given factor (1.0 = no change).\n\n[📖 Ren'Py Docs](https://www.renpy.org/doc/html/atl.html#transform-properties)",
-    "xzoom": "**xzoom** *factor*\n\nHorizontal scale factor. Negative values flip horizontally.\n\n[📖 Ren'Py Docs](https://www.renpy.org/doc/html/atl.html#transform-properties)",
-    "yzoom": "**yzoom** *factor*\n\nVertical scale factor. Negative values flip vertically.\n\n[📖 Ren'Py Docs](https://www.renpy.org/doc/html/atl.html#transform-properties)",
-    "alpha": "**alpha** *value*\n\nOpacity of the displayable (0.0 = transparent, 1.0 = opaque).\n\n[📖 Ren'Py Docs](https://www.renpy.org/doc/html/atl.html#transform-properties)",
-    "crop": "**crop** (*x*, *y*, *w*, *h*)\n\nCrops the displayable to the given rectangle.\n\n[📖 Ren'Py Docs](https://www.renpy.org/doc/html/atl.html#transform-properties)",
-    "blur": "**blur** *radius*\n\nApplies a Gaussian blur with the given radius.\n\n[📖 Ren'Py Docs](https://www.renpy.org/doc/html/atl.html#transform-properties)",
-}
+# Keyword documentation lives in renpy_data.KEYWORD_DOCS.
 
 
 @LSP_SERVER.feature(types.TEXT_DOCUMENT_HOVER)
@@ -1973,11 +1774,11 @@ def hover(ls: LanguageServer, params: types.HoverParams) -> Optional[types.Hover
         return None
 
     # 1) Check keyword docs
-    if word in _KEYWORD_DOCS:
+    if word in KEYWORD_DOCS:
         return types.Hover(
             contents=types.MarkupContent(
                 kind=types.MarkupKind.Markdown,
-                value=_KEYWORD_DOCS[word],
+                value=KEYWORD_DOCS[word],
             )
         )
 
@@ -2568,66 +2369,79 @@ def rename(
                         )
                     )
 
-        # Rename jump/call references
-        for fp in _get_workspace_rpy_files():
-            file_uri, ast, parser = _get_parse_for_file(fp)
-            file_doc = ls.workspace.get_text_document(file_uri)
+        # Rename jump/call references — only scan files that contain matching targets
+        _jump_uris = set(_workspace_index.get_jump_target_uris(old_name))
+        _call_uris = set(_workspace_index.get_call_target_uris(old_name))
+        _ref_uris = _jump_uris | _call_uris
+        for ref_uri in _ref_uris:
+            try:
+                file_doc = ls.workspace.get_text_document(ref_uri)
+            except Exception:
+                continue
+            fp = _path_from_uri(ref_uri)
+            if not fp:
+                continue
+            _, ast, parser = _get_parse_for_file(fp)
 
-            for j in parser.get_all_jumps():
-                if j.target == old_name:
-                    if file_uri not in changes:
-                        changes[file_uri] = []
-                    if j.lineno - 1 < len(file_doc.lines):
-                        jump_line = file_doc.lines[j.lineno - 1]
-                        m = re.search(
-                            rf"\bjump\s+(?:expression\s+)?{re.escape(old_name)}\b",
-                            jump_line,
-                        )
-                        if m:
-                            start_col = jump_line.find(old_name, m.start())
-                            if start_col >= 0:
-                                changes[file_uri].append(
-                                    types.TextEdit(
-                                        range=types.Range(
-                                            start=types.Position(
-                                                line=j.lineno - 1, character=start_col
+            if ref_uri in _jump_uris:
+                for j in parser.get_all_jumps():
+                    if j.target == old_name:
+                        if ref_uri not in changes:
+                            changes[ref_uri] = []
+                        if j.lineno - 1 < len(file_doc.lines):
+                            jump_line = file_doc.lines[j.lineno - 1]
+                            m = re.search(
+                                rf"\bjump\s+(?:expression\s+)?{re.escape(old_name)}\b",
+                                jump_line,
+                            )
+                            if m:
+                                start_col = jump_line.find(old_name, m.start())
+                                if start_col >= 0:
+                                    changes[ref_uri].append(
+                                        types.TextEdit(
+                                            range=types.Range(
+                                                start=types.Position(
+                                                    line=j.lineno - 1,
+                                                    character=start_col,
+                                                ),
+                                                end=types.Position(
+                                                    line=j.lineno - 1,
+                                                    character=start_col + len(old_name),
+                                                ),
                                             ),
-                                            end=types.Position(
-                                                line=j.lineno - 1,
-                                                character=start_col + len(old_name),
-                                            ),
-                                        ),
-                                        new_text=new_name,
+                                            new_text=new_name,
+                                        )
                                     )
-                                )
 
-            for c in parser.get_all_calls():
-                if c.target == old_name:
-                    if file_uri not in changes:
-                        changes[file_uri] = []
-                    if c.lineno - 1 < len(file_doc.lines):
-                        call_line = file_doc.lines[c.lineno - 1]
-                        m = re.search(
-                            rf"\bcall\s+(?:expression\s+)?{re.escape(old_name)}\b",
-                            call_line,
-                        )
-                        if m:
-                            start_col = call_line.find(old_name, m.start())
-                            if start_col >= 0:
-                                changes[file_uri].append(
-                                    types.TextEdit(
-                                        range=types.Range(
-                                            start=types.Position(
-                                                line=c.lineno - 1, character=start_col
+            if ref_uri in _call_uris:
+                for c in parser.get_all_calls():
+                    if c.target == old_name:
+                        if ref_uri not in changes:
+                            changes[ref_uri] = []
+                        if c.lineno - 1 < len(file_doc.lines):
+                            call_line = file_doc.lines[c.lineno - 1]
+                            m = re.search(
+                                rf"\bcall\s+(?:expression\s+)?{re.escape(old_name)}\b",
+                                call_line,
+                            )
+                            if m:
+                                start_col = call_line.find(old_name, m.start())
+                                if start_col >= 0:
+                                    changes[ref_uri].append(
+                                        types.TextEdit(
+                                            range=types.Range(
+                                                start=types.Position(
+                                                    line=c.lineno - 1,
+                                                    character=start_col,
+                                                ),
+                                                end=types.Position(
+                                                    line=c.lineno - 1,
+                                                    character=start_col + len(old_name),
+                                                ),
                                             ),
-                                            end=types.Position(
-                                                line=c.lineno - 1,
-                                                character=start_col + len(old_name),
-                                            ),
-                                        ),
-                                        new_text=new_name,
+                                            new_text=new_name,
+                                        )
                                     )
-                                )
 
         return types.WorkspaceEdit(changes=changes) if changes else None
 
@@ -2730,44 +2544,6 @@ def rename(
     return None
 
 
-# ─────────────────────── Word Counting ──────────────────────────────────
-
-# Regex to match CJK characters (Chinese, Japanese, Korean)
-_CJK_PATTERN = re.compile(
-    r"[\u4e00-\u9fff\u3400-\u4dbf\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af]"
-)
-
-
-def _count_words(text: str) -> int:
-    """Count words in text, handling both CJK and non-CJK languages.
-
-    For CJK characters: each character counts as one word.
-    For non-CJK text: words are split by whitespace.
-    """
-    if not text:
-        return 0
-
-    count = 0
-    non_cjk_buffer = []
-
-    for char in text:
-        if _CJK_PATTERN.match(char):
-            # CJK character: count any accumulated non-CJK words first
-            if non_cjk_buffer:
-                count += len("".join(non_cjk_buffer).split())
-                non_cjk_buffer.clear()
-            # Each CJK character counts as one word
-            count += 1
-        else:
-            non_cjk_buffer.append(char)
-
-    # Count any remaining non-CJK words
-    if non_cjk_buffer:
-        count += len("".join(non_cjk_buffer).split())
-
-    return count
-
-
 # ─────────────────────── Workspace Commands ─────────────────────────────
 
 
@@ -2834,10 +2610,10 @@ def cmd_show_stats() -> Dict[str, object]:
         # Count dialogue (Say nodes) and words
         for node in parser._collect(ast, Say):
             total_dialogue_lines += 1
-            total_words += _count_words(node.what)
+            total_words += count_words(node.what)
         for node in parser._collect(ast, NarratorSay):
             total_dialogue_lines += 1
-            total_words += _count_words(node.what)
+            total_words += count_words(node.what)
 
     return {
         "files": len(files),

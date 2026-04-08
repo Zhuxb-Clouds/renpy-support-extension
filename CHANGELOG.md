@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.3.1] - 2026-04-08
+
+### Improved
+
+- **Refactored language server into modular architecture**
+  - Extracted `renpy_data.py` — pure-data constants (`RENPY_KEYWORDS`, `RENPY_TRANSITIONS`, `RENPY_TRANSFORMS`, `KEYWORD_DOCS`, `count_words()`) with zero runtime dependencies
+  - Extracted `workspace_index.py` — `WorkspaceIndex` class with dependency injection, avoiding circular imports
+  - Reduced `lsp_server.py` from ~3200 lines to ~2600 lines for better maintainability
+
 ## [1.3.0] - 2026-04-03
 
 ### Added

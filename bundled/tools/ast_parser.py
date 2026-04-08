@@ -753,6 +753,14 @@ class RpyParser:
             result.extend(self._collect(child, cls))
         return result
 
+    def _collect_multi(self, node: Node, type_map: dict) -> None:
+        """Single-pass collection into *type_map* ``{type: list}``."""
+        node_type = type(node)
+        if node_type in type_map:
+            type_map[node_type].append(node)
+        for child in self._children_of(node):
+            self._collect_multi(child, type_map)
+
     @staticmethod
     def _children_of(node: Node) -> List[Node]:
         """Return direct children of *node*."""
