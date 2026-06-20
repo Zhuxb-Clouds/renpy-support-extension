@@ -260,6 +260,16 @@ class Hide(Node):
 
 
 @dataclass
+class Camera(Node):
+    """``camera [at transform] [with transition]``."""
+
+    at_transform: Optional[str] = None
+    with_transition: Optional[str] = None
+    has_block: bool = False
+    body: List[Node] = field(default_factory=list)
+
+
+@dataclass
 class With(Node):
     """``with transition``."""
 
@@ -391,7 +401,7 @@ class Unknown(Node):
 
 # Pre-compiled patterns for performance.
 _RE_LABEL = re.compile(
-    r"^label\s+([a-zA-Z_\u4e00-\u9fff\u3400-\u4dbf][\w.]*)\s*(?:\(([^)]*)\))?\s*:$"
+    r"^label\s+([a-zA-Z_\u4e00-\u9fff\u3400-\u4dbf][\w.]*)\s*(?:\((.*)\))?\s*:$"
 )
 _RE_DEFINE = re.compile(
     r"^define\s+([a-zA-Z_\u4e00-\u9fff\u3400-\u4dbf][\w.]*)\s*=\s*(.+)$"
@@ -403,10 +413,10 @@ _RE_IMAGE = re.compile(
     r"^image\s+([\w\u4e00-\u9fff\u3400-\u4dbf\-][\w\u4e00-\u9fff\u3400-\u4dbf\- ]*?)\s*(?:=\s*(.+)|:)\s*$"
 )
 _RE_TRANSFORM = re.compile(
-    r"^transform\s+([a-zA-Z_\u4e00-\u9fff\u3400-\u4dbf]\w*)\s*(?:\(([^)]*)\))?\s*:$"
+    r"^transform\s+([a-zA-Z_\u4e00-\u9fff\u3400-\u4dbf]\w*)\s*(?:\((.*)\))?\s*:$"
 )
 _RE_SCREEN = re.compile(
-    r"^screen\s+([a-zA-Z_\u4e00-\u9fff\u3400-\u4dbf]\w*)\s*(?:\(([^)]*)\))?\s*:$"
+    r"^screen\s+([a-zA-Z_\u4e00-\u9fff\u3400-\u4dbf]\w*)\s*(?:\((.*)\))?\s*:$"
 )
 _RE_STYLE = re.compile(
     r"^style\s+([a-zA-Z_\u4e00-\u9fff\u3400-\u4dbf]\w*)(?:\s+is\s+([a-zA-Z_\u4e00-\u9fff\u3400-\u4dbf]\w*))?\s*:?$"
@@ -416,7 +426,7 @@ _RE_IF = re.compile(r"^if\s+(.+):$")
 _RE_ELIF = re.compile(r"^elif\s+(.+):$")
 _RE_ELSE = re.compile(r"^else\s*:$")
 _RE_WHILE = re.compile(r"^while\s+(.+):$")
-_RE_FOR = re.compile(r"^for\s+(\w+)\s+in\s+(.+):$")
+_RE_FOR = re.compile(r"^for\s+(.+?)\s+in\s+(.+):$")
 
 _RE_MENU = re.compile(r"^menu\s*(?:(\w+)\s*)?:$")
 _RE_MENU_ITEM = re.compile(r'^"(.+?)"\s*(?:if\s+(.+))?:$')
@@ -425,7 +435,7 @@ _RE_JUMP = re.compile(
     r"^jump\s+(expression\s+)?([a-zA-Z_\u4e00-\u9fff\u3400-\u4dbf][\w.]*)$"
 )
 _RE_CALL = re.compile(
-    r"^call\s+(expression\s+)?([a-zA-Z_\u4e00-\u9fff\u3400-\u4dbf][\w.]*)\s*(?:\(([^)]*)\))?\s*(?:from\s+([a-zA-Z_\u4e00-\u9fff\u3400-\u4dbf]\w*))?$"
+    r"^call\s+(expression\s+)?([a-zA-Z_\u4e00-\u9fff\u3400-\u4dbf][\w.]*)\s*(?:\((.*)\))?\s*(?:from\s+([a-zA-Z_\u4e00-\u9fff\u3400-\u4dbf]\w*))?$"
 )
 _RE_CALL_SCREEN = re.compile(
     r"^call\s+screen\s+([\w\u4e00-\u9fff\u3400-\u4dbf]+)\s*(?:\((.*)\))?\s*$"
@@ -438,6 +448,10 @@ _RE_SCENE = re.compile(
     r"^scene\s+(.+?)(?:\s+at\s+(.+?))?(?:\s+with\s+(\w+(?:\([^)]*\))?))?\s*:?\s*$"
 )
 _RE_SCENE_BARE = re.compile(r"^scene\s*:?\s*$")
+_RE_CAMERA = re.compile(
+    r"^camera(?:\s+(.+?))?(?:\s+at\s+(.+?))?(?:\s+with\s+(\w+(?:\([^)]*\))?))?\s*:?\s*$"
+)
+_RE_CAMERA_BARE = re.compile(r"^camera\s*:?\s*$")
 _RE_SHOW = re.compile(
     r"^show\s+(.+?)(?:\s+at\s+(.+?))?(?:\s+with\s+(\w+(?:\([^)]*\))?))?(?:\s+behind\s+(\w+))?\s*:?\s*$"
 )
@@ -473,7 +487,7 @@ _RE_SAY_NOSPACE = re.compile(r'^(\w+)"(.*)"(?:\s+with\s+\w+)?$')
 _RE_NARRATOR = re.compile(r'^"(.*)"(?:\s+with\s+\w+)?$')
 
 # window / pause
-_RE_WINDOW = re.compile(r"^window\s+(show|hide|auto)$")
+_RE_WINDOW = re.compile(r"^window\s+(show|hide|auto)(?:\s+(.+))?$")
 _RE_PAUSE = re.compile(r"^pause(?:\s*\((.+?)\)|\s+(.+))?$")
 
 
@@ -625,7 +639,7 @@ class RpyParser:
 
             # ── Inside screen / transform / style / image / ATL blocks: skip body parsing ──
             if isinstance(
-                parent, (ScreenDef, TransformDef, StyleDef, ImageDef, Scene, Show, Hide)
+                parent, (ScreenDef, TransformDef, StyleDef, ImageDef, Scene, Show, Hide, Camera)
             ):
                 # But still parse python: blocks and $ one-liners inside these
                 m = _RE_PYTHON_BLOCK.match(content)
@@ -1033,7 +1047,27 @@ class RpyParser:
         if content == "pass":
             return Pass(lineno=lineno, end_lineno=lineno, indent=indent)
 
-        # ── Visual: scene / show / hide / with ──
+        # ── Visual: scene / camera / show / hide / with ──
+        m = _RE_CAMERA_BARE.match(content)
+        if m:
+            return Camera(
+                lineno=lineno,
+                end_lineno=lineno,
+                indent=indent,
+                has_block=content.rstrip().endswith(":"),
+            )
+
+        m = _RE_CAMERA.match(content)
+        if m:
+            return Camera(
+                lineno=lineno,
+                end_lineno=lineno,
+                indent=indent,
+                at_transform=m.group(2),
+                with_transition=m.group(3),
+                has_block=content.rstrip().endswith(":"),
+            )
+
         m = _RE_SCENE_BARE.match(content)
         if m:
             return Scene(
@@ -1265,7 +1299,7 @@ class RpyParser:
     def _is_block_node(node: Node) -> bool:
         """Return True if *node* can contain children (has a body list)."""
         # Scene/Show/Hide are block nodes only when they have a trailing colon (ATL block)
-        if isinstance(node, (Scene, Show, Hide)):
+        if isinstance(node, (Scene, Show, Hide, Camera)):
             return node.has_block
         return isinstance(
             node,

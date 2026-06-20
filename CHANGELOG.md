@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.4.0] - 2026-06-20
+
+### Fixed
+
+- **Dramatically reduced false positive diagnostics in parser**
+  - Fixed `screen`, `transform`, `label`, and `call` definition regexes to support nested parentheses in parameters — previously a single unmatched definition would cascade into hundreds of false "Unrecognized statement" warnings for all indented body lines
+  - Fixed `for` loop regex to support tuple unpacking (e.g. `for key, value in dict.items():`)
+  - Fixed `window` statement regex to support optional transition arguments
+
+### Added
+
+- **`camera` statement support**
+  - Added full parsing for `camera` and `camera <layer>` statements with `at` and `with` clauses
+  - Camera blocks are now recognized as block nodes, suppressing false errors for ATL body content
+
 ## [1.3.1] - 2026-04-08
 
 ### Improved
