@@ -34,6 +34,7 @@ from ast_parser import (
     RpyParser,
     Script,
     ScreenDef,
+    StyleDef,
     TransformDef,
 )
 
@@ -83,6 +84,7 @@ class WorkspaceIndex:
         self._screens: Dict[str, Dict[str, List[ScreenDef]]] = {}
         self._images: Dict[str, Dict[str, List[ImageDef]]] = {}
         self._transforms: Dict[str, Dict[str, List[TransformDef]]] = {}
+        self._styles: Dict[str, Dict[str, List[StyleDef]]] = {}
         # Per-URI jump/call targets  {uri: set_of_target_names}
         self._jump_targets: Dict[str, set] = {}
         self._call_targets: Dict[str, set] = {}
@@ -179,6 +181,7 @@ class WorkspaceIndex:
             ScreenDef: [],
             ImageDef: [],
             TransformDef: [],
+            StyleDef: [],
             Jump: [],
             Call: [],
         }
@@ -202,6 +205,9 @@ class WorkspaceIndex:
         transforms: Dict[str, List[TransformDef]] = {}
         for t in type_map[TransformDef]:
             transforms.setdefault(t.name, []).append(t)
+        styles: Dict[str, List[StyleDef]] = {}
+        for s in type_map[StyleDef]:
+            styles.setdefault(s.name, []).append(s)
         jt: set = {j.target for j in type_map[Jump] if not j.is_expression}
         ct: set = {c.target for c in type_map[Call] if not c.is_expression}
 
@@ -236,6 +242,11 @@ class WorkspaceIndex:
                 self._agg_cache.pop("transforms", None)
             else:
                 self._transforms[uri] = transforms
+            if self._styles.get(uri) != styles:
+                self._styles[uri] = styles
+                self._agg_cache.pop("styles", None)
+            else:
+                self._styles[uri] = styles
             if self._jump_targets.get(uri) != jt or self._call_targets.get(uri) != ct:
                 self._agg_cache.pop("used_labels", None)
             self._jump_targets[uri] = jt
@@ -264,6 +275,9 @@ class WorkspaceIndex:
                 changed = True
             if uri in self._transforms:
                 del self._transforms[uri]
+                changed = True
+            if uri in self._styles:
+                del self._styles[uri]
                 changed = True
             self._jump_targets.pop(uri, None)
             self._call_targets.pop(uri, None)
@@ -378,6 +392,7 @@ class WorkspaceIndex:
             self._screens.clear()
             self._images.clear()
             self._transforms.clear()
+            self._styles.clear()
             self._jump_targets.clear()
             self._call_targets.clear()
             self._indexed_hashes.clear()
@@ -430,6 +445,10 @@ class WorkspaceIndex:
     def get_transforms(self) -> Dict[str, List[Tuple[str, TransformDef]]]:
         self.ensure_current()
         return self._aggregate(self._transforms, "transforms")
+
+    def get_styles(self) -> Dict[str, List[Tuple[str, StyleDef]]]:
+        self.ensure_current()
+        return self._aggregate(self._styles, "styles")
 
     def get_used_labels(self) -> set:
         """Return the set of all label names that are jump/call targets."""

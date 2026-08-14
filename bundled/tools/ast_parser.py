@@ -449,7 +449,7 @@ _RE_SCENE = re.compile(
 )
 _RE_SCENE_BARE = re.compile(r"^scene\s*:?\s*$")
 _RE_CAMERA = re.compile(
-    r"^camera(?:\s+(.+?))?(?:\s+at\s+(.+?))?(?:\s+with\s+(\w+(?:\([^)]*\))?))?\s*:?\s*$"
+    r"^camera(?:\s+(?!(?:at|with)\b)(.+?))?(?:\s+at\s+(.+?))?(?:\s+with\s+(\w+(?:\([^)]*\))?))?\s*:?\s*$"
 )
 _RE_CAMERA_BARE = re.compile(r"^camera\s*:?\s*$")
 _RE_SHOW = re.compile(
@@ -726,6 +726,12 @@ class RpyParser:
 
     def get_all_screens(self, root: Optional[Script] = None) -> List[ScreenDef]:
         return self._collect(root or self.root, ScreenDef)
+
+    def get_all_transforms(self, root: Optional[Script] = None) -> List[TransformDef]:
+        return self._collect(root or self.root, TransformDef)
+
+    def get_all_styles(self, root: Optional[Script] = None) -> List[StyleDef]:
+        return self._collect(root or self.root, StyleDef)
 
     def get_all_images(self, root: Optional[Script] = None) -> List[ImageDef]:
         return self._collect(root or self.root, ImageDef)

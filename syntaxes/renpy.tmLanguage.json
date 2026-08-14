@@ -1703,7 +1703,7 @@
               "include": "#strings"
             },
             {
-              "match": "\\b(?:[a-zA-Z_0-9]+)\\b",
+              "match": "(?<!\\S)(?!(?:at|as|behind|onlayer|expression|with|zorder)\\b)[\\p{XID_Continue}.\\-]+[ \\t]*",
               "name": "entity.name.type.image.renpy"
             },
             {
@@ -1960,7 +1960,7 @@
               "include": "#zorder"
             },
             {
-              "match": "\\b(?:[a-zA-Z_0-9]+)\\b",
+              "match": "(?<!\\S)(?!(?:at|as|behind|onlayer|expression|with|zorder)\\b)[\\p{XID_Continue}.\\-]+[ \\t]*",
               "name": "entity.name.type.image.renpy"
             },
             {
@@ -2032,7 +2032,7 @@
               "include": "#zorder"
             },
             {
-              "match": "\\b(?:[a-zA-Z_0-9]+)\\b[ \\t]*",
+              "match": "(?<!\\S)(?!(?:at|as|behind|onlayer|expression|with|zorder)\\b)[\\p{XID_Continue}.\\-]+[ \\t]*",
               "name": "entity.name.type.image.renpy"
             },
             {
@@ -2058,10 +2058,16 @@
               "include": "#strings"
             },
             {
-              "match": "\\b(?:[a-zA-Z_0-9]+)\\b[ \\t]*",
+              "match": "(?<!\\S)(?!(?:at|as|behind|onlayer|expression|with|zorder)\\b)[\\p{XID_Continue}.\\-]+[ \\t]*",
               "name": "entity.name.type.image.renpy"
             }
           ]
+        },
+        {
+          "include": "#at-statement"
+        },
+        {
+          "include": "#as-statement"
         },
         {
           "include": "#with-statement"
@@ -2090,7 +2096,7 @@
           "end": "(?=\\b(at|with)\\b|#|:)|$",
           "patterns": [
             {
-              "match": "\\b(?:[a-zA-Z_0-9]+)\\b[ \\t]*",
+              "match": "(?<!\\S)(?!(?:at|as|behind|onlayer|expression|with|zorder)\\b)[\\p{XID_Continue}.\\-]+[ \\t]*",
               "name": "entity.name.type.image.renpy"
             }
           ]

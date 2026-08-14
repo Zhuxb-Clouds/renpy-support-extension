@@ -67,6 +67,10 @@ from renpy_data import (
     RENPY_KEYWORDS,
     RENPY_TRANSITIONS,
     RENPY_TRANSFORMS,
+    RENPY_SCREEN_DISPLAYABLES,
+    RENPY_SCREEN_PROPERTIES,
+    RENPY_ATL_PROPERTIES,
+    RENPY_STYLE_PROPERTIES,
     KEYWORD_DOCS,
     count_words,
 )
@@ -83,7 +87,7 @@ from urllib.parse import unquote as url_unquote
 
 MAX_WORKERS = 4
 LSP_SERVER = LanguageServer(
-    name="renpy-server", version="1.0.0", max_workers=MAX_WORKERS
+    name="renpy-server", version="1.5.0", max_workers=MAX_WORKERS
 )
 
 # Suppress noisy "Cancel notification for unknown message id" warnings.
@@ -110,6 +114,110 @@ _handler.setFormatter(
 _log.addHandler(_handler)
 
 _log.info("Ren'Py LSP server module loaded")
+
+
+# ── Runtime settings ─────────────────────────────────────────────────────
+
+_settings = {
+    "formatting": {
+        "enabled": True,
+        "indentSize": 4,
+    },
+    "diagnostics": {
+        "enabled": True,
+        "fullOnSave": False,
+    },
+}
+
+
+def _coerce_bool(value: object, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    return default
+
+
+def _coerce_int(value: object, default: int) -> int:
+    if isinstance(value, int):
+        return value
+    return default
+
+
+def _extract_renpy_settings(raw_settings: object) -> dict:
+    if not isinstance(raw_settings, dict):
+        return {}
+
+    settings = raw_settings.get("renpy-lsp", raw_settings)
+    if not isinstance(settings, dict):
+        return {}
+
+    return settings
+
+
+def _update_settings(raw_settings: object) -> None:
+    settings = _extract_renpy_settings(raw_settings)
+    if not settings:
+        return
+
+    formatting = settings.get("formatting", {})
+    if isinstance(formatting, dict):
+        _settings["formatting"]["enabled"] = _coerce_bool(
+            formatting.get("enabled"), _settings["formatting"]["enabled"]
+        )
+        _settings["formatting"]["indentSize"] = _coerce_int(
+            formatting.get("indentSize"), _settings["formatting"]["indentSize"]
+        )
+    elif "formatting.enabled" in settings:
+        _settings["formatting"]["enabled"] = _coerce_bool(
+            settings.get("formatting.enabled"), _settings["formatting"]["enabled"]
+        )
+
+    diagnostics = settings.get("diagnostics", {})
+    if isinstance(diagnostics, dict):
+        _settings["diagnostics"]["enabled"] = _coerce_bool(
+            diagnostics.get("enabled"), _settings["diagnostics"]["enabled"]
+        )
+        _settings["diagnostics"]["fullOnSave"] = _coerce_bool(
+            diagnostics.get("fullOnSave"), _settings["diagnostics"]["fullOnSave"]
+        )
+    elif "diagnostics.enabled" in settings:
+        _settings["diagnostics"]["enabled"] = _coerce_bool(
+            settings.get("diagnostics.enabled"), _settings["diagnostics"]["enabled"]
+        )
+        _settings["diagnostics"]["fullOnSave"] = _coerce_bool(
+            settings.get("diagnostics.fullOnSave"),
+            _settings["diagnostics"]["fullOnSave"],
+        )
+
+    _log.info(
+        "settings: formatting.enabled=%s diagnostics.enabled=%s diagnostics.fullOnSave=%s",
+        _settings["formatting"]["enabled"],
+        _settings["diagnostics"]["enabled"],
+        _settings["diagnostics"]["fullOnSave"],
+    )
+
+
+def _formatting_enabled() -> bool:
+    return bool(_settings["formatting"]["enabled"])
+
+
+def _diagnostics_enabled() -> bool:
+    return bool(_settings["diagnostics"]["enabled"])
+
+
+def _full_diagnostics_on_save() -> bool:
+    return bool(_settings["diagnostics"]["fullOnSave"])
+
+
+@LSP_SERVER.feature(types.INITIALIZE)
+def initialize(ls: LanguageServer, params: types.InitializeParams) -> None:
+    _update_settings(params.initialization_options)
+
+
+@LSP_SERVER.feature(types.WORKSPACE_DID_CHANGE_CONFIGURATION)
+def did_change_configuration(
+    ls: LanguageServer, params: types.DidChangeConfigurationParams
+) -> None:
+    _update_settings(params.settings)
 
 
 # ── UTF-16 → Python (UTF-32) column offset conversion ──────────────────
@@ -317,6 +425,11 @@ def _get_all_workspace_images() -> Dict[str, List[Tuple[str, "ImageDef"]]]:
 def _get_all_workspace_transforms() -> Dict[str, List[Tuple[str, "TransformDef"]]]:
     """Return {name: [(uri, TransformDef), ...]} across all workspace .rpy files."""
     return _workspace_index.get_transforms()
+
+
+def _get_all_workspace_styles() -> Dict[str, List[Tuple[str, "StyleDef"]]]:
+    """Return {name: [(uri, StyleDef), ...]} across all workspace .rpy files."""
+    return _workspace_index.get_styles()
 
 
 # ── Python variable / class / function definition helpers ──
@@ -681,6 +794,8 @@ def _publish_diagnostics_light(uri: str):
     Called from ``didChange`` (debounced).  This covers parser errors and
     empty-ATL-block errors — the things the user wants instant feedback on.
     """
+    if not _diagnostics_enabled():
+        return
     _log.info("_publish_diagnostics_light: %s", _short_uri(uri))
     t0 = _time.monotonic()
     ast, parser = _get_parse(uri)
@@ -737,6 +852,8 @@ def _publish_diagnostics(uri: str):
     definitions, unused labels, missing image files).  Called from
     ``didOpen`` and ``didSave``.
     """
+    if not _diagnostics_enabled():
+        return
     _log.info("_publish_diagnostics: %s", _short_uri(uri))
     t0 = _time.monotonic()
     ast, parser = _get_parse(uri)
@@ -950,6 +1067,8 @@ def _schedule_full_diagnostics(uri: str) -> None:
     Multiple saves within ``_DIAG_COALESCE_DELAY`` are batched into a single
     diagnostic pass so that e.g. "Format All Files" doesn't spawn N threads.
     """
+    if not _diagnostics_enabled():
+        return
     global _diag_thread_running
     with _diag_queue_lock:
         _diag_queue[uri] = _time.monotonic()
@@ -990,6 +1109,8 @@ def _schedule_full_diagnostics(uri: str) -> None:
 
 def _schedule_light_diagnostics(uri: str) -> None:
     """Schedule a debounced lightweight diagnostic run for *uri*."""
+    if not _diagnostics_enabled():
+        return
     # Cancel any pending timer for this URI
     old = _debounce_timers.pop(uri, None)
     if old is not None:
@@ -1018,7 +1139,8 @@ def did_open(ls: LanguageServer, params: types.DidOpenTextDocumentParams):
     if not _workspace_index.is_ready() and not _workspace_index._warming:
         _workspace_index.warm()
     # Run index update + full diagnostics in a background thread.
-    _schedule_full_diagnostics(uri)
+    if _diagnostics_enabled():
+        _schedule_full_diagnostics(uri)
 
 
 @LSP_SERVER.feature(types.TEXT_DOCUMENT_DID_CHANGE)
@@ -1038,10 +1160,18 @@ def did_save(ls: LanguageServer, params: types.DidSaveTextDocumentParams):
     old = _debounce_timers.pop(uri, None)
     if old is not None:
         old.cancel()
-    # Warm the parse cache synchronously (fast).
-    _get_parse(uri)
-    # Index update + full diagnostics run in a background thread.
-    _schedule_full_diagnostics(uri)
+    if not _diagnostics_enabled():
+        LSP_SERVER.text_document_publish_diagnostics(
+            types.PublishDiagnosticsParams(uri=uri, diagnostics=[])
+        )
+        return
+
+    if _full_diagnostics_on_save():
+        # Index update + full diagnostics run in a background thread.
+        _schedule_full_diagnostics(uri)
+    else:
+        # Keep saves responsive: only syntax/empty-block diagnostics run after save.
+        _schedule_light_diagnostics(uri)
 
 
 @LSP_SERVER.feature(types.TEXT_DOCUMENT_DID_CLOSE)
@@ -1055,9 +1185,10 @@ def did_close(ls: LanguageServer, params: types.DidCloseTextDocumentParams):
     with _cache_lock:
         _parse_cache.pop(uri, None)
     _workspace_index.remove_file(uri)
-    ls.text_document_publish_diagnostics(
-        types.PublishDiagnosticsParams(uri=uri, diagnostics=[])
-    )
+    if _diagnostics_enabled():
+        ls.text_document_publish_diagnostics(
+            types.PublishDiagnosticsParams(uri=uri, diagnostics=[])
+        )
 
 
 @LSP_SERVER.feature(types.WORKSPACE_DID_CHANGE_WATCHED_FILES)
@@ -1597,8 +1728,386 @@ def _word_at_position(line: str, col: int) -> str:
 
 # ─────────────────────── Completion ──────────────────────────────────────
 
-# Ren'Py keyword/transition/transform lists are in renpy_data.py:
-#   RENPY_KEYWORDS, RENPY_TRANSITIONS, RENPY_TRANSFORMS
+# Ren'Py keyword/transition/transform lists are in renpy_data.py.
+
+_COMPLETION_NAME_RE = r"[\w.\-\u4e00-\u9fff\u3400-\u4dbf ]*"
+_COMPLETION_IDENTIFIER_RE = r"[\w.\u4e00-\u9fff\u3400-\u4dbf]*"
+
+
+def _add_completion_item(
+    items: List[types.CompletionItem],
+    seen: set,
+    label: str,
+    kind: types.CompletionItemKind,
+    detail: Optional[str] = None,
+) -> None:
+    """Append a completion item once, preserving first-seen ordering."""
+    if not label or label in seen:
+        return
+    seen.add(label)
+    items.append(types.CompletionItem(label=label, kind=kind, detail=detail))
+
+
+def _add_workspace_symbol_completions(
+    items: List[types.CompletionItem],
+    seen: set,
+    symbols: Dict[str, List[Tuple[str, Node]]],
+    *,
+    kind: types.CompletionItemKind,
+    detail_label: str,
+    expression_attr: Optional[str] = None,
+) -> None:
+    """Append completions from a workspace symbol map."""
+    for name in sorted(symbols):
+        entries = symbols[name]
+        if not entries:
+            continue
+        target_uri, node = entries[0]
+        fname = os.path.basename(_path_from_uri(target_uri))
+        detail = f"{detail_label} ({fname}:{node.lineno})"
+        if expression_attr:
+            expression = getattr(node, expression_attr, None)
+            if expression:
+                detail = f"{detail_label}: {expression}"
+        _add_completion_item(items, seen, name, kind, detail)
+
+
+def _add_keyword_completions(
+    items: List[types.CompletionItem],
+    seen: set,
+    names: List[str],
+    *,
+    kind: types.CompletionItemKind,
+    detail: Optional[str] = None,
+) -> None:
+    for name in names:
+        _add_completion_item(items, seen, name, kind, detail)
+
+
+def _current_symbol_map(
+    uri: str, nodes: List[Node]
+) -> Dict[str, List[Tuple[str, Node]]]:
+    symbols: Dict[str, List[Tuple[str, Node]]] = {}
+    for node in nodes:
+        name = getattr(node, "name", "")
+        if name:
+            symbols.setdefault(name, []).append((uri, node))
+    return symbols
+
+
+def _merge_current_symbols(
+    workspace_symbols: Dict[str, List[Tuple[str, Node]]],
+    uri: str,
+    nodes: List[Node],
+) -> Dict[str, List[Tuple[str, Node]]]:
+    merged = {name: list(entries) for name, entries in workspace_symbols.items()}
+    for name, entries in _current_symbol_map(uri, nodes).items():
+        existing = merged.setdefault(name, [])
+        existing_keys = {(entry_uri, node.lineno) for entry_uri, node in existing}
+        for entry in entries:
+            if (entry[0], entry[1].lineno) not in existing_keys:
+                existing.append(entry)
+    return merged
+
+
+def _line_indent(line: str) -> int:
+    return len(line) - len(line.lstrip(" "))
+
+
+def _enclosing_completion_block(lines: List[str], line_no: int, col: int) -> Optional[str]:
+    """Return the nearest enclosing screen/transform/style block for completion."""
+    if line_no >= len(lines):
+        return None
+    current_indent = _line_indent(lines[line_no][:col])
+    if current_indent <= 0:
+        return None
+
+    for i in range(line_no - 1, -1, -1):
+        raw = lines[i]
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        indent = _line_indent(raw)
+        if indent >= current_indent:
+            continue
+        current_indent = indent
+        if re.match(r"^screen\s+[a-zA-Z_\u4e00-\u9fff\u3400-\u4dbf]\w*", stripped):
+            return "screen"
+        if re.match(r"^transform\s+[a-zA-Z_\u4e00-\u9fff\u3400-\u4dbf]\w*", stripped):
+            return "transform"
+        if re.match(r"^style\s+[a-zA-Z_\u4e00-\u9fff\u3400-\u4dbf]\w*", stripped):
+            return "style"
+
+    return None
+
+
+def _prefix_matches(prefix: str, pattern: str) -> bool:
+    return re.match(pattern, prefix, re.IGNORECASE) is not None
+
+
+def _add_label_completions(
+    items: List[types.CompletionItem],
+    seen: set,
+    uri: str,
+    parser: RpyParser,
+) -> None:
+    labels = _merge_current_symbols(
+        _get_all_workspace_labels(), uri, parser.get_all_labels()
+    )
+    _add_workspace_symbol_completions(
+        items,
+        seen,
+        labels,
+        kind=types.CompletionItemKind.Function,
+        detail_label="label",
+    )
+
+
+def _add_transform_completions(
+    items: List[types.CompletionItem],
+    seen: set,
+    uri: str,
+    parser: RpyParser,
+) -> None:
+    _add_keyword_completions(
+        items,
+        seen,
+        RENPY_TRANSFORMS,
+        kind=types.CompletionItemKind.Constant,
+        detail="transform position",
+    )
+    transforms = _merge_current_symbols(
+        _get_all_workspace_transforms(), uri, parser.get_all_transforms()
+    )
+    _add_workspace_symbol_completions(
+        items,
+        seen,
+        transforms,
+        kind=types.CompletionItemKind.Function,
+        detail_label="transform",
+    )
+
+
+def _add_screen_completions(
+    items: List[types.CompletionItem],
+    seen: set,
+    uri: str,
+    parser: RpyParser,
+) -> None:
+    screens = _merge_current_symbols(
+        _get_all_workspace_screens(), uri, parser.get_all_screens()
+    )
+    _add_workspace_symbol_completions(
+        items,
+        seen,
+        screens,
+        kind=types.CompletionItemKind.Class,
+        detail_label="screen",
+    )
+
+
+def _add_style_completions(
+    items: List[types.CompletionItem],
+    seen: set,
+    uri: str,
+    parser: RpyParser,
+) -> None:
+    styles = _merge_current_symbols(
+        _get_all_workspace_styles(), uri, parser.get_all_styles()
+    )
+    _add_workspace_symbol_completions(
+        items,
+        seen,
+        styles,
+        kind=types.CompletionItemKind.Property,
+        detail_label="style",
+    )
+
+
+def _add_image_completions(
+    items: List[types.CompletionItem],
+    seen: set,
+    uri: str,
+    parser: RpyParser,
+) -> None:
+    images = _merge_current_symbols(
+        _get_all_workspace_images(), uri, parser.get_all_images()
+    )
+    _add_workspace_symbol_completions(
+        items,
+        seen,
+        images,
+        kind=types.CompletionItemKind.File,
+        detail_label="image",
+    )
+    _ensure_image_cache()
+    explicit_names = {name.lower() for name in images}
+    for auto_name in sorted(_image_cache):
+        if auto_name.lower() in explicit_names:
+            continue
+        _add_completion_item(
+            items,
+            seen,
+            auto_name,
+            types.CompletionItemKind.File,
+            "image (auto)",
+        )
+
+
+def _add_audio_define_completions(
+    items: List[types.CompletionItem],
+    seen: set,
+    uri: str,
+    parser: RpyParser,
+) -> None:
+    defines = _merge_current_symbols(
+        _get_all_workspace_defines(), uri, parser.get_all_defines()
+    )
+    for dname in sorted(defines):
+        if not dname.startswith("audio."):
+            continue
+        entries = defines[dname]
+        if not entries:
+            continue
+        target_uri, node = entries[0]
+        fname = os.path.basename(_path_from_uri(target_uri))
+        _add_completion_item(
+            items,
+            seen,
+            dname[len("audio.") :],
+            types.CompletionItemKind.Variable,
+            f"{dname} ({fname}:{node.lineno})",
+        )
+
+
+def _add_variable_completions(
+    items: List[types.CompletionItem],
+    seen: set,
+    uri: str,
+    parser: RpyParser,
+) -> None:
+    defines = _merge_current_symbols(
+        _get_all_workspace_defines(), uri, parser.get_all_defines()
+    )
+    defaults = _merge_current_symbols(
+        _get_all_workspace_defaults(), uri, parser.get_all_defaults()
+    )
+    _add_workspace_symbol_completions(
+        items,
+        seen,
+        defines,
+        kind=types.CompletionItemKind.Variable,
+        detail_label="define",
+        expression_attr="expression",
+    )
+    _add_workspace_symbol_completions(
+        items,
+        seen,
+        defaults,
+        kind=types.CompletionItemKind.Variable,
+        detail_label="default",
+        expression_attr="expression",
+    )
+
+
+def _completion_items_for_context(
+    uri: str,
+    parser: RpyParser,
+    lines: List[str],
+    line_no: int,
+    col: int,
+) -> List[types.CompletionItem]:
+    line_text = lines[line_no] if line_no < len(lines) else ""
+    prefix = line_text[:col]
+    items: List[types.CompletionItem] = []
+    seen: set = set()
+
+    # Keep trailing spaces in prefix matching. Removing them breaks trigger
+    # contexts like "jump " and "with ".
+    if _prefix_matches(
+        prefix,
+        rf"^\s*(?:show|hide|call)\s+screen\s+{_COMPLETION_IDENTIFIER_RE}$",
+    ) or _prefix_matches(prefix, rf"^\s*use\s+{_COMPLETION_IDENTIFIER_RE}$"):
+        _add_screen_completions(items, seen, uri, parser)
+    elif _prefix_matches(
+        prefix,
+        rf"^\s*(?:jump|call)\s+(?:expression\s+)?{_COMPLETION_IDENTIFIER_RE}$",
+    ):
+        _add_label_completions(items, seen, uri, parser)
+    elif _prefix_matches(prefix, rf"^.*\bwith\s+{_COMPLETION_IDENTIFIER_RE}$"):
+        _add_keyword_completions(
+            items,
+            seen,
+            RENPY_TRANSITIONS,
+            kind=types.CompletionItemKind.Constant,
+            detail="transition",
+        )
+    elif _prefix_matches(prefix, rf"^.*\bat\s+{_COMPLETION_IDENTIFIER_RE}$"):
+        _add_transform_completions(items, seen, uri, parser)
+    elif _prefix_matches(
+        prefix,
+        rf"^\s*style\s+(?:{_COMPLETION_IDENTIFIER_RE}\s+is\s+)?{_COMPLETION_IDENTIFIER_RE}$",
+    ):
+        _add_style_completions(items, seen, uri, parser)
+    elif _prefix_matches(
+        prefix,
+        rf"^\s*(?:show|scene|hide)\s+{_COMPLETION_NAME_RE}$",
+    ) and not re.search(
+        r"\b(?:at|with|behind|as|onlayer|zorder)\b",
+        prefix,
+        re.IGNORECASE,
+    ):
+        if not _prefix_matches(prefix, r"^\s*(?:show|hide)\s+screen\b"):
+            _add_image_completions(items, seen, uri, parser)
+    elif _prefix_matches(
+        prefix,
+        rf"^\s*(?:play|queue)\s+\w+\s+{_COMPLETION_IDENTIFIER_RE}$",
+    ):
+        _add_audio_define_completions(items, seen, uri, parser)
+    else:
+        block = _enclosing_completion_block(lines, line_no, col)
+        if block == "screen":
+            _add_keyword_completions(
+                items,
+                seen,
+                RENPY_SCREEN_DISPLAYABLES,
+                kind=types.CompletionItemKind.Keyword,
+                detail="screen displayable",
+            )
+            _add_keyword_completions(
+                items,
+                seen,
+                RENPY_SCREEN_PROPERTIES,
+                kind=types.CompletionItemKind.Property,
+                detail="screen property",
+            )
+        elif block == "transform":
+            _add_keyword_completions(
+                items,
+                seen,
+                RENPY_ATL_PROPERTIES,
+                kind=types.CompletionItemKind.Property,
+                detail="ATL statement",
+            )
+        elif block == "style":
+            _add_keyword_completions(
+                items,
+                seen,
+                RENPY_STYLE_PROPERTIES,
+                kind=types.CompletionItemKind.Property,
+                detail="style property",
+            )
+        else:
+            _add_keyword_completions(
+                items,
+                seen,
+                RENPY_KEYWORDS,
+                kind=types.CompletionItemKind.Keyword,
+            )
+            _add_variable_completions(items, seen, uri, parser)
+            _add_label_completions(items, seen, uri, parser)
+
+    return items
 
 
 @LSP_SERVER.feature(
@@ -1613,143 +2122,13 @@ def completions(
     pos = params.position
     line_text = doc.lines[pos.line] if pos.line < len(doc.lines) else ""
     col = _utf16_col_to_utf32(line_text, pos.character)
-    line_prefix = line_text[:col].strip()
+    line_prefix = line_text[:col]
     _log.debug(
         "completion: %s L%d prefix=%r", _short_uri(uri), pos.line + 1, line_prefix[-30:]
     )
 
-    items: List[types.CompletionItem] = []
-
-    ast, parser = _get_parse(uri)
-
-    # Context-aware completion
-    if line_prefix.endswith(("jump ", "call ")):
-        # Complete label names from the whole workspace
-        all_labels = _get_all_workspace_labels()
-        for name, entries in all_labels.items():
-            target_uri, lb = entries[0]
-            # Show which file it's from
-            fname = os.path.basename(_path_from_uri(target_uri))
-            items.append(
-                types.CompletionItem(
-                    label=name,
-                    kind=types.CompletionItemKind.Function,
-                    detail=f"label ({fname}:{lb.lineno})",
-                )
-            )
-    elif line_prefix.endswith("with "):
-        # Complete transitions
-        for t in RENPY_TRANSITIONS:
-            items.append(
-                types.CompletionItem(
-                    label=t,
-                    kind=types.CompletionItemKind.Constant,
-                    detail="transition",
-                )
-            )
-    elif line_prefix.endswith("at "):
-        # Complete built-in transforms
-        for t in RENPY_TRANSFORMS:
-            items.append(
-                types.CompletionItem(
-                    label=t,
-                    kind=types.CompletionItemKind.Constant,
-                    detail="transform position",
-                )
-            )
-        # User-defined transforms from entire workspace
-        all_transforms = _get_all_workspace_transforms()
-        for tname, entries in all_transforms.items():
-            t_uri, tdef = entries[0]
-            fname = os.path.basename(_path_from_uri(t_uri))
-            items.append(
-                types.CompletionItem(
-                    label=tname,
-                    kind=types.CompletionItemKind.Function,
-                    detail=f"transform ({fname}:{tdef.lineno})",
-                )
-            )
-    elif line_prefix.endswith(("show screen ", "hide screen ", "call screen ")):
-        # Complete screen names from workspace
-        all_screens = _get_all_workspace_screens()
-        for sname, entries in all_screens.items():
-            s_uri, sdef = entries[0]
-            fname = os.path.basename(_path_from_uri(s_uri))
-            items.append(
-                types.CompletionItem(
-                    label=sname,
-                    kind=types.CompletionItemKind.Class,
-                    detail=f"screen ({fname}:{sdef.lineno})",
-                )
-            )
-    elif re.match(r"^\s*(?:show|scene|hide)\s+$", line_prefix, re.IGNORECASE):
-        # Complete image names after show/scene/hide
-        # 1) image definitions from .rpy files
-        all_images = _get_all_workspace_images()
-        for img_name, entries in all_images.items():
-            img_uri, img_def = entries[0]
-            fname = os.path.basename(_path_from_uri(img_uri))
-            items.append(
-                types.CompletionItem(
-                    label=img_name,
-                    kind=types.CompletionItemKind.File,
-                    detail=f"image ({fname}:{img_def.lineno})",
-                )
-            )
-        # 2) auto-detected image files from images/ directory
-        _ensure_image_cache()
-        seen = {n.lower() for n in all_images}
-        for auto_name in sorted(_image_cache):
-            if auto_name not in seen:
-                items.append(
-                    types.CompletionItem(
-                        label=auto_name,
-                        kind=types.CompletionItemKind.File,
-                        detail="image (auto)",
-                    )
-                )
-                seen.add(auto_name)
-    elif re.match(r"^\s*(?:play|queue)\s+\w+\s+$", line_prefix, re.IGNORECASE):
-        # Complete audio names after "play music ", "play sound ", "queue music ", etc.
-        # Suggest define names with "audio." prefix (Ren'Py convention: define audio.xxx = "file.ogg")
-        all_defines = _get_all_workspace_defines()
-        for dname, entries in all_defines.items():
-            if dname.startswith("audio."):
-                short = dname[len("audio.") :]
-                d_uri, ddef = entries[0]
-                fname = os.path.basename(_path_from_uri(d_uri))
-                items.append(
-                    types.CompletionItem(
-                        label=short,
-                        kind=types.CompletionItemKind.Variable,
-                        detail=f"{dname} ({fname}:{ddef.lineno})",
-                    )
-                )
-    else:
-        # General: keywords + characters + labels
-        for kw in RENPY_KEYWORDS:
-            items.append(
-                types.CompletionItem(
-                    label=kw,
-                    kind=types.CompletionItemKind.Keyword,
-                )
-            )
-        for ch in parser.get_all_characters():
-            items.append(
-                types.CompletionItem(
-                    label=ch.name,
-                    kind=types.CompletionItemKind.Variable,
-                    detail=ch.expression,
-                )
-            )
-        for lb in parser.get_all_labels():
-            items.append(
-                types.CompletionItem(
-                    label=lb.name,
-                    kind=types.CompletionItemKind.Function,
-                    detail=f"label (line {lb.lineno})",
-                )
-            )
+    _ast, parser = _get_parse(uri)
+    items = _completion_items_for_context(uri, parser, doc.lines, pos.line, col)
 
     _log.debug("completion: %s → %d item(s)", _short_uri(uri), len(items))
     return types.CompletionList(is_incomplete=False, items=items)
@@ -1988,8 +2367,149 @@ _SAY_SPACE_RE = re.compile(
 )
 
 
+def _normalize_expression_spacing(text: str) -> str:
+    """Normalize common expression spacing outside strings and comments."""
+    result: List[str] = []
+    i = 0
+    quote: Optional[str] = None
+    escaped = False
+    depth = 0
+    stripped = text.lstrip()
+
+    def _prev_significant() -> str:
+        j = len(result) - 1
+        while j >= 0 and result[j] in " \t":
+            j -= 1
+        return result[j] if j >= 0 else ""
+
+    def _next_significant(start: int) -> str:
+        j = start
+        while j < len(text) and text[j] in " \t":
+            j += 1
+        return text[j] if j < len(text) else ""
+
+    def _append_spaced_operator(operator: str) -> None:
+        while result and result[-1] in " \t":
+            result.pop()
+        result.append(f" {operator} ")
+
+    def _skip_following_spaces(start: int) -> int:
+        j = start
+        while j < len(text) and text[j] in " \t":
+            j += 1
+        return j
+
+    def _can_be_binary_operator(operator: str, prev_ch: str, next_ch: str) -> bool:
+        if not prev_ch or not next_ch:
+            return False
+        if prev_ch in "([{,=:+-*/%<>!":
+            return False
+        if operator in ("+", "-") and next_ch in ")]},=:+-*/%<>":
+            return False
+        if operator in ("*", "/", "%") and next_ch in ")]},=*/%<>":
+            return False
+        return True
+
+    def _can_be_assignment(prev_ch: str, next_ch: str) -> bool:
+        if depth != 0 or not prev_ch or not next_ch:
+            return False
+        if prev_ch in "=!<>:" or next_ch == "=":
+            return False
+        if stripped.startswith(("$", "define ", "default ", "image ", "init offset")):
+            return True
+        return False
+
+    while i < len(text):
+        ch = text[i]
+
+        if quote:
+            result.append(ch)
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == quote:
+                quote = None
+            i += 1
+            continue
+
+        if ch in ("'", '"'):
+            quote = ch
+            result.append(ch)
+            i += 1
+            continue
+
+        if ch == "#":
+            result.append(text[i:])
+            break
+
+        if ch in "([{":
+            depth += 1
+            result.append(ch)
+            i += 1
+            continue
+
+        if ch in ")]}":
+            if depth > 0:
+                depth -= 1
+            result.append(ch)
+            i += 1
+            continue
+
+        if ch == ",":
+            while result and result[-1] in " \t":
+                result.pop()
+            next_ch = _next_significant(i + 1)
+            result.append("," if not next_ch or next_ch in ")]}" else ", ")
+            i = _skip_following_spaces(i + 1)
+            continue
+
+        two_char = text[i : i + 2]
+        if two_char in ("==", "!=", "<=", ">="):
+            prev_ch = _prev_significant()
+            next_ch = _next_significant(i + 2)
+            if prev_ch and next_ch:
+                _append_spaced_operator(two_char)
+                i = _skip_following_spaces(i + 2)
+                continue
+
+        if ch in "=<>":
+            prev_ch = _prev_significant()
+            next_ch = _next_significant(i + 1)
+            if ch == "=" and _can_be_assignment(prev_ch, next_ch):
+                _append_spaced_operator(ch)
+                i = _skip_following_spaces(i + 1)
+                continue
+            if ch in "<>" and prev_ch and next_ch and next_ch != "=":
+                _append_spaced_operator(ch)
+                i = _skip_following_spaces(i + 1)
+                continue
+
+        if ch in "+-*/%":
+            prev_ch = _prev_significant()
+            next_ch = _next_significant(i + 1)
+            if _can_be_binary_operator(ch, prev_ch, next_ch):
+                _append_spaced_operator(ch)
+                i = _skip_following_spaces(i + 1)
+                continue
+
+        result.append(ch)
+        i += 1
+
+    return "".join(result)
+
+
+def _normalize_binary_star_spacing(text: str) -> str:
+    """Normalize spaces around binary * outside strings and comments."""
+    return _normalize_expression_spacing(text)
+
+
 @LSP_SERVER.feature(types.TEXT_DOCUMENT_FORMATTING)
 def format_document(ls: LanguageServer, params: types.DocumentFormattingParams):
+    if not _formatting_enabled():
+        _log.info("formatting: disabled by settings")
+        return []
+
     _log.info(
         "formatting: %s (tabSize=%d)",
         _short_uri(params.text_document.uri),
@@ -2036,6 +2556,7 @@ def format_document(ls: LanguageServer, params: types.DocumentFormattingParams):
         m = _SAY_SPACE_RE.match(stripped)
         if m:
             stripped = m.group(1) + " " + m.group(3)
+        stripped = _normalize_expression_spacing(stripped)
         formatted.append(target_indent * level + stripped)
 
     # Trailing newline

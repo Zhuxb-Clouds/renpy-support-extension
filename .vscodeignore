@@ -27,10 +27,13 @@ package-lock.json
 yarn.lock
 
 # Test & sample files
+.pytest_cache/**
 test_samples/**
+tests/**
 out/**
 
 # Logs & temp files
+log.txt
 *.log
 *.bak
 *.tmp

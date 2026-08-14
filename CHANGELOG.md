@@ -1,5 +1,31 @@
 # Changelog
 
+## [1.5.0] - 2026-08-14
+
+### Added
+
+- **Python pytest test base**
+  - Added focused pytest coverage for `ast_parser`, `WorkspaceIndex`, and LSP completion helpers
+  - Added parser regressions for nested parameters, tuple unpacking loops, camera ATL blocks, styles, and error recovery
+  - Added workspace index coverage for style aggregation
+
+- **Expanded context-aware completions**
+  - Added `define`/`default` variable completions in general Ren'Py contexts
+  - Added style-name completions for `style ... is ...` and screen `style` properties
+  - Added screen-language displayable/property completions inside `screen` blocks
+  - Added ATL statement/property completions inside `transform` blocks
+  - Added style property completions inside `style` blocks
+
+- **Ren'Py snippets**
+  - Added snippets for `label`, `screen`, `menu`, and `define`
+
+### Fixed
+
+- Fixed context completion triggers that depended on trailing spaces, such as `jump `, `with `, `at `, `call screen `, and `play music `
+- Fixed TextMate highlighting for Unicode image names and `scene ... as ...` clauses, e.g. `scene 便利店内 as bg with fade`
+- Expanded formatter spacing normalization for common expressions outside strings/comments, including commas, statement-level assignments, comparison operators, and binary arithmetic such as `matrixcolor TintMatrix('#EEFDFD') *  BrightnessMatrix(0.1)`
+- Improved save responsiveness by honoring `renpy-lsp.formatting.enabled`, honoring `renpy-lsp.diagnostics.enabled`, and adding `renpy-lsp.diagnostics.fullOnSave` for opt-in cross-workspace diagnostics on save
+
 ## [1.4.0] - 2026-06-20
 
 ### Fixed

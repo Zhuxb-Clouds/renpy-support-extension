@@ -30,5 +30,6 @@ build
 *.pytest_cache
 .coverage
 /test_samples/
+/out/
 /.vscode/
 *.vsix

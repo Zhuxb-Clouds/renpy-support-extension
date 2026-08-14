@@ -41,6 +41,7 @@
 | `renpy-lsp.formatting.enabled`    | `true` | 启用文档格式化                             |
 | `renpy-lsp.formatting.indentSize` | `4`    | 每级缩进的空格数                           |
 | `renpy-lsp.diagnostics.enabled`   | `true` | 启用诊断功能                               |
+| `renpy-lsp.diagnostics.fullOnSave` | `false` | 每次保存时运行跨工作区完整诊断             |
 
 ## 开发
 

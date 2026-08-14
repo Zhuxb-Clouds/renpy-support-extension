@@ -1,0 +1,34 @@
+{
+  "Label block": {
+    "prefix": "label",
+    "body": [
+      "label ${1:start}:",
+      "\t${0:pass}"
+    ],
+    "description": "Create a Ren'Py label block"
+  },
+  "Screen block": {
+    "prefix": "screen",
+    "body": [
+      "screen ${1:name}(${2}):",
+      "\t${0:pass}"
+    ],
+    "description": "Create a Ren'Py screen block"
+  },
+  "Menu block": {
+    "prefix": "menu",
+    "body": [
+      "menu:",
+      "\t\"${1:Choice}\":",
+      "\t\t${0:pass}"
+    ],
+    "description": "Create a Ren'Py menu block"
+  },
+  "Character define": {
+    "prefix": "define",
+    "body": [
+      "define ${1:e} = Character(\"${2:Eileen}\")"
+    ],
+    "description": "Define a Ren'Py character"
+  }
+}

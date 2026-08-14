@@ -128,6 +128,20 @@ async function resolvePythonPath(extensionPath: string): Promise<string | undefi
   return "python3";
 }
 
+function getServerSettings() {
+  const cfg = vscode.workspace.getConfiguration("renpy-lsp");
+  return {
+    formatting: {
+      enabled: cfg.get<boolean>("formatting.enabled", true),
+      indentSize: cfg.get<number>("formatting.indentSize", 4),
+    },
+    diagnostics: {
+      enabled: cfg.get<boolean>("diagnostics.enabled", true),
+      fullOnSave: cfg.get<boolean>("diagnostics.fullOnSave", false),
+    },
+  };
+}
+
 // ─── Activation ────────────────────────────────────────────────────────
 
 export function activate(context: vscode.ExtensionContext) {
@@ -193,9 +207,16 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration("renpy-lsp")) {
-        log("Configuration changed for renpy-lsp — restarting server");
-        vscode.window.showInformationMessage("Ren'Py LSP config changed — restarting server…");
-        stopLanguageServer().then(() => startLanguageServer(context));
+        if (e.affectsConfiguration("renpy-lsp.pythonPath")) {
+          log("Python path changed for renpy-lsp — restarting server");
+          vscode.window.showInformationMessage("Ren'Py LSP Python path changed — restarting server…");
+          stopLanguageServer().then(() => startLanguageServer(context));
+          return;
+        }
+        log("Configuration changed for renpy-lsp — updating server settings");
+        client?.sendNotification("workspace/didChangeConfiguration", {
+          settings: { "renpy-lsp": getServerSettings() },
+        });
       }
     }),
   );
@@ -459,7 +480,9 @@ async function startLanguageServer(context: vscode.ExtensionContext) {
       { scheme: "file", pattern: "**/*.rpy" },
       { scheme: "file", pattern: "**/*.rpym" },
     ],
+    initializationOptions: getServerSettings(),
     synchronize: {
+      configurationSection: "renpy-lsp",
       fileEvents: vscode.workspace.createFileSystemWatcher("**/*.{rpy,rpym}"),
     },
   };

@@ -41,6 +41,7 @@ Open Command Palette (`Ctrl+Shift+P` / `Cmd+Shift+P`) and type:
 | `renpy-lsp.formatting.enabled` | `true` | Enable document formatting |
 | `renpy-lsp.formatting.indentSize` | `4` | Spaces per indentation level |
 | `renpy-lsp.diagnostics.enabled` | `true` | Enable diagnostics |
+| `renpy-lsp.diagnostics.fullOnSave` | `false` | Run full cross-workspace diagnostics on every save |
 
 ## Development
 

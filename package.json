@@ -2,7 +2,7 @@
   "name": "renpy-support-extension",
   "publisher": "zhuxb-clouds",
   "displayName": "Ren'Py Language Support",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "Language support for Ren'Py script files (.rpy)",
   "icon": "icons/renpy.png",
   "main": "./dist/extension.js",
@@ -105,6 +105,12 @@
         }
       }
     ],
+    "snippets": [
+      {
+        "language": "renpy",
+        "path": "./snippets/renpy.json"
+      }
+    ],
     "commands": [
       {
         "command": "renpy-lsp.startServer",
@@ -161,6 +167,11 @@
           "type": "boolean",
           "default": true,
           "description": "Enable diagnostics (warnings, errors) for Ren'Py files."
+        },
+        "renpy-lsp.diagnostics.fullOnSave": {
+          "type": "boolean",
+          "default": false,
+          "description": "Run full cross-workspace diagnostics on every save. Disable for faster saves in large projects; lightweight syntax diagnostics still run."
         }
       }
     },
