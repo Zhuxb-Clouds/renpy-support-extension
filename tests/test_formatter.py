@@ -66,3 +66,210 @@ def test_normalize_expression_spacing_keeps_keyword_arguments_tight() -> None:
         lsp_server._normalize_expression_spacing("matrixcolor=BrightnessMatrix(1.0),")
         == "matrixcolor=BrightnessMatrix(1.0),"
     )
+
+
+def test_normalize_expression_spacing_keeps_hyphenated_statement_names() -> None:
+    assert (
+        lsp_server._normalize_expression_spacing("image 便利店-空调-关闭:")
+        == "image 便利店-空调-关闭:"
+    )
+    assert (
+        lsp_server._normalize_expression_spacing("label 便利店-空调:")
+        == "label 便利店-空调:"
+    )
+    assert (
+        lsp_server._normalize_expression_spacing("screen 便利店-空调:")
+        == "screen 便利店-空调:"
+    )
+    assert (
+        lsp_server._normalize_expression_spacing("transform 便利店-空调:")
+        == "transform 便利店-空调:"
+    )
+    assert (
+        lsp_server._normalize_expression_spacing("show 便利店-空调-关闭")
+        == "show 便利店-空调-关闭"
+    )
+    assert (
+        lsp_server._normalize_expression_spacing("jump 便利店-空调")
+        == "jump 便利店-空调"
+    )
+    assert (
+        lsp_server._normalize_expression_spacing("init -1 python:")
+        == "init -1 python:"
+    )
+
+
+def test_normalize_expression_spacing_still_normalizes_after_statement_name() -> None:
+    assert (
+        lsp_server._normalize_expression_spacing('image foo = "x-1.png"')
+        == 'image foo = "x-1.png"'
+    )
+    assert (
+        lsp_server._normalize_expression_spacing("image foo= bg-1")
+        == "image foo = bg - 1"
+    )
+    assert (
+        lsp_server._normalize_expression_spacing("define e=Character('E',color='#fff')")
+        == "define e = Character('E', color='#fff')"
+    )
+    assert (
+        lsp_server._normalize_expression_spacing("show expression (a-1) as x")
+        == "show expression (a - 1) as x"
+    )
+
+
+# ─────────────────────── format_document ──────────────────────────────
+
+
+class _FakeDoc:
+    def __init__(self, source: str) -> None:
+        self.source = source
+
+
+class _FakeWorkspace:
+    def __init__(self, source: str) -> None:
+        self._doc = _FakeDoc(source)
+
+    def get_text_document(self, uri: str) -> _FakeDoc:
+        return self._doc
+
+
+class _FakeLS:
+    def __init__(self, source: str) -> None:
+        self.workspace = _FakeWorkspace(source)
+
+
+def _format(
+    source: str,
+    *,
+    blank_lines: str = "collapse",
+    indent_size: int = 4,
+    tab_size: int = 4,
+) -> str:
+    """Run format_document with the given style settings and return the result."""
+    from lsprotocol import types
+
+    saved_formatting = dict(lsp_server._settings["formatting"])
+    saved_style = dict(lsp_server._vscode_style)
+    try:
+        lsp_server._settings["formatting"]["enabled"] = True
+        lsp_server._settings["formatting"]["indentSize"] = indent_size
+        lsp_server._settings["formatting"]["blankLines"] = blank_lines
+        lsp_server._vscode_style["indentSize"] = indent_size
+        lsp_server._vscode_style["blankLines"] = blank_lines
+        params = types.DocumentFormattingParams(
+            text_document=types.TextDocumentIdentifier(uri="file:///test.rpy"),
+            options=types.FormattingOptions(tab_size=tab_size, insert_spaces=True),
+        )
+        edits = lsp_server.format_document(_FakeLS(source), params)
+        return edits[0].new_text if edits else source
+    finally:
+        lsp_server._settings["formatting"].update(saved_formatting)
+        lsp_server._vscode_style.update(saved_style)
+
+
+def test_format_collapse_blank_lines() -> None:
+    source = 'label a:\n    "x"\n\n\n\n    "y"\n'
+    assert _format(source, blank_lines="collapse") == 'label a:\n    "x"\n\n    "y"\n'
+
+
+def test_format_preserve_leaves_blank_lines_untouched() -> None:
+    source = 'label a:\n    "x"\n\n\n    "y"\n'
+    assert _format(source, blank_lines="preserve") == source
+
+
+def test_format_strip_removes_all_blank_lines() -> None:
+    source = 'label a:\n    "x"\n\n    "y"\n\nlabel b:\n    "z"\n'
+    assert (
+        _format(source, blank_lines="strip")
+        == 'label a:\n    "x"\n    "y"\nlabel b:\n    "z"\n'
+    )
+
+
+def test_format_between_say_inserts_blank_lines() -> None:
+    source = 'label start:\n    "甲"\n    girl    "乙"\n    scene 黑夜\n    "丙"\n'
+    assert (
+        _format(source, blank_lines="betweenSay")
+        == 'label start:\n    "甲"\n\n    girl "乙"\n\n    scene 黑夜\n\n    "丙"\n'
+    )
+
+
+def test_format_between_say_normalizes_existing_blanks() -> None:
+    source = 'label start:\n    "甲"\n\n\n    "乙"\n'
+    assert (
+        _format(source, blank_lines="betweenSay")
+        == 'label start:\n    "甲"\n\n    "乙"\n'
+    )
+
+
+def test_format_between_say_extend_is_not_separated() -> None:
+    source = 'label start:\n    "甲"\n    extend "乙"\n    "丙"\n'
+    assert (
+        _format(source, blank_lines="betweenSay")
+        == 'label start:\n    "甲"\n    extend "乙"\n\n    "丙"\n'
+    )
+    # An existing blank between a say line and its extend is removed.
+    source_with_blank = 'label start:\n    "甲"\n\n    extend "乙"\n'
+    assert (
+        _format(source_with_blank, blank_lines="betweenSay")
+        == 'label start:\n    "甲"\n    extend "乙"\n'
+    )
+
+
+def test_format_between_say_keeps_menu_compact() -> None:
+    source = (
+        'label start:\n'
+        '    "对话"\n'
+        '    menu:\n'
+        '        "选项A":\n'
+        '            jump a\n'
+        '        "选项B":  # comment\n'
+        '            jump b\n'
+    )
+    assert (
+        _format(source, blank_lines="betweenSay")
+        == 'label start:\n'
+        '    "对话"\n'
+        '\n'
+        '    menu:\n'
+        '        "选项A":\n'
+        '            jump a\n'
+        '        "选项B":  # comment\n'
+        '            jump b\n'
+    )
+
+
+def test_format_between_say_ignores_non_script_blocks() -> None:
+    source = (
+        'init python:\n'
+        '    """docstring"""\n'
+        '    x = 1\n'
+        '\n'
+        'screen foo():\n'
+        '    text "你好"\n'
+        '    text "世界"\n'
+    )
+    assert _format(source, blank_lines="betweenSay") == source
+
+
+def test_format_between_say_requires_label_scope() -> None:
+    # Bare top-level say lines (outside any label) are not spaced apart.
+    source = '"甲"\n"乙"\n'
+    assert _format(source, blank_lines="betweenSay") == source
+
+
+def test_format_indent_size_setting_overrides_lsp_tab_size() -> None:
+    source = 'label a:\n    if x:\n        "hi"\n'
+    # VS Code reports tabSize=4, but the indentSize setting wins with 2.
+    assert (
+        _format(source, indent_size=2, tab_size=4)
+        == 'label a:\n  if x:\n    "hi"\n'
+    )
+
+
+def test_format_indent_size_zero_falls_back_to_lsp_tab_size() -> None:
+    source = 'label a:\n    "x"\n'
+    assert (
+        _format(source, indent_size=0, tab_size=2)
+        == 'label a:\n  "x"\n'
+    )

@@ -134,6 +134,7 @@ function getServerSettings() {
     formatting: {
       enabled: cfg.get<boolean>("formatting.enabled", true),
       indentSize: cfg.get<number>("formatting.indentSize", 4),
+      blankLines: cfg.get<string>("formatting.blankLines", "collapse"),
     },
     diagnostics: {
       enabled: cfg.get<boolean>("diagnostics.enabled", true),
@@ -483,7 +484,10 @@ async function startLanguageServer(context: vscode.ExtensionContext) {
     initializationOptions: getServerSettings(),
     synchronize: {
       configurationSection: "renpy-lsp",
-      fileEvents: vscode.workspace.createFileSystemWatcher("**/*.{rpy,rpym}"),
+      fileEvents: [
+        vscode.workspace.createFileSystemWatcher("**/*.{rpy,rpym}"),
+        vscode.workspace.createFileSystemWatcher("**/.renpy-format.json"),
+      ],
     },
   };
 

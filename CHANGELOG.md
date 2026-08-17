@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.6.0] - 2026-08-18
+
+### Added
+
+- Added `renpy-lsp.formatting.blankLines` setting controlling blank-line handling when formatting: `preserve` (leave untouched), `collapse` (default, fold consecutive blank lines into one), `betweenSay` (also insert one blank line between dialogue/narration lines inside `label` script blocks), and `strip` (remove all blank lines)
+- Added support for a `.renpy-format.json` file in the workspace root (keys: `indentSize`, `blankLines`); when present it overrides the corresponding VS Code settings per key, so format style can be committed with the project
+
+### Fixed
+
+- `renpy-lsp.formatting.indentSize` is now the single source of truth for formatting indentation — regular document formatting previously ignored it and followed `editor.tabSize` (only the batch "Format All Ren'Py Files" command honored it)
+
 ## [1.5.0] - 2026-08-14
 
 ### Added

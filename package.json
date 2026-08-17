@@ -2,7 +2,7 @@
   "name": "renpy-support-extension",
   "publisher": "zhuxb-clouds",
   "displayName": "Ren'Py Language Support",
-  "version": "1.5.0",
+  "version": "1.6.0",
   "description": "Language support for Ren'Py script files (.rpy)",
   "icon": "icons/renpy.png",
   "main": "./dist/extension.js",
@@ -161,7 +161,18 @@
           "default": 4,
           "minimum": 1,
           "maximum": 8,
-          "description": "Number of spaces per indentation level when formatting."
+          "markdownDescription": "Number of spaces per indentation level when formatting. Overridden per key by `.renpy-format.json` in the workspace root when present."
+        },
+        "renpy-lsp.formatting.blankLines": {
+          "type": "string",
+          "enum": [
+            "preserve",
+            "collapse",
+            "betweenSay",
+            "strip"
+          ],
+          "default": "collapse",
+          "markdownDescription": "Blank-line handling when formatting:\n\n- `preserve` — leave blank lines untouched\n- `collapse` — collapse consecutive blank lines into one\n- `betweenSay` — like `collapse`, plus insert one blank line between dialogue/narration lines inside `label` script blocks\n- `strip` — remove all blank lines\n\nOverridden per key by `.renpy-format.json` in the workspace root when present."
         },
         "renpy-lsp.diagnostics.enabled": {
           "type": "boolean",

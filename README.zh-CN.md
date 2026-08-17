@@ -40,8 +40,22 @@
 | `renpy-lsp.pythonPath`            | `""`   | 自定义 Python 解释器路径（留空则自动检测） |
 | `renpy-lsp.formatting.enabled`    | `true` | 启用文档格式化                             |
 | `renpy-lsp.formatting.indentSize` | `4`    | 每级缩进的空格数                           |
+| `renpy-lsp.formatting.blankLines` | `collapse` | 空行处理：`preserve`（不动）、`collapse`（折叠为一行）、`betweenSay`（另在 `label` 脚本块内的对白/旁白行之间插入空行）、`strip`（全部删除） |
 | `renpy-lsp.diagnostics.enabled`   | `true` | 启用诊断功能                               |
 | `renpy-lsp.diagnostics.fullOnSave` | `false` | 每次保存时运行跨工作区完整诊断             |
+
+### 项目级格式化配置
+
+风格设置（`indentSize`、`blankLines`）可通过工作区根目录的 `.renpy-format.json` 文件随项目提交：
+
+```json
+{
+  "indentSize": 2,
+  "blankLines": "betweenSay"
+}
+```
+
+该文件存在时，按键覆盖对应的 VS Code 设置。
 
 ## 开发
 

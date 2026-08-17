@@ -40,8 +40,22 @@ Open Command Palette (`Ctrl+Shift+P` / `Cmd+Shift+P`) and type:
 | `renpy-lsp.pythonPath` | `""` | Custom Python interpreter path (auto-detect if empty) |
 | `renpy-lsp.formatting.enabled` | `true` | Enable document formatting |
 | `renpy-lsp.formatting.indentSize` | `4` | Spaces per indentation level |
+| `renpy-lsp.formatting.blankLines` | `collapse` | Blank-line handling: `preserve` (untouched), `collapse` (fold consecutive to one), `betweenSay` (also insert one between dialogue/narration lines inside `label` blocks), `strip` (remove all) |
 | `renpy-lsp.diagnostics.enabled` | `true` | Enable diagnostics |
 | `renpy-lsp.diagnostics.fullOnSave` | `false` | Run full cross-workspace diagnostics on every save |
+
+### Per-project format config
+
+Style settings (`indentSize`, `blankLines`) can be committed to the project via a `.renpy-format.json` file in the workspace root:
+
+```json
+{
+  "indentSize": 2,
+  "blankLines": "betweenSay"
+}
+```
+
+When present, it overrides the corresponding VS Code settings per key.
 
 ## Development
 

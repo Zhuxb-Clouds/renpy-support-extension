@@ -1,6 +1,6 @@
 [project]
 name = "renpy-lsp"
-version = "1.5.0"
+version = "1.6.0"
 description = "Language server for Ren'Py script files"
 readme = "README.md"
 requires-python = ">=3.11"

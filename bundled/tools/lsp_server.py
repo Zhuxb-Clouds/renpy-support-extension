@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 import os
 import re
+import json
 
 # Ensure the bundled/tools directory is on sys.path so we can import ast_parser.
 _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -87,7 +88,7 @@ from urllib.parse import unquote as url_unquote
 
 MAX_WORKERS = 4
 LSP_SERVER = LanguageServer(
-    name="renpy-server", version="1.5.0", max_workers=MAX_WORKERS
+    name="renpy-server", version="1.6.0", max_workers=MAX_WORKERS
 )
 
 # Suppress noisy "Cancel notification for unknown message id" warnings.
@@ -122,12 +123,30 @@ _settings = {
     "formatting": {
         "enabled": True,
         "indentSize": 4,
+        "blankLines": "collapse",
     },
     "diagnostics": {
         "enabled": True,
         "fullOnSave": False,
     },
 }
+
+# Allowed values for the `blankLines` formatting mode:
+#   preserve   — leave blank lines untouched
+#   collapse   — collapse consecutive blank lines into one (default)
+#   betweenSay — like collapse, plus insert one blank line between
+#                dialogue/narration lines inside label script blocks
+#   strip      — remove all blank lines
+_BLANK_LINE_MODES = ("preserve", "collapse", "betweenSay", "strip")
+
+# Style settings as last sent by the VS Code client.  `.renpy-format.json`
+# overrides these per key; the merged result lives in _settings["formatting"].
+_vscode_style: Dict[str, object] = {"indentSize": 4, "blankLines": "collapse"}
+
+# Path to the workspace-root format config file, if one exists.
+_format_config_path: Optional[str] = None
+
+_FORMAT_CONFIG_FILENAME = ".renpy-format.json"
 
 
 def _coerce_bool(value: object, default: bool) -> bool:
@@ -138,6 +157,12 @@ def _coerce_bool(value: object, default: bool) -> bool:
 
 def _coerce_int(value: object, default: int) -> int:
     if isinstance(value, int):
+        return value
+    return default
+
+
+def _coerce_choice(value: object, allowed: Tuple[str, ...], default: str) -> str:
+    if isinstance(value, str) and value in allowed:
         return value
     return default
 
@@ -163,8 +188,13 @@ def _update_settings(raw_settings: object) -> None:
         _settings["formatting"]["enabled"] = _coerce_bool(
             formatting.get("enabled"), _settings["formatting"]["enabled"]
         )
-        _settings["formatting"]["indentSize"] = _coerce_int(
-            formatting.get("indentSize"), _settings["formatting"]["indentSize"]
+        _vscode_style["indentSize"] = _coerce_int(
+            formatting.get("indentSize"), _vscode_style["indentSize"]
+        )
+        _vscode_style["blankLines"] = _coerce_choice(
+            formatting.get("blankLines"),
+            _BLANK_LINE_MODES,
+            str(_vscode_style["blankLines"]),
         )
     elif "formatting.enabled" in settings:
         _settings["formatting"]["enabled"] = _coerce_bool(
@@ -188,12 +218,73 @@ def _update_settings(raw_settings: object) -> None:
             _settings["diagnostics"]["fullOnSave"],
         )
 
+    _apply_format_config()
+
     _log.info(
-        "settings: formatting.enabled=%s diagnostics.enabled=%s diagnostics.fullOnSave=%s",
+        "settings: formatting.enabled=%s formatting.indentSize=%s "
+        "formatting.blankLines=%s diagnostics.enabled=%s diagnostics.fullOnSave=%s",
         _settings["formatting"]["enabled"],
+        _settings["formatting"]["indentSize"],
+        _settings["formatting"]["blankLines"],
         _settings["diagnostics"]["enabled"],
         _settings["diagnostics"]["fullOnSave"],
     )
+
+
+def _find_format_config() -> Optional[str]:
+    """Return the path of the first `.renpy-format.json` in a workspace root."""
+    try:
+        folders = list(LSP_SERVER.workspace.folders.values())
+    except Exception:  # workspace not initialized (e.g. in tests)
+        return None
+    for folder in folders:
+        candidate = os.path.join(_path_from_uri(folder.uri), _FORMAT_CONFIG_FILENAME)
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def _load_format_config(path: str) -> dict:
+    """Read and validate `.renpy-format.json`; return {} on any problem."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+        _log.warning("%s: root value is not an object — ignored", path)
+    except (OSError, ValueError) as exc:
+        _log.warning("failed to read %s: %s", path, exc)
+    return {}
+
+
+def _apply_format_config() -> None:
+    """Rebuild style settings: VS Code values, overridden per key by
+    `.renpy-format.json` when one is present in the workspace root."""
+    fmt = _settings["formatting"]
+    fmt["indentSize"] = _vscode_style["indentSize"]
+    fmt["blankLines"] = _vscode_style["blankLines"]
+    if not _format_config_path:
+        return
+    cfg = _load_format_config(_format_config_path)
+    if "indentSize" in cfg:
+        fmt["indentSize"] = _coerce_int(cfg.get("indentSize"), fmt["indentSize"])
+    if "blankLines" in cfg:
+        fmt["blankLines"] = _coerce_choice(
+            cfg.get("blankLines"), _BLANK_LINE_MODES, str(fmt["blankLines"])
+        )
+    _log.info(
+        "format config %s: indentSize=%s blankLines=%s",
+        _format_config_path,
+        fmt["indentSize"],
+        fmt["blankLines"],
+    )
+
+
+def _refresh_format_config() -> None:
+    """(Re)discover and apply `.renpy-format.json` from the workspace root."""
+    global _format_config_path
+    _format_config_path = _find_format_config()
+    _apply_format_config()
 
 
 def _formatting_enabled() -> bool:
@@ -211,6 +302,7 @@ def _full_diagnostics_on_save() -> bool:
 @LSP_SERVER.feature(types.INITIALIZE)
 def initialize(ls: LanguageServer, params: types.InitializeParams) -> None:
     _update_settings(params.initialization_options)
+    _refresh_format_config()
 
 
 @LSP_SERVER.feature(types.WORKSPACE_DID_CHANGE_CONFIGURATION)
@@ -218,6 +310,7 @@ def did_change_configuration(
     ls: LanguageServer, params: types.DidChangeConfigurationParams
 ) -> None:
     _update_settings(params.settings)
+    _refresh_format_config()
 
 
 # ── UTF-16 → Python (UTF-32) column offset conversion ──────────────────
@@ -1202,6 +1295,9 @@ def did_change_watched_files(
     for change in params.changes:
         _log.debug("watchedFile: %s type=%s", _short_uri(change.uri), change.type)
         change_path = _path_from_uri(change.uri)
+        if os.path.basename(change_path) == _FORMAT_CONFIG_FILENAME:
+            _refresh_format_config()
+            continue
         is_rpy = change_path.endswith((".rpy", ".rpym"))
         if change.type == types.FileChangeType.Created:
             if is_rpy:
@@ -2367,6 +2463,130 @@ _SAY_SPACE_RE = re.compile(
 )
 
 
+def _strip_comment(text: str) -> str:
+    """Return *text* with any trailing ``#`` comment removed (string-aware)."""
+    quote: Optional[str] = None
+    escaped = False
+    for i, ch in enumerate(text):
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == quote:
+                quote = None
+        elif ch in "\"'`":
+            quote = ch
+        elif ch == "#":
+            return text[:i]
+    return text
+
+
+def _line_is_block_opener(stripped: str) -> bool:
+    """True if *stripped* opens an indented block, i.e. its code (ignoring
+    strings and trailing comments) ends with ``:``."""
+    return _strip_comment(stripped).rstrip().endswith(":")
+
+
+def _first_word(stripped: str) -> str:
+    """Return the leading word of a statement ("" when it starts with a
+    non-word character such as a quote)."""
+    m = re.match(r"\w+", stripped, re.UNICODE)
+    return m.group(0) if m else ""
+
+
+# Block-opening statements whose body is NOT Ren'Py script flow (dialogue
+# never appears inside them).
+_NON_SCRIPT_OPENERS = frozenset(
+    {
+        "python",
+        "init",
+        "screen",
+        "transform",
+        "style",
+        "image",
+        "layeredimage",
+        "predict",
+        "channel",
+    }
+)
+
+
+def _is_say_line(stripped: str) -> bool:
+    """Detect dialogue/narration lines for ``betweenSay`` blank-line insertion.
+
+    Matches ``character "..."`` and bare narration ``"..."``, but not block
+    openers such as menu options (``"choice":``) nor ``extend`` continuations.
+    """
+    if not stripped:
+        return False
+    if _strip_comment(stripped).rstrip().endswith(":"):
+        return False
+    if stripped[0] in "\"'`":
+        return True
+    m = _SAY_SPACE_RE.match(stripped)
+    return bool(m) and m.group(1) != "extend"
+
+
+def _is_extend_line(stripped: str) -> bool:
+    """True for ``extend "..."`` continuation lines."""
+    m = _SAY_SPACE_RE.match(stripped)
+    return bool(m) and m.group(1) == "extend"
+
+
+# Statement keywords whose name may legally contain '-' (image names, labels,
+# screens, ...). For these, the name must not be split like a subtraction.
+_NAME_KEYWORDS = (
+    "image ",
+    "label ",
+    "screen ",
+    "transform ",
+    "style ",
+    "define ",
+    "default ",
+    "init ",
+    "show ",
+    "scene ",
+    "hide ",
+    "jump ",
+    "call ",
+)
+
+
+def _match_statement_name(text: str) -> Optional[int]:
+    """If *text* starts with a statement whose name may contain '-', return the
+    index at which the remainder to normalize starts (or ``len(text)`` when the
+    whole line is the name). Otherwise return ``None``.
+
+    Definitions (``image``, ``label``, ``screen``, ``transform``, ``style``,
+    ``define``, ``default``, ``init``) keep the name up to the ``:`` or ``=``.
+    Statements taking a bare name (``show``, ``scene``, ``hide``, ``jump``,
+    ``call``) keep the name region verbatim when it contains a '-'.
+    """
+    stripped = text.lstrip()
+    if not stripped:
+        return None
+    lower = stripped.lower()
+    offset = len(text) - len(stripped)
+    for kw in _NAME_KEYWORDS:
+        if not lower.startswith(kw):
+            continue
+        i = offset + len(kw)
+        if kw in ("show ", "scene ", "hide ", "jump ", "call "):
+            first_end = i
+            while first_end < len(text) and text[first_end] not in " \t":
+                first_end += 1
+            if text[i:first_end] == "expression":
+                return None
+            if "-" not in text[i:]:
+                return None
+            return len(text)
+        while i < len(text) and text[i] not in ":=":
+            i += 1
+        return i
+    return None
+
+
 def _normalize_expression_spacing(text: str) -> str:
     """Normalize common expression spacing outside strings and comments."""
     result: List[str] = []
@@ -2375,6 +2595,11 @@ def _normalize_expression_spacing(text: str) -> str:
     escaped = False
     depth = 0
     stripped = text.lstrip()
+
+    name_end = _match_statement_name(text)
+    if name_end is not None:
+        result.extend(text[:name_end])
+        i = name_end
 
     def _prev_significant() -> str:
         j = len(result) - 1
@@ -2510,46 +2735,94 @@ def format_document(ls: LanguageServer, params: types.DocumentFormattingParams):
         _log.info("formatting: disabled by settings")
         return []
 
-    _log.info(
-        "formatting: %s (tabSize=%d)",
-        _short_uri(params.text_document.uri),
-        params.options.tab_size,
-    )
     """Re-indent the document using a consistent indent width.
 
     Strategy:
       1. Detect the file's current indent unit (e.g. 4 spaces).
       2. For every line compute *indent level* = leading_spaces / unit.
       3. Re-emit each line at ``target_indent * level``.
-      4. Collapse consecutive blank lines into one.
+      4. Blank lines follow the ``blankLines`` mode:
+         - ``preserve``   — leave blank lines untouched
+         - ``collapse``   — collapse consecutive blank lines into one
+         - ``betweenSay`` — like ``collapse``, plus insert one blank line
+           between dialogue/narration lines inside label script blocks
+         - ``strip``      — remove all blank lines
       5. Strip trailing whitespace.
     """
+    _refresh_format_config()
     document = ls.workspace.get_text_document(params.text_document.uri)
     source = document.source
-    tab_size: int = params.options.tab_size
+    indent_size = _settings["formatting"]["indentSize"]
+    if isinstance(indent_size, int) and indent_size > 0:
+        tab_size = indent_size
+    else:
+        tab_size = params.options.tab_size
     use_spaces: bool = params.options.insert_spaces
+    blank_mode: str = str(_settings["formatting"]["blankLines"])
     target_indent = " " * tab_size if use_spaces else "\t"
+
+    _log.info(
+        "formatting: %s (tabSize=%d blankLines=%s)",
+        _short_uri(params.text_document.uri),
+        tab_size,
+        blank_mode,
+    )
 
     raw_lines = source.splitlines()
     src_unit = _detect_indent_unit(raw_lines)
 
     formatted: List[str] = []
-    prev_blank = False
+    pending_blanks = 0
+    # (level, is_script) of each enclosing block opener — used by betweenSay
+    # to restrict blank-line insertion to label script flow.
+    scope_stack: List[Tuple[int, bool]] = []
+    prev_level = 0
+    prev_is_dialogue = False
+    prev_in_script = False
 
     for raw in raw_lines:
         stripped = raw.strip()
 
-        # ── blank lines: keep at most one ──
+        # ── blank lines: handled according to the blankLines mode ──
         if not stripped:
-            if not prev_blank and formatted:
+            if blank_mode == "preserve":
                 formatted.append("")
-            prev_blank = True
+            elif blank_mode == "strip":
+                continue
+            else:  # collapse / betweenSay — flush before the next code line
+                pending_blanks += 1
             continue
-        prev_blank = False
 
         # ── compute indent level from source ──
         spaces = _leading_spaces(raw)
         level = round(spaces / src_unit) if src_unit else 0
+
+        # ── script-scope tracking (betweenSay only) ──
+        in_script = False
+        cur_is_say = cur_is_extend = False
+        if blank_mode == "betweenSay":
+            while scope_stack and scope_stack[-1][0] >= level:
+                scope_stack.pop()
+            in_script = scope_stack[-1][1] if scope_stack else False
+            cur_is_say = _is_say_line(stripped)
+            cur_is_extend = _is_extend_line(stripped)
+
+        # ── emit blank lines before this line ──
+        if formatted:
+            if blank_mode == "collapse":
+                if pending_blanks > 0:
+                    formatted.append("")
+            elif blank_mode == "betweenSay":
+                same_scope_level = prev_level == level and prev_in_script and in_script
+                if cur_is_extend and prev_is_dialogue and same_scope_level:
+                    pass  # extend continues the previous line — never blank
+                elif pending_blanks > 0 or (
+                    same_scope_level
+                    and not cur_is_extend
+                    and (prev_is_dialogue or cur_is_say)
+                ):
+                    formatted.append("")
+        pending_blanks = 0
 
         # ── emit with normalized indent ──
         # Normalize: exactly 1 space between character name and dialog string
@@ -2558,6 +2831,20 @@ def format_document(ls: LanguageServer, params: types.DocumentFormattingParams):
             stripped = m.group(1) + " " + m.group(3)
         stripped = _normalize_expression_spacing(stripped)
         formatted.append(target_indent * level + stripped)
+
+        # ── push block opener & remember line for the next iteration ──
+        if blank_mode == "betweenSay":
+            if _line_is_block_opener(stripped):
+                word = _first_word(stripped)
+                if word == "label":
+                    scope_stack.append((level, True))
+                elif word in _NON_SCRIPT_OPENERS:
+                    scope_stack.append((level, False))
+                else:
+                    scope_stack.append((level, in_script))
+            prev_level = level
+            prev_is_dialogue = cur_is_say or cur_is_extend
+            prev_in_script = in_script
 
     # Trailing newline
     formatted_text = "\n".join(formatted)
