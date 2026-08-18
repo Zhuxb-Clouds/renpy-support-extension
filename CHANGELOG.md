@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.6.1] - 2026-08-18
+
+### Fixed
+
+- Fixed the formatter inserting a stray space inside unary minus after an assignment, e.g. `init offset = -2` was rewritten as the invalid `init offset =  - 2` (same issue affected `define`/`default`/`image` assignments like `define foo = -2`). Unary `-`/`+` immediately following a spaced operator are now kept tight to their operand.
+
 ## [1.6.0] - 2026-08-18
 
 ### Added

@@ -99,6 +99,41 @@ def test_normalize_expression_spacing_keeps_hyphenated_statement_names() -> None
     )
 
 
+def test_normalize_expression_spacing_keeps_unary_minus_after_assignment() -> None:
+    # Regression: a unary minus right after a spaced assignment operator must
+    # not be mistaken for a binary operator and split with spaces, which would
+    # turn ``init offset = -2`` into the invalid ``init offset =  - 2``.
+    assert (
+        lsp_server._normalize_expression_spacing("init offset = -2")
+        == "init offset = -2"
+    )
+    assert (
+        lsp_server._normalize_expression_spacing("init offset =  -2")
+        == "init offset = -2"
+    )
+    assert (
+        lsp_server._normalize_expression_spacing("init offset =-2")
+        == "init offset = -2"
+    )
+    assert (
+        lsp_server._normalize_expression_spacing("define foo = -2")
+        == "define foo = -2"
+    )
+    assert (
+        lsp_server._normalize_expression_spacing("default foo = -2")
+        == "default foo = -2"
+    )
+    # Binary minus elsewhere in the expression is still normalized.
+    assert (
+        lsp_server._normalize_expression_spacing("init offset = -2 - 3")
+        == "init offset = -2 - 3"
+    )
+    assert (
+        lsp_server._normalize_expression_spacing("define foo = -2 + 3")
+        == "define foo = -2 + 3"
+    )
+
+
 def test_normalize_expression_spacing_still_normalizes_after_statement_name() -> None:
     assert (
         lsp_server._normalize_expression_spacing('image foo = "x-1.png"')

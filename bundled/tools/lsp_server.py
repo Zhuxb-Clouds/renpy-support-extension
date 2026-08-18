@@ -2602,10 +2602,11 @@ def _normalize_expression_spacing(text: str) -> str:
         i = name_end
 
     def _prev_significant() -> str:
-        j = len(result) - 1
-        while j >= 0 and result[j] in " \t":
-            j -= 1
-        return result[j] if j >= 0 else ""
+        for elem in reversed(result):
+            for ch in reversed(elem):
+                if ch not in " \t":
+                    return ch
+        return ""
 
     def _next_significant(start: int) -> str:
         j = start
