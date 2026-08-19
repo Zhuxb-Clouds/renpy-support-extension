@@ -99,6 +99,49 @@ def test_normalize_expression_spacing_keeps_hyphenated_statement_names() -> None
     )
 
 
+def test_normalize_expression_spacing_collapses_dashes_in_image_names() -> None:
+    # Ren'Py forbids image-name components that begin with '-'; a dash used as
+    # an in-component separator must not be surrounded by spaces.
+    assert (
+        lsp_server._normalize_expression_spacing("image 便利店 - 内部:")
+        == "image 便利店-内部:"
+    )
+    assert (
+        lsp_server._normalize_expression_spacing("image 主角家 - 卧室:")
+        == "image 主角家-卧室:"
+    )
+    assert (
+        lsp_server._normalize_expression_spacing("image 便利店 - 外部 - 树:")
+        == "image 便利店-外部-树:"
+    )
+    assert (
+        lsp_server._normalize_expression_spacing('image 便利店 - 内部 = "x.png"')
+        == 'image 便利店-内部 = "x.png"'
+    )
+    assert (
+        lsp_server._normalize_expression_spacing("show 便利店 - 内部")
+        == "show 便利店-内部"
+    )
+    assert (
+        lsp_server._normalize_expression_spacing("scene 便利店 - 内部 with dissolve")
+        == "scene 便利店-内部 with dissolve"
+    )
+    assert (
+        lsp_server._normalize_expression_spacing("hide 便利店 - 内部")
+        == "hide 便利店-内部"
+    )
+    # Already-valid multi-component names (no dash) are untouched.
+    assert (
+        lsp_server._normalize_expression_spacing("image bg market:")
+        == "image bg market:"
+    )
+    # Non-image statements keep their spaced dashes (e.g. ``init -1``).
+    assert (
+        lsp_server._normalize_expression_spacing("init -1 python:")
+        == "init -1 python:"
+    )
+
+
 def test_normalize_expression_spacing_keeps_unary_minus_after_assignment() -> None:
     # Regression: a unary minus right after a spaced assignment operator must
     # not be mistaken for a binary operator and split with spaces, which would
@@ -307,4 +350,27 @@ def test_format_indent_size_zero_falls_back_to_lsp_tab_size() -> None:
     assert (
         _format(source, indent_size=0, tab_size=2)
         == 'label a:\n  "x"\n'
+    )
+
+
+def test_format_collapses_spaced_dashes_in_image_names() -> None:
+    # Regression: ``image 主角家 - 卧室:`` is invalid Ren'Py ("image name
+    # components may not begin with a '-'"); the formatter collapses the
+    # spaces around the dash so the result is ``image 主角家-卧室:``.
+    source = (
+        'image 主角家 - 卧室:\n'
+        '    "#000"\n'
+        '    xysize (3840, 2160)\n'
+        '\n'
+        'image 便利店 - 内部:\n'
+        '    "#000"\n'
+    )
+    assert (
+        _format(source)
+        == 'image 主角家-卧室:\n'
+        '    "#000"\n'
+        '    xysize (3840, 2160)\n'
+        '\n'
+        'image 便利店-内部:\n'
+        '    "#000"\n'
     )

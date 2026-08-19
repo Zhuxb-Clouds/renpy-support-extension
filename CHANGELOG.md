@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.6.2] - 2026-08-19
+
+### Fixed
+
+- Fixed the formatter leaving spaces around `-` in image names, producing invalid Ren'Py such as `image 便利店 - 内部:` (Ren'Py reports "image name components may not begin with a '-'"). Spaces around dashes in `image`/`show`/`scene`/`hide` image names are now collapsed, yielding the valid `image 便利店-内部:`.
+
 ## [1.6.1] - 2026-08-18
 
 ### Fixed

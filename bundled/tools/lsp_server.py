@@ -88,7 +88,7 @@ from urllib.parse import unquote as url_unquote
 
 MAX_WORKERS = 4
 LSP_SERVER = LanguageServer(
-    name="renpy-server", version="1.6.0", max_workers=MAX_WORKERS
+    name="renpy-server", version="1.6.2", max_workers=MAX_WORKERS
 )
 
 # Suppress noisy "Cancel notification for unknown message id" warnings.
@@ -2552,11 +2552,19 @@ _NAME_KEYWORDS = (
     "call ",
 )
 
+# Subset whose name is an *image name*: multiple space-separated components
+# are allowed, but a component may not begin with '-'.  For these statements
+# a dash surrounded by spaces (``便利店 - 内部``) is invalid Ren'Py and is
+# collapsed to ``便利店-内部`` by the formatter.
+_IMAGE_NAME_KEYWORDS = frozenset({"image ", "show ", "scene ", "hide "})
 
-def _match_statement_name(text: str) -> Optional[int]:
-    """If *text* starts with a statement whose name may contain '-', return the
-    index at which the remainder to normalize starts (or ``len(text)`` when the
-    whole line is the name). Otherwise return ``None``.
+
+def _match_statement_name(text: str) -> Optional[Tuple[int, bool]]:
+    """If *text* starts with a statement whose name may contain '-', return a
+    ``(name_end, is_image_name)`` tuple where *name_end* is the index at which
+    the remainder to normalize starts (or ``len(text)`` when the whole line is
+    the name) and *is_image_name* marks image-name statements whose dashes
+    must not be surrounded by spaces.  Return ``None`` otherwise.
 
     Definitions (``image``, ``label``, ``screen``, ``transform``, ``style``,
     ``define``, ``default``, ``init``) keep the name up to the ``:`` or ``=``.
@@ -2572,6 +2580,7 @@ def _match_statement_name(text: str) -> Optional[int]:
         if not lower.startswith(kw):
             continue
         i = offset + len(kw)
+        is_image_name = kw in _IMAGE_NAME_KEYWORDS
         if kw in ("show ", "scene ", "hide ", "jump ", "call "):
             first_end = i
             while first_end < len(text) and text[first_end] not in " \t":
@@ -2580,11 +2589,22 @@ def _match_statement_name(text: str) -> Optional[int]:
                 return None
             if "-" not in text[i:]:
                 return None
-            return len(text)
+            return len(text), is_image_name
         while i < len(text) and text[i] not in ":=":
             i += 1
-        return i
+        return i, is_image_name
     return None
+
+
+def _collapse_image_name_dashes(text: str) -> str:
+    """Collapse spaces around '-' so an invalid ``image 便利店 - 内部:`` becomes
+    the valid ``image 便利店-内部:``.
+
+    Ren'Py splits image names on whitespace into components and forbids any
+    component that begins with '-'; a dash meant as an in-component separator
+    must therefore never be surrounded by spaces.
+    """
+    return re.sub(r"\s*-\s*", "-", text)
 
 
 def _normalize_expression_spacing(text: str) -> str:
@@ -2596,9 +2616,13 @@ def _normalize_expression_spacing(text: str) -> str:
     depth = 0
     stripped = text.lstrip()
 
-    name_end = _match_statement_name(text)
-    if name_end is not None:
-        result.extend(text[:name_end])
+    matched = _match_statement_name(text)
+    if matched is not None:
+        name_end, is_image_name = matched
+        prefix = text[:name_end]
+        if is_image_name:
+            prefix = _collapse_image_name_dashes(prefix)
+        result.extend(prefix)
         i = name_end
 
     def _prev_significant() -> str:
