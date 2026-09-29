@@ -83,6 +83,22 @@ npm run package      # 生产构建
 npm run vsix         # 打包 .vsix 文件
 ```
 
+### 发布
+
+发布由 GitHub Actions 自动完成（`.github/workflows/release.yml`）：
+
+1. 确认 `CHANGELOG.md` 已包含新版本的段落，且 `package.json` / `pyproject.toml` 已更新到该版本。
+2. 创建并推送与版本号一致的 tag：
+
+   ```bash
+   git tag v1.7.0
+   git push origin v1.7.0
+   ```
+
+3. workflow 会运行测试、校验 tag 与 `package.json` 版本一致、构建 `.vsix`、发布到 VS Code 扩展商店（需要在仓库配置 `VSCE_PAT` secret，未配置时跳过该步），并创建附有 `.vsix` 和 CHANGELOG 摘要的 GitHub Release。
+
+push 和 PR 会由 `.github/workflows/ci.yml` 检查（Python 测试 + 生产构建）。
+
 ### 项目结构
 
 - `src/extension.ts` — VS Code 客户端入口

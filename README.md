@@ -83,6 +83,22 @@ npm run package      # Production build
 npm run vsix         # Build .vsix package
 ```
 
+### Release
+
+Releases are automated through GitHub Actions (`.github/workflows/release.yml`):
+
+1. Make sure `CHANGELOG.md` has a section for the new version and `package.json` / `pyproject.toml` carry that version.
+2. Create and push a tag matching the version:
+
+   ```bash
+   git tag v1.7.0
+   git push origin v1.7.0
+   ```
+
+3. The workflow runs the test suite, verifies the tag matches `package.json`, builds the `.vsix`, publishes it to the VS Code Marketplace (requires the `VSCE_PAT` repository secret — when absent this step is skipped), and creates a GitHub Release with the `.vsix` attached and the CHANGELOG section as release notes.
+
+Pushes and pull requests are additionally checked by `.github/workflows/ci.yml` (Python tests + production bundle).
+
 ### Project Structure
 
 - `src/extension.ts` — VS Code client entry point
