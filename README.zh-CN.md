@@ -8,7 +8,12 @@
 
 - **语法高亮** — 完整的 Ren'Py 脚本语法高亮，包括 screen、style、ATL 和嵌入式 Python
 - **代码格式化** — 通过内置 LSP 服务器自动缩进和格式化
-- **诊断功能** — 常见问题的警告和错误提示
+- **诊断功能** — 常见问题的警告和错误提示：
+  - 未定义的 `jump`/`call` label、重复的 label/screen 定义、缺失的图像文件、未使用的 label
+  - `show`/`scene`/`hide` 引用未定义的 image、`at` 引用未知的 transform、`style x is parent` 的父样式不存在
+- **快速修复** — 针对诊断的 Code Action：一键创建缺失的 label、删除未使用的 label 块
+- **上下文补全** — label、image、transform、transition、screen、style、`define`/`default` 变量（含 `music.` 这类点分命名空间），以及 screen/ATL/style 属性
+- **翻译 ID 悬停** — 悬停对话行可查看 Ren'Py 翻译标识符
 - **Markdown 支持** — Markdown 文件中 Ren'Py 代码块的语法高亮
 
 ## 安装

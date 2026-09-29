@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import lsp_server
+import server_context as ctx
 
 
 def test_normalize_binary_star_spacing_in_matrixcolor_expression() -> None:
@@ -304,14 +305,14 @@ def _format(
     """Run format_document with the given style settings and return the result."""
     from lsprotocol import types
 
-    saved_formatting = dict(lsp_server._settings["formatting"])
-    saved_style = dict(lsp_server._vscode_style)
+    saved_formatting = dict(ctx._settings["formatting"])
+    saved_style = dict(ctx._vscode_style)
     try:
-        lsp_server._settings["formatting"]["enabled"] = True
-        lsp_server._settings["formatting"]["indentSize"] = indent_size
-        lsp_server._settings["formatting"]["blankLines"] = blank_lines
-        lsp_server._vscode_style["indentSize"] = indent_size
-        lsp_server._vscode_style["blankLines"] = blank_lines
+        ctx._settings["formatting"]["enabled"] = True
+        ctx._settings["formatting"]["indentSize"] = indent_size
+        ctx._settings["formatting"]["blankLines"] = blank_lines
+        ctx._vscode_style["indentSize"] = indent_size
+        ctx._vscode_style["blankLines"] = blank_lines
         params = types.DocumentFormattingParams(
             text_document=types.TextDocumentIdentifier(uri="file:///test.rpy"),
             options=types.FormattingOptions(tab_size=tab_size, insert_spaces=True),
@@ -319,8 +320,8 @@ def _format(
         edits = lsp_server.format_document(_FakeLS(source), params)
         return edits[0].new_text if edits else source
     finally:
-        lsp_server._settings["formatting"].update(saved_formatting)
-        lsp_server._vscode_style.update(saved_style)
+        ctx._settings["formatting"].update(saved_formatting)
+        ctx._vscode_style.update(saved_style)
 
 
 def test_format_collapse_blank_lines() -> None:

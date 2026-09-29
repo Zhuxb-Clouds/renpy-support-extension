@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from textwrap import dedent
 
-import lsp_server
+import server_context as ctx
 from ast_parser import RpyParser
+from completion import _completion_items_for_context
 
 
 URI = "file:///workspace/game/script.rpy"
@@ -29,42 +30,36 @@ def symbol_map(nodes):
 
 def patch_workspace_symbols(monkeypatch, parser: RpyParser) -> None:
     monkeypatch.setattr(
-        lsp_server, "_get_all_workspace_labels", lambda: symbol_map(parser.get_all_labels())
+        ctx, "_get_all_workspace_labels", lambda: symbol_map(parser.get_all_labels())
     )
     monkeypatch.setattr(
-        lsp_server,
-        "_get_all_workspace_defines",
+        ctx, "_get_all_workspace_defines",
         lambda: symbol_map(parser.get_all_defines()),
     )
     monkeypatch.setattr(
-        lsp_server,
-        "_get_all_workspace_defaults",
+        ctx, "_get_all_workspace_defaults",
         lambda: symbol_map(parser.get_all_defaults()),
     )
     monkeypatch.setattr(
-        lsp_server,
-        "_get_all_workspace_screens",
+        ctx, "_get_all_workspace_screens",
         lambda: symbol_map(parser.get_all_screens()),
     )
     monkeypatch.setattr(
-        lsp_server,
-        "_get_all_workspace_images",
+        ctx, "_get_all_workspace_images",
         lambda: symbol_map(parser.get_all_images()),
     )
     monkeypatch.setattr(
-        lsp_server,
-        "_get_all_workspace_transforms",
+        ctx, "_get_all_workspace_transforms",
         lambda: symbol_map(parser.get_all_transforms()),
     )
     monkeypatch.setattr(
-        lsp_server,
-        "_get_all_workspace_styles",
+        ctx, "_get_all_workspace_styles",
         lambda: symbol_map(parser.get_all_styles()),
     )
 
 
 def complete(lines: list[str], parser: RpyParser, line_no: int):
-    return lsp_server._completion_items_for_context(
+    return _completion_items_for_context(
         URI, parser, lines, line_no, len(lines[line_no])
     )
 

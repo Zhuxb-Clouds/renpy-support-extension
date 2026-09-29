@@ -8,7 +8,12 @@ A Visual Studio Code extension providing language support for Ren'Py script file
 
 - **Syntax Highlighting** — Full syntax highlighting for Ren'Py scripts, including screens, styles, ATL, and embedded Python
 - **Code Formatting** — Automatic indentation and formatting via built-in LSP server
-- **Diagnostics** — Warnings and errors for common issues
+- **Diagnostics** — Warnings and errors for common issues:
+  - Undefined `jump`/`call` labels, duplicate label/screen definitions, missing image files, unused labels
+  - `show`/`scene`/`hide` of undefined images, `at` clauses referencing unknown transforms, `style x is parent` with an unknown parent
+- **Quick Fixes** — Code Actions on diagnostics: create a missing label with one click, delete an unused label block
+- **Context-Aware Completion** — labels, images, transforms, transitions, screens, styles, `define`/`default` variables (including dotted namespaces like `music.`), and screen/ATL/style properties
+- **Translation ID Hover** — hovering a dialogue line shows the Ren'Py translation identifier
 - **Markdown Support** — Syntax highlighting for Ren'Py code blocks in Markdown files
 
 ## Installation

@@ -1,31 +1,31 @@
-"""Ren'Py Language Server — LSP features powered by ast_parser."""
+"""Ren'Py Language Server — LSP features powered by ast_parser.
+
+Feature handlers live here; shared state and helpers live in
+``server_context``, diagnostics in ``diagnostics``, completion in
+``completion``, and quick fixes in ``code_actions``.
+"""
 
 from __future__ import annotations
 
-import sys
 import os
 import re
-import json
+import sys
+import hashlib
 
 # Ensure the bundled/tools directory is on sys.path so we can import ast_parser.
 _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, _TOOLS_DIR)
+if _TOOLS_DIR not in sys.path:
+    sys.path.insert(0, _TOOLS_DIR)
 
 # Ensure bundled third-party libraries (pygls, lsprotocol, …) are importable.
 _LIBS_DIR = os.path.join(os.path.dirname(_TOOLS_DIR), "libs")
-if os.path.isdir(_LIBS_DIR):
+if os.path.isdir(_LIBS_DIR) and _LIBS_DIR not in sys.path:
     sys.path.insert(0, _LIBS_DIR)
 
 from lsprotocol import types
 from pygls.lsp.server import LanguageServer
-from pygls.uris import (
-    from_fs_path as _pygls_from_fs_path,
-    to_fs_path as _pygls_to_fs_path,
-)
 
 from ast_parser import (
-    RpyParser,
-    Script,
     Label,
     Define,
     Default,
@@ -34,269 +34,69 @@ from ast_parser import (
     ScreenDef,
     StyleDef,
     If,
-    Elif,
-    While,
-    For,
     Menu,
     MenuItem,
-    Jump,
-    Call,
-    Return,
-    Pass,
     Say,
     NarratorSay,
     Scene,
     Show,
     Hide,
-    With,
     PlayMusic,
-    StopMusic,
     QueueMusic,
     Voice,
-    PythonBlock,
-    PythonOneliner,
     Init,
     Translate,
     Comment,
-    Unknown,
     Node,
     CallScreen,
     ShowScreen,
 )
 
-from renpy_data import (
-    RENPY_KEYWORDS,
-    RENPY_TRANSITIONS,
-    RENPY_TRANSFORMS,
-    RENPY_SCREEN_DISPLAYABLES,
-    RENPY_SCREEN_PROPERTIES,
-    RENPY_ATL_PROPERTIES,
-    RENPY_STYLE_PROPERTIES,
-    KEYWORD_DOCS,
-    count_words,
+from renpy_data import KEYWORD_DOCS, count_words
+
+from server_context import (
+    LSP_SERVER,
+    _log,
+    _settings,
+    _update_settings,
+    _refresh_format_config,
+    _formatting_enabled,
+    _diagnostics_enabled,
+    _full_diagnostics_on_save,
+    _utf16_col_to_utf32,
+    _parse_cache,
+    _cache_lock,
+    _renpy_py_cache,
+    _path_to_uri,
+    _FORMAT_CONFIG_FILENAME,
+    _get_parse,
+    _short_uri,
+    _uri_from_path,
+    _find_nodes_at_line,
+    _cursor_on_image_name,
+    _extract_quoted_string,
+    _make_file_location,
+    _make_node_location,
+    _dedup_locations,
+    _try_extract_path,
+    _word_at_position,
 )
-from workspace_index import WorkspaceIndex
+import server_context as ctx
+
+from diagnostics import (
+    _schedule_full_diagnostics,
+    _schedule_light_diagnostics,
+    cancel_pending_light_diagnostics,
+)
+from completion import _completion_items_for_context
+import code_actions
 
 from typing import Dict, Generator, List, Optional, Tuple, Union
-import glob
-import hashlib
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from urllib.parse import quote as url_quote
-from urllib.parse import unquote as url_unquote
-
-MAX_WORKERS = 4
-LSP_SERVER = LanguageServer(
-    name="renpy-server", version="1.7.0", max_workers=MAX_WORKERS
-)
-
-# Suppress noisy "Cancel notification for unknown message id" warnings.
-# These occur normally when VS Code cancels requests the server already finished.
-import logging as _logging
-
-_logging.getLogger("pygls.protocol.json_rpc").setLevel(_logging.ERROR)
-
-# ── Server logger (prints to stderr, which VS Code captures in the Output channel) ──
 import time as _time
 
-_log = _logging.getLogger("renpy-lsp")
-_log.setLevel(_logging.DEBUG)
-# On Windows the default stderr encoding may not be UTF-8, which garbles CJK
-# characters in log output.  Force UTF-8 so diagnostics are readable.
-_handler = _logging.StreamHandler(
-    open(sys.stderr.fileno(), mode="w", encoding="utf-8", closefd=False)
-    if sys.platform == "win32"
-    else sys.stderr
-)
-_handler.setFormatter(
-    _logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
-)
-_log.addHandler(_handler)
 
-_log.info("Ren'Py LSP server module loaded")
-
-
-# ── Runtime settings ─────────────────────────────────────────────────────
-
-_settings = {
-    "formatting": {
-        "enabled": True,
-        "indentSize": 4,
-        "blankLines": "collapse",
-    },
-    "diagnostics": {
-        "enabled": True,
-        "fullOnSave": False,
-    },
-}
-
-# Allowed values for the `blankLines` formatting mode:
-#   preserve   — leave blank lines untouched
-#   collapse   — collapse consecutive blank lines into one (default)
-#   betweenSay — like collapse, plus insert one blank line between
-#                dialogue/narration lines inside label script blocks
-#   strip      — remove all blank lines
-_BLANK_LINE_MODES = ("preserve", "collapse", "betweenSay", "strip")
-
-# Style settings as last sent by the VS Code client.  `.renpy-format.json`
-# overrides these per key; the merged result lives in _settings["formatting"].
-_vscode_style: Dict[str, object] = {"indentSize": 4, "blankLines": "collapse"}
-
-# Path to the workspace-root format config file, if one exists.
-_format_config_path: Optional[str] = None
-
-_FORMAT_CONFIG_FILENAME = ".renpy-format.json"
-
-
-def _coerce_bool(value: object, default: bool) -> bool:
-    if isinstance(value, bool):
-        return value
-    return default
-
-
-def _coerce_int(value: object, default: int) -> int:
-    if isinstance(value, int):
-        return value
-    return default
-
-
-def _coerce_choice(value: object, allowed: Tuple[str, ...], default: str) -> str:
-    if isinstance(value, str) and value in allowed:
-        return value
-    return default
-
-
-def _extract_renpy_settings(raw_settings: object) -> dict:
-    if not isinstance(raw_settings, dict):
-        return {}
-
-    settings = raw_settings.get("renpy-lsp", raw_settings)
-    if not isinstance(settings, dict):
-        return {}
-
-    return settings
-
-
-def _update_settings(raw_settings: object) -> None:
-    settings = _extract_renpy_settings(raw_settings)
-    if not settings:
-        return
-
-    formatting = settings.get("formatting", {})
-    if isinstance(formatting, dict):
-        _settings["formatting"]["enabled"] = _coerce_bool(
-            formatting.get("enabled"), _settings["formatting"]["enabled"]
-        )
-        _vscode_style["indentSize"] = _coerce_int(
-            formatting.get("indentSize"), _vscode_style["indentSize"]
-        )
-        _vscode_style["blankLines"] = _coerce_choice(
-            formatting.get("blankLines"),
-            _BLANK_LINE_MODES,
-            str(_vscode_style["blankLines"]),
-        )
-    elif "formatting.enabled" in settings:
-        _settings["formatting"]["enabled"] = _coerce_bool(
-            settings.get("formatting.enabled"), _settings["formatting"]["enabled"]
-        )
-
-    diagnostics = settings.get("diagnostics", {})
-    if isinstance(diagnostics, dict):
-        _settings["diagnostics"]["enabled"] = _coerce_bool(
-            diagnostics.get("enabled"), _settings["diagnostics"]["enabled"]
-        )
-        _settings["diagnostics"]["fullOnSave"] = _coerce_bool(
-            diagnostics.get("fullOnSave"), _settings["diagnostics"]["fullOnSave"]
-        )
-    elif "diagnostics.enabled" in settings:
-        _settings["diagnostics"]["enabled"] = _coerce_bool(
-            settings.get("diagnostics.enabled"), _settings["diagnostics"]["enabled"]
-        )
-        _settings["diagnostics"]["fullOnSave"] = _coerce_bool(
-            settings.get("diagnostics.fullOnSave"),
-            _settings["diagnostics"]["fullOnSave"],
-        )
-
-    _apply_format_config()
-
-    _log.info(
-        "settings: formatting.enabled=%s formatting.indentSize=%s "
-        "formatting.blankLines=%s diagnostics.enabled=%s diagnostics.fullOnSave=%s",
-        _settings["formatting"]["enabled"],
-        _settings["formatting"]["indentSize"],
-        _settings["formatting"]["blankLines"],
-        _settings["diagnostics"]["enabled"],
-        _settings["diagnostics"]["fullOnSave"],
-    )
-
-
-def _find_format_config() -> Optional[str]:
-    """Return the path of the first `.renpy-format.json` in a workspace root."""
-    try:
-        folders = list(LSP_SERVER.workspace.folders.values())
-    except Exception:  # workspace not initialized (e.g. in tests)
-        return None
-    for folder in folders:
-        candidate = os.path.join(_path_from_uri(folder.uri), _FORMAT_CONFIG_FILENAME)
-        if os.path.isfile(candidate):
-            return candidate
-    return None
-
-
-def _load_format_config(path: str) -> dict:
-    """Read and validate `.renpy-format.json`; return {} on any problem."""
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, dict):
-            return data
-        _log.warning("%s: root value is not an object — ignored", path)
-    except (OSError, ValueError) as exc:
-        _log.warning("failed to read %s: %s", path, exc)
-    return {}
-
-
-def _apply_format_config() -> None:
-    """Rebuild style settings: VS Code values, overridden per key by
-    `.renpy-format.json` when one is present in the workspace root."""
-    fmt = _settings["formatting"]
-    fmt["indentSize"] = _vscode_style["indentSize"]
-    fmt["blankLines"] = _vscode_style["blankLines"]
-    if not _format_config_path:
-        return
-    cfg = _load_format_config(_format_config_path)
-    if "indentSize" in cfg:
-        fmt["indentSize"] = _coerce_int(cfg.get("indentSize"), fmt["indentSize"])
-    if "blankLines" in cfg:
-        fmt["blankLines"] = _coerce_choice(
-            cfg.get("blankLines"), _BLANK_LINE_MODES, str(fmt["blankLines"])
-        )
-    _log.info(
-        "format config %s: indentSize=%s blankLines=%s",
-        _format_config_path,
-        fmt["indentSize"],
-        fmt["blankLines"],
-    )
-
-
-def _refresh_format_config() -> None:
-    """(Re)discover and apply `.renpy-format.json` from the workspace root."""
-    global _format_config_path
-    _format_config_path = _find_format_config()
-    _apply_format_config()
-
-
-def _formatting_enabled() -> bool:
-    return bool(_settings["formatting"]["enabled"])
-
-
-def _diagnostics_enabled() -> bool:
-    return bool(_settings["diagnostics"]["enabled"])
-
-
-def _full_diagnostics_on_save() -> bool:
-    return bool(_settings["diagnostics"]["fullOnSave"])
+# ── Runtime settings / cache / workspace index live in server_context. ──
 
 
 @LSP_SERVER.feature(types.INITIALIZE)
@@ -313,924 +113,15 @@ def did_change_configuration(
     _refresh_format_config()
 
 
-# ── UTF-16 → Python (UTF-32) column offset conversion ──────────────────
-
-
-def _utf16_col_to_utf32(line: str, utf16_col: int) -> int:
-    """Convert a UTF-16 character offset to a Python string index.
-
-    LSP positions use UTF-16 code units by default.  Characters outside the
-    Basic Multilingual Plane (e.g. emoji) take 2 UTF-16 units but 1 Python
-    character.  This helper walks the line to map the offset correctly.
-    """
-    utf16_pos = 0
-    for i, ch in enumerate(line):
-        units = 2 if ord(ch) > 0xFFFF else 1
-        if utf16_pos + units > utf16_col:
-            return i
-        utf16_pos += units
-    return len(line)
-
-
-# ─────────────────────── Cache / Index ───────────────────────────────────
-
-# Per-URI parse cache so we don't re-parse on every request.
-# Value: (content_hash, source_text, ast, parser)
-_parse_cache: Dict[str, Tuple[int, str, Script, RpyParser]] = {}
-
-# Fast path→URI mapping: avoids O(n) scan in _get_parse_for_file.
-_path_to_uri: Dict[str, str] = {}
-
-# Lock protecting _parse_cache and _path_to_uri from concurrent access
-# (background diagnostics thread vs. main event-loop).
-_cache_lock = threading.Lock()
-
-
-def _normalize_path_key(path: str) -> str:
-    """Normalize a filesystem path for use as a dictionary key.
-
-    On Windows (case-insensitive FS) this lowercases the whole path so that
-    ``C:\\Foo\\bar.rpy`` and ``c:\\foo\\bar.rpy`` map to the same key.
-    On Linux/macOS it's a no-op beyond ``abspath``.
-    """
-    return os.path.normcase(os.path.abspath(path))
-
-
-def _same_file_uri(uri1: str, uri2: str) -> bool:
-    """Return *True* if two file URIs refer to the same file.
-
-    Fast-path: exact string match.  Slow-path (Windows): normalise
-    both sides through *normcase* before comparing.
-    """
-    if uri1 == uri2:
-        return True
-    try:
-        return _normalize_path_key(_path_from_uri(uri1)) == _normalize_path_key(
-            _path_from_uri(uri2)
-        )
-    except Exception:
-        return False
-
-
-def _get_parse(uri: str, source: Optional[str] = None) -> Tuple[Script, RpyParser]:
-    """Return cached (ast, parser) for *uri*, re-parsing only when source changes."""
-    doc = LSP_SERVER.workspace.get_text_document(uri)
-    text = source if source is not None else doc.source
-    text_hash = hash(text)
-    with _cache_lock:
-        cached = _parse_cache.get(uri)
-        if cached and cached[0] == text_hash:
-            _log.debug("_get_parse: cache hit for %s", _short_uri(uri))
-            return cached[2], cached[3]
-    _log.info("_get_parse: parsing %s (%d chars)", _short_uri(uri), len(text))
-    t0 = _time.monotonic()
-    parser = RpyParser(text)
-    ast = parser.parse()
-    elapsed = (_time.monotonic() - t0) * 1000
-    _log.info(
-        "_get_parse: parsed %s in %.1f ms (%d top-level nodes)",
-        _short_uri(uri),
-        elapsed,
-        len(ast.body),
-    )
-    with _cache_lock:
-        _parse_cache[uri] = (text_hash, text, ast, parser)
-        # Maintain path→URI mapping (normalized key for Windows compat)
-        try:
-            norm_key = _normalize_path_key(_path_from_uri(uri))
-            _path_to_uri[norm_key] = uri
-        except Exception:
-            pass
-    return ast, parser
-
-
-def _short_uri(uri: str) -> str:
-    """Return a short display name for a URI (just the filename)."""
-    return os.path.basename(_path_from_uri(uri))
-
-
-def _uri_from_path(path: str) -> str:
-    """Convert a filesystem path to a file:// URI."""
-    result = _pygls_from_fs_path(os.path.abspath(path))
-    if result is not None:
-        return result
-    # Fallback for non-file paths
-    return Path(os.path.abspath(path)).as_uri()
-
-
-def _path_from_uri(uri: str) -> str:
-    """Convert a file:// URI to a filesystem path (Windows-safe)."""
-    result = _pygls_to_fs_path(uri)
-    if result is not None:
-        return result
-    # Fallback: strip scheme for non-file URIs
-    if uri.startswith("file://"):
-        return url_unquote(uri[len("file://") :])
-    return uri
-
-
-def _get_workspace_rpy_files() -> List[str]:
-    """Return all .rpy / .rpym file paths in the workspace (uses cached list)."""
-    return _workspace_index.get_file_list()
-
-
-def _get_workspace_renpy_py_files() -> List[str]:
-    """Return all ``*_ren.py`` file paths in the workspace.
-
-    These are pure-Python files that Ren'Py loads alongside ``.rpy`` scripts.
-    They typically contain class and function definitions.
-    """
-    results: List[str] = []
-    for folder in LSP_SERVER.workspace.folders.values():
-        root = _path_from_uri(folder.uri)
-        results.extend(glob.glob(os.path.join(root, "**", "*_ren.py"), recursive=True))
-    return results
-
-
-def _get_parse_for_file(filepath: str) -> Tuple[str, Script, RpyParser]:
-    """Parse (or cache-hit) a file by filesystem path. Returns (uri, ast, parser)."""
-    norm_key = _normalize_path_key(filepath)
-    with _cache_lock:
-        # O(1) lookup via path→URI map
-        cached_uri = _path_to_uri.get(norm_key)
-        if cached_uri and cached_uri in _parse_cache:
-            cached_data = _parse_cache[cached_uri]
-            return cached_uri, cached_data[2], cached_data[3]
-        # Compute URI and try cache directly
-        uri = _uri_from_path(filepath)
-        cached_data = _parse_cache.get(uri)
-        if cached_data:
-            _path_to_uri[norm_key] = uri
-            return uri, cached_data[2], cached_data[3]
-    # No existing cache entry found — parse and cache
-    try:
-        text = Path(filepath).read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        text = ""
-    parser = RpyParser(text)
-    ast = parser.parse()
-    with _cache_lock:
-        _parse_cache[uri] = (hash(text), text, ast, parser)
-        _path_to_uri[norm_key] = uri
-    return uri, ast, parser
-
-
-# ─────────────────────── Workspace Index ─────────────────────────────────
-
-# The WorkspaceIndex class lives in workspace_index.py.
-# We instantiate it here with injected dependencies (cache, utils).
-_workspace_index = WorkspaceIndex(
-    server=LSP_SERVER,
-    parse_cache=_parse_cache,
-    cache_lock=_cache_lock,
-    path_to_uri=_path_to_uri,
-    path_from_uri_fn=_path_from_uri,
-    normalize_path_fn=_normalize_path_key,
-    get_parse_for_file_fn=_get_parse_for_file,
-)
-
-
-def _get_all_workspace_labels() -> Dict[str, List[Tuple[str, "Label"]]]:
-    """Return {label_name: [(uri, Label), ...]} across all workspace .rpy files."""
-    return _workspace_index.get_labels()
-
-
-def _get_all_workspace_defines() -> Dict[str, List[Tuple[str, "Define"]]]:
-    """Return {name: [(uri, Define), ...]} across all workspace .rpy files."""
-    return _workspace_index.get_defines()
-
-
-def _get_all_workspace_defaults() -> Dict[str, List[Tuple[str, "Default"]]]:
-    """Return {name: [(uri, Default), ...]} across all workspace .rpy files."""
-    return _workspace_index.get_defaults()
-
-
-def _get_all_workspace_screens() -> Dict[str, List[Tuple[str, "ScreenDef"]]]:
-    """Return {name: [(uri, ScreenDef), ...]} across all workspace .rpy files."""
-    return _workspace_index.get_screens()
-
-
-def _get_all_workspace_images() -> Dict[str, List[Tuple[str, "ImageDef"]]]:
-    """Return {image_name: [(uri, ImageDef), ...]} across all workspace .rpy files."""
-    return _workspace_index.get_images()
-
-
-def _get_all_workspace_transforms() -> Dict[str, List[Tuple[str, "TransformDef"]]]:
-    """Return {name: [(uri, TransformDef), ...]} across all workspace .rpy files."""
-    return _workspace_index.get_transforms()
-
-
-def _get_all_workspace_styles() -> Dict[str, List[Tuple[str, "StyleDef"]]]:
-    """Return {name: [(uri, StyleDef), ...]} across all workspace .rpy files."""
-    return _workspace_index.get_styles()
-
-
-# ── Python variable / class / function definition helpers ──
-
-# Regex patterns for Python definitions
-_RE_PY_ASSIGN = re.compile(r"""^\s*([a-zA-Z_\u4e00-\u9fff\u3400-\u4dbf]\w*)\s*=[^=]""")
-_RE_PY_CLASS = re.compile(r"""^\s*class\s+([a-zA-Z_]\w*)\s*[:(]""")
-_RE_PY_DEF = re.compile(r"""^\s*def\s+([a-zA-Z_]\w*)\s*\(""")
-
-
-def _find_python_definitions_in_file(
-    uri: str, parser: RpyParser, ast: Script
-) -> Dict[str, List[Tuple[int, str]]]:
-    """Find Python variable assignments, class and function definitions
-    in python: blocks and $ one-liners.
-
-    Returns {name: [(lineno, code_snippet), ...]}.
-    """
-    result: Dict[str, List[Tuple[int, str]]] = {}
-
-    # Collect ALL PythonOneliner nodes — this covers both:
-    #   - standalone ``$ var = ...`` one-liners
-    #   - lines inside ``python:`` blocks (parser stores them as PythonOneliner children)
-    for node in parser._collect(ast, PythonOneliner):
-        code = node.code
-        # Variable assignment:  var = ...
-        m = _RE_PY_ASSIGN.match(code)
-        if m:
-            result.setdefault(m.group(1), []).append((node.lineno, code.strip()))
-            continue
-        # Class definition:  class Foo(...):
-        m = _RE_PY_CLASS.match(code)
-        if m:
-            result.setdefault(m.group(1), []).append((node.lineno, code.strip()))
-            continue
-        # Function definition:  def bar(...):
-        m = _RE_PY_DEF.match(code)
-        if m:
-            result.setdefault(m.group(1), []).append((node.lineno, code.strip()))
-
-    return result
-
-
-# Cache for *_ren.py definitions so we don't re-scan every request.
-_renpy_py_cache: Dict[str, Tuple[str, Dict[str, List[Tuple[int, str]]]]] = {}
-
-
-def _find_python_definitions_in_py_file(
-    filepath: str,
-) -> Tuple[str, Dict[str, List[Tuple[int, str]]]]:
-    """Scan a pure-Python ``*_ren.py`` file for top-level class/def/assignment.
-
-    Returns (uri, {name: [(lineno, code_snippet), ...]}).
-    """
-    uri = _uri_from_path(filepath)
-    try:
-        text = Path(filepath).read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return uri, {}
-
-    cached = _renpy_py_cache.get(uri)
-    if cached and cached[0] == text:
-        return uri, cached[1]
-
-    result: Dict[str, List[Tuple[int, str]]] = {}
-    for lineno_0, line in enumerate(text.splitlines()):
-        lineno = lineno_0 + 1  # 1-based
-        # Only match top-level definitions (no leading whitespace) —
-        # method-level defs / local vars inside classes are not useful targets.
-        if not line or line[0].isspace():
-            continue
-        m = _RE_PY_CLASS.match(line)
-        if m:
-            result.setdefault(m.group(1), []).append((lineno, line.strip()))
-            continue
-        m = _RE_PY_DEF.match(line)
-        if m:
-            result.setdefault(m.group(1), []).append((lineno, line.strip()))
-            continue
-        m = _RE_PY_ASSIGN.match(line)
-        if m:
-            result.setdefault(m.group(1), []).append((lineno, line.strip()))
-
-    _renpy_py_cache[uri] = (text, result)
-    return uri, result
-
-
-def _find_python_var_across_workspace(
-    var_name: str,
-) -> List[Tuple[str, int, str]]:
-    """Return [(uri, lineno, code), ...] for *var_name* across all workspace files.
-
-    Searches .rpy/.rpym files (via AST) and *_ren.py files (via line scanning).
-    Matches variable assignments, class definitions, and function definitions.
-    """
-    results: List[Tuple[str, int, str]] = []
-    # 1) .rpy / .rpym files
-    for fp in _get_workspace_rpy_files():
-        uri, ast, parser = _get_parse_for_file(fp)
-        defs = _find_python_definitions_in_file(uri, parser, ast)
-        if var_name in defs:
-            for lineno, code in defs[var_name]:
-                results.append((uri, lineno, code))
-    # 2) *_ren.py files
-    for fp in _get_workspace_renpy_py_files():
-        uri, defs = _find_python_definitions_in_py_file(fp)
-        if var_name in defs:
-            for lineno, code in defs[var_name]:
-                results.append((uri, lineno, code))
-    return results
-
-
-# ── Ren'Py file search helpers ──
-
-
-def _get_renpy_search_dirs() -> List[str]:
-    """Return directories to search for Ren'Py assets (images, audio, etc.).
-
-    Ren'Py uses ``config.searchpath`` which defaults to ``['common', 'game']``.
-    The ``game/`` folder is the primary location for all assets.  We also check
-    ``config.image_directories`` (default ``['images']``) for auto-detected images.
-    """
-    dirs: List[str] = []
-    for folder in LSP_SERVER.workspace.folders.values():
-        root = _path_from_uri(folder.uri)
-        # game/ is the canonical Ren'Py asset directory
-        game_dir = os.path.join(root, "game")
-        if os.path.isdir(game_dir):
-            dirs.append(game_dir)
-        # Also add workspace root itself (covers non-standard layouts)
-        dirs.append(root)
-    return dirs
-
-
-def _resolve_renpy_file(
-    filename: str, source_uri: Optional[str] = None
-) -> Optional[str]:
-    """Resolve a Ren'Py file reference to an absolute filesystem path.
-
-    Search strategy (first match wins):
-      1. Relative to ``game/`` and workspace root (``config.searchpath`` defaults).
-      2. Relative to the directory of the current ``.rpy`` file.
-      3. Recursive glob ``**/<filename>`` across the workspace — this handles
-         ``config.searchpath`` with custom directories that we cannot read at
-         edit-time.
-    Returns *None* if the file cannot be found.
-    """
-    if not filename:
-        return None
-    # Normalize separators
-    filename = filename.replace("\\", "/")
-    # Strip leading ./ if present
-    if filename.startswith("./"):
-        filename = filename[2:]
-
-    # Collect all search directories
-    search_dirs = list(_get_renpy_search_dirs())
-
-    # Also search relative to the current .rpy file's directory — this is
-    # important because .rpy files live in game/ and references like
-    # "images/bg/xxx.png" are relative to game/.
-    if source_uri:
-        source_path = _path_from_uri(source_uri)
-        source_dir = os.path.dirname(source_path)
-        if source_dir and source_dir not in search_dirs:
-            search_dirs.insert(0, source_dir)
-
-    # Pass 1: direct relative lookup in known search dirs
-    for search_dir in search_dirs:
-        candidate = os.path.join(search_dir, filename)
-        if os.path.isfile(candidate):
-            return os.path.abspath(candidate)
-
-    # Pass 2: recursive glob  **/<filename>  across workspace roots.
-    # This covers config.searchpath with custom directories.
-    for folder in LSP_SERVER.workspace.folders.values():
-        root = _path_from_uri(folder.uri)
-        pattern = os.path.join(root, "**", filename)
-        hits = glob.glob(pattern, recursive=True)
-        if hits:
-            return os.path.abspath(hits[0])
-
-    return None
-
-
-# ── Image auto-name cache ──
-# Maps lowercased image name → absolute file path.
-# Invalidated on file create/delete (see did_change_watched_files).
-_image_cache: Dict[str, str] = {}
-_image_cache_built = False
-
-
-def _ensure_image_cache() -> None:
-    """Build the image auto-name → filepath index if not yet populated."""
-    global _image_cache_built
-    if _image_cache_built:
-        return
-    IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".avif", ".svg")
-    cache: Dict[str, str] = {}
-    for search_dir in _get_renpy_search_dirs():
-        images_dir = os.path.join(search_dir, "images")
-        if not os.path.isdir(images_dir):
-            continue
-        for dirpath, _dirnames, filenames in os.walk(images_dir):
-            for fn in filenames:
-                base, ext = os.path.splitext(fn)
-                if ext.lower() not in IMAGE_EXTENSIONS:
-                    continue
-                abs_path = os.path.abspath(os.path.join(dirpath, fn))
-                rel = os.path.relpath(os.path.join(dirpath, fn), images_dir)
-                rel_no_ext = os.path.splitext(rel)[0]
-                auto_name = rel_no_ext.replace(os.sep, " ").replace("/", " ").lower()
-                if auto_name not in cache:
-                    cache[auto_name] = abs_path
-                base_lower = base.lower()
-                if base_lower not in cache:
-                    cache[base_lower] = abs_path
-    _image_cache.update(cache)
-    _image_cache_built = True
-    _log.debug("_ensure_image_cache: indexed %d image entries", len(cache))
-
-
-def _resolve_image_name_to_file(image_name: str) -> Optional[str]:
-    """Try to find an image file matching *image_name* via Ren'Py auto-detection.
-
-    Results are cached in ``_image_cache`` to avoid repeated directory walks.
-    """
-    _ensure_image_cache()
-    return _image_cache.get(image_name.lower())
-
-
-# ── AST / line analysis helpers ──
-
-
-def _find_nodes_at_line(parser: RpyParser, lineno: int) -> List[Node]:
-    """Return all AST nodes whose ``lineno`` matches *lineno* (1-based)."""
-    result: List[Node] = []
-
-    def _walk(node: Node):
-        if node.lineno == lineno:
-            result.append(node)
-        for child in parser._children_of(node):
-            _walk(child)
-
-    _walk(parser.root)
-    return result
-
-
-def _cursor_on_image_name(line_text: str, col: int, image_name: str) -> bool:
-    """Return True if *col* falls within the image-name span of a scene/show/hide line.
-
-    For ``scene black with ImageDissolve("zc01",0.5)`` only the ``black``
-    portion should be navigable.  The image name is the text between the
-    keyword (``scene``/``show``/``hide``) and the first clause keyword
-    (``at``, ``with``, ``behind``, ``as``, ``onlayer``, ``zorder``) or
-    end-of-line.
-    """
-    m = re.match(r"^(\s*)(scene|show|hide)\s+", line_text, re.IGNORECASE)
-    if not m:
-        return False
-    img_start = m.end()  # first char after "scene " / "show " / "hide "
-    # Find where the image name ends — at the first clause keyword or EOL.
-    rest = line_text[img_start:]
-    clause = re.search(r"\s+(?:at|with|behind|as|onlayer|zorder)\s", rest)
-    if clause:
-        img_end = img_start + clause.start()
-    else:
-        # Might end with ':' or just EOL
-        stripped = rest.rstrip()
-        if stripped.endswith(":"):
-            stripped = stripped[:-1].rstrip()
-        img_end = img_start + len(stripped)
-    return img_start <= col < img_end
-
-
-def _extract_quoted_string(line: str, col: int) -> Optional[str]:
-    """If the cursor is inside or on a quoted string, return its contents."""
-    # Find all quoted strings in the line
-    for m in re.finditer(r"""(["'])(.*?)\1""", line):
-        # Match when cursor is anywhere from the opening quote to the closing quote
-        if m.start() <= col <= m.end() - 1:
-            return m.group(2)
-    return None
-
-
-def _make_file_location(filepath: str) -> types.Location:
-    """Create a Location pointing to line 1 of a file."""
-    return types.Location(
-        uri=_uri_from_path(filepath),
-        range=types.Range(
-            start=types.Position(line=0, character=0),
-            end=types.Position(line=0, character=0),
-        ),
-    )
-
-
-def _make_node_location(uri: str, node: Node) -> types.Location:
-    """Create a Location pointing to a node's name."""
-    line = node.lineno - 1
-    start_char = 0
-    end_char = 10000  # Large value, will be clipped by VS Code
-
-    # Try to find the exact position of the node's name
-    if hasattr(node, "name") and node.name:
-        name = node.name
-        # Get the raw line from parse cache or file
-        raw_line = ""
-        with _cache_lock:
-            cached = _parse_cache.get(uri)
-        if cached:
-            source = cached[1]
-            lines = source.splitlines()
-            if 0 <= line < len(lines):
-                raw_line = lines[line]
-        else:
-            # Try to read from file
-            try:
-                path = _path_from_uri(uri)
-                if os.path.isfile(path):
-                    with open(path, "r", encoding="utf-8") as f:
-                        lines = f.read().splitlines()
-                    if 0 <= line < len(lines):
-                        raw_line = lines[line]
-            except Exception:
-                pass
-
-        if raw_line:
-            idx = raw_line.find(name)
-            if idx >= 0:
-                start_char = idx
-                end_char = idx + len(name)
-
-    return types.Location(
-        uri=uri,
-        range=types.Range(
-            start=types.Position(line=line, character=start_char),
-            end=types.Position(line=line, character=end_char),
-        ),
-    )
-
-
-def _dedup_locations(locations: List[types.Location]) -> List[types.Location]:
-    """Remove duplicate locations based on (file_path, line)."""
-    seen: set = set()
-    result: List[types.Location] = []
-    for loc in locations:
-        # Normalize by converting to path for comparison
-        try:
-            path = _path_from_uri(loc.uri)
-        except Exception:
-            path = loc.uri
-        key = (path, loc.range.start.line)
-        if key not in seen:
-            seen.add(key)
-            result.append(loc)
-    return result
-
-
-def _publish_diagnostics_light(uri: str):
-    """Fast diagnostics: only current-file syntax checks (no workspace scan).
-
-    Called from ``didChange`` (debounced).  This covers parser errors and
-    empty-ATL-block errors — the things the user wants instant feedback on.
-    """
-    if not _diagnostics_enabled():
-        return
-    _log.info("_publish_diagnostics_light: %s", _short_uri(uri))
-    t0 = _time.monotonic()
-    ast, parser = _get_parse(uri)
-    # Update the workspace index for this single file so subsequent
-    # queries (hover, goto-def, …) see the latest symbols.
-    _workspace_index.update_file(uri)
-    diags: List[types.Diagnostic] = []
-
-    # 1) Parser-level errors (Unknown lines).
-    for lineno, msg in parser.errors:
-        diags.append(
-            types.Diagnostic(
-                range=types.Range(
-                    start=types.Position(line=lineno - 1, character=0),
-                    end=types.Position(line=lineno - 1, character=999),
-                ),
-                message=msg,
-                severity=types.DiagnosticSeverity.Warning,
-                source="renpy-lsp",
-            )
-        )
-
-    # 2) Check for empty ATL blocks (show/scene/hide with colon but no body).
-    for node in parser.get_empty_block_errors():
-        stmt_type = type(node).__name__.lower()
-        diags.append(
-            types.Diagnostic(
-                range=types.Range(
-                    start=types.Position(line=node.lineno - 1, character=0),
-                    end=types.Position(line=node.lineno - 1, character=999),
-                ),
-                message=f'"{stmt_type}" statement ends with ":" but has no indented block',
-                severity=types.DiagnosticSeverity.Error,
-                source="renpy-lsp",
-            )
-        )
-
-    elapsed = (_time.monotonic() - t0) * 1000
-    _log.info(
-        "_publish_diagnostics_light: %s → %d diagnostic(s) in %.1f ms",
-        _short_uri(uri),
-        len(diags),
-        elapsed,
-    )
-    LSP_SERVER.text_document_publish_diagnostics(
-        types.PublishDiagnosticsParams(uri=uri, diagnostics=diags)
-    )
-
-
-def _publish_diagnostics(uri: str):
-    """Full diagnostics: parse the document and push all diagnostics.
-
-    This includes cross-workspace checks (undefined labels, duplicate
-    definitions, unused labels, missing image files).  Called from
-    ``didOpen`` and ``didSave``.
-    """
-    if not _diagnostics_enabled():
-        return
-    _log.info("_publish_diagnostics: %s", _short_uri(uri))
-    t0 = _time.monotonic()
-    ast, parser = _get_parse(uri)
-    # Ensure workspace index is up-to-date for the current file
-    _workspace_index.update_file(uri)
-    diags: List[types.Diagnostic] = []
-
-    # 1) Parser-level errors (Unknown lines).
-    for lineno, msg in parser.errors:
-        diags.append(
-            types.Diagnostic(
-                range=types.Range(
-                    start=types.Position(line=lineno - 1, character=0),
-                    end=types.Position(line=lineno - 1, character=999),
-                ),
-                message=msg,
-                severity=types.DiagnosticSeverity.Warning,
-                source="renpy-lsp",
-            )
-        )
-
-    # 2) Check jump/call targets exist across the whole workspace.
-    all_labels = _get_all_workspace_labels()
-    # Also include labels from the current document (covers the case where
-    # the file is outside the workspace folders or URI format differs).
-    for lb in parser.get_all_labels():
-        if lb.name not in all_labels:
-            all_labels[lb.name] = [(uri, lb)]
-    for j in parser.get_all_jumps():
-        if not j.is_expression and j.target not in all_labels:
-            diags.append(
-                types.Diagnostic(
-                    range=types.Range(
-                        start=types.Position(line=j.lineno - 1, character=0),
-                        end=types.Position(line=j.lineno - 1, character=999),
-                    ),
-                    message=f'Label "{j.target}" is not defined in the project',
-                    severity=types.DiagnosticSeverity.Warning,
-                    source="renpy-lsp",
-                )
-            )
-    for c in parser.get_all_calls():
-        if not c.is_expression and c.target not in all_labels:
-            diags.append(
-                types.Diagnostic(
-                    range=types.Range(
-                        start=types.Position(line=c.lineno - 1, character=0),
-                        end=types.Position(line=c.lineno - 1, character=999),
-                    ),
-                    message=f'Label "{c.target}" is not defined in the project',
-                    severity=types.DiagnosticSeverity.Warning,
-                    source="renpy-lsp",
-                )
-            )
-
-    # 3) Check for empty ATL blocks (show/scene/hide with colon but no body).
-    for node in parser.get_empty_block_errors():
-        stmt_type = type(node).__name__.lower()
-        diags.append(
-            types.Diagnostic(
-                range=types.Range(
-                    start=types.Position(line=node.lineno - 1, character=0),
-                    end=types.Position(line=node.lineno - 1, character=999),
-                ),
-                message=f'"{stmt_type}" statement ends with ":" but has no indented block',
-                severity=types.DiagnosticSeverity.Error,
-                source="renpy-lsp",
-            )
-        )
-
-    # 4) Check for duplicate definitions across the workspace.
-    # Labels
-    for name, locations in all_labels.items():
-        if len(locations) > 1:
-            for loc_uri, label in locations:
-                if _same_file_uri(loc_uri, uri):
-                    other_files = [
-                        os.path.basename(_path_from_uri(u))
-                        for u, _ in locations
-                        if not _same_file_uri(u, uri) or _.lineno != label.lineno
-                    ]
-                    if other_files:
-                        diags.append(
-                            types.Diagnostic(
-                                range=types.Range(
-                                    start=types.Position(
-                                        line=label.lineno - 1, character=0
-                                    ),
-                                    end=types.Position(
-                                        line=label.lineno - 1, character=999
-                                    ),
-                                ),
-                                message=f'Label "{name}" is also defined in: {", ".join(other_files)}',
-                                severity=types.DiagnosticSeverity.Warning,
-                                source="renpy-lsp",
-                            )
-                        )
-
-    # Screens
-    all_screens = _get_all_workspace_screens()
-    for name, locations in all_screens.items():
-        if len(locations) > 1:
-            for loc_uri, screen in locations:
-                if _same_file_uri(loc_uri, uri):
-                    other_files = [
-                        os.path.basename(_path_from_uri(u))
-                        for u, _ in locations
-                        if not _same_file_uri(u, uri) or _.lineno != screen.lineno
-                    ]
-                    if other_files:
-                        diags.append(
-                            types.Diagnostic(
-                                range=types.Range(
-                                    start=types.Position(
-                                        line=screen.lineno - 1, character=0
-                                    ),
-                                    end=types.Position(
-                                        line=screen.lineno - 1, character=999
-                                    ),
-                                ),
-                                message=f'Screen "{name}" is also defined in: {", ".join(other_files)}',
-                                severity=types.DiagnosticSeverity.Warning,
-                                source="renpy-lsp",
-                            )
-                        )
-
-    # 5) Check for missing image files in `image name = "path"` definitions.
-    for img in parser.get_all_images():
-        if img.expression:
-            # Extract path from expression like '"images/bg.png"'
-            file_path = _try_extract_path(img.expression)
-            if file_path:
-                resolved = _resolve_renpy_file(file_path, source_uri=uri)
-                if not resolved:
-                    diags.append(
-                        types.Diagnostic(
-                            range=types.Range(
-                                start=types.Position(line=img.lineno - 1, character=0),
-                                end=types.Position(line=img.lineno - 1, character=999),
-                            ),
-                            message=f'Image file not found: "{file_path}"',
-                            severity=types.DiagnosticSeverity.Warning,
-                            source="renpy-lsp",
-                        )
-                    )
-
-    # 6) Check for unused labels (defined but never jumped/called).
-    # Use the pre-indexed jump/call targets from the workspace index.
-    all_used_labels = _workspace_index.get_used_labels()
-    # Also include the current document's targets — covers the case where
-    # the file is opened outside of a workspace folder or the workspace
-    # scanner hasn't discovered it yet.
-    for j in parser.get_all_jumps():
-        if not j.is_expression:
-            all_used_labels.add(j.target)
-    for c in parser.get_all_calls():
-        if not c.is_expression:
-            all_used_labels.add(c.target)
-    # Special labels that are entry points (never directly called)
-    ENTRY_LABELS = {"start", "main_menu", "splashscreen", "after_load", "quit"}
-
-    for lb in parser.get_all_labels():
-        if lb.name not in all_used_labels and lb.name not in ENTRY_LABELS:
-            # Skip translation variant labels (contain dots like "label.1")
-            if "." in lb.name and lb.name.split(".")[-1].isdigit():
-                continue
-            diags.append(
-                types.Diagnostic(
-                    range=types.Range(
-                        start=types.Position(line=lb.lineno - 1, character=0),
-                        end=types.Position(line=lb.lineno - 1, character=999),
-                    ),
-                    message=f'Label "{lb.name}" is defined but never used',
-                    severity=types.DiagnosticSeverity.Hint,
-                    source="renpy-lsp",
-                    tags=[types.DiagnosticTag.Unnecessary],
-                )
-            )
-
-    elapsed = (_time.monotonic() - t0) * 1000
-    _log.info(
-        "_publish_diagnostics: %s → %d diagnostic(s) in %.1f ms",
-        _short_uri(uri),
-        len(diags),
-        elapsed,
-    )
-    LSP_SERVER.text_document_publish_diagnostics(
-        types.PublishDiagnosticsParams(uri=uri, diagnostics=diags)
-    )
-
-
-# ─────────────────────── Document Sync ───────────────────────────────────
-
-# Debounce timers for didChange → lightweight diagnostics.
-_DEBOUNCE_DELAY = 0.3  # seconds
-_debounce_timers: Dict[str, threading.Timer] = {}
-
-# Lock to serialise background diagnostic runs so at most one runs at a time.
-_diag_lock = threading.Lock()
-
-# Coalescing queue for full diagnostics — avoids spawning one thread per save.
-_diag_queue: Dict[str, float] = {}  # uri → timestamp when queued
-_diag_queue_lock = threading.Lock()
-_diag_thread_running = False
-_DIAG_COALESCE_DELAY = 0.15  # seconds — wait briefly to batch rapid saves
-
-
-def _schedule_full_diagnostics(uri: str) -> None:
-    """Queue *uri* for background index update + diagnostics.
-
-    Multiple saves within ``_DIAG_COALESCE_DELAY`` are batched into a single
-    diagnostic pass so that e.g. "Format All Files" doesn't spawn N threads.
-    """
-    if not _diagnostics_enabled():
-        return
-    global _diag_thread_running
-    with _diag_queue_lock:
-        _diag_queue[uri] = _time.monotonic()
-        if _diag_thread_running:
-            return  # existing thread will pick up the new entry
-        _diag_thread_running = True
-
-    def _drain():
-        global _diag_thread_running
-        try:
-            while True:
-                # Wait a short window to coalesce rapid saves
-                _time.sleep(_DIAG_COALESCE_DELAY)
-                with _diag_queue_lock:
-                    if not _diag_queue:
-                        _diag_thread_running = False
-                        return
-                    batch = dict(_diag_queue)
-                    _diag_queue.clear()
-                with _diag_lock:
-                    for batch_uri in batch:
-                        try:
-                            _workspace_index.update_file(batch_uri)
-                            _publish_diagnostics(batch_uri)
-                        except Exception:
-                            _log.exception(
-                                "Error in background diagnostics for %s", batch_uri
-                            )
-        except Exception:
-            _log.exception("Error in diagnostics drain thread")
-        finally:
-            with _diag_queue_lock:
-                _diag_thread_running = False
-
-    t = threading.Thread(target=_drain, daemon=True, name="diag-drain")
-    t.start()
-
-
-def _schedule_light_diagnostics(uri: str) -> None:
-    """Schedule a debounced lightweight diagnostic run for *uri*."""
-    if not _diagnostics_enabled():
-        return
-    # Cancel any pending timer for this URI
-    old = _debounce_timers.pop(uri, None)
-    if old is not None:
-        old.cancel()
-
-    def _run():
-        _debounce_timers.pop(uri, None)
-        try:
-            _publish_diagnostics_light(uri)
-        except Exception:
-            _log.exception("Error in debounced light diagnostics for %s", uri)
-
-    timer = threading.Timer(_DEBOUNCE_DELAY, _run)
-    timer.daemon = True
-    _debounce_timers[uri] = timer
-    timer.start()
-
-
 @LSP_SERVER.feature(types.TEXT_DOCUMENT_DID_OPEN)
 def did_open(ls: LanguageServer, params: types.DidOpenTextDocumentParams):
     uri = params.text_document.uri
     _log.info("didOpen: %s", _short_uri(uri))
     # Warm the cache synchronously (fast) so completions/hover work immediately.
-    _get_parse(uri)
+    ctx._get_parse(uri)
     # Kick off background index warm-up on the first file open.
-    if not _workspace_index.is_ready() and not _workspace_index._warming:
-        _workspace_index.warm()
+    if not ctx._workspace_index.is_ready() and not ctx._workspace_index._warming:
+        ctx._workspace_index.warm()
     # Run index update + full diagnostics in a background thread.
     if _diagnostics_enabled():
         _schedule_full_diagnostics(uri)
@@ -1241,7 +132,7 @@ def did_change(ls: LanguageServer, params: types.DidChangeTextDocumentParams):
     _log.debug("didChange: %s", _short_uri(params.text_document.uri))
     # Parse immediately so the cache is warm for completions/hover, but
     # defer diagnostics behind a debounce timer.
-    _get_parse(params.text_document.uri)
+    ctx._get_parse(params.text_document.uri)
     _schedule_light_diagnostics(params.text_document.uri)
 
 
@@ -1250,9 +141,7 @@ def did_save(ls: LanguageServer, params: types.DidSaveTextDocumentParams):
     uri = params.text_document.uri
     _log.info("didSave: %s", _short_uri(uri))
     # Cancel any pending light-diagnostics timer — we'll do a full pass now.
-    old = _debounce_timers.pop(uri, None)
-    if old is not None:
-        old.cancel()
+    cancel_pending_light_diagnostics(uri)
     if not _diagnostics_enabled():
         LSP_SERVER.text_document_publish_diagnostics(
             types.PublishDiagnosticsParams(uri=uri, diagnostics=[])
@@ -1272,12 +161,10 @@ def did_close(ls: LanguageServer, params: types.DidCloseTextDocumentParams):
     uri = params.text_document.uri
     _log.info("didClose: %s", _short_uri(uri))
     # Cancel pending timer
-    old = _debounce_timers.pop(uri, None)
-    if old is not None:
-        old.cancel()
+    cancel_pending_light_diagnostics(uri)
     with _cache_lock:
         _parse_cache.pop(uri, None)
-    _workspace_index.remove_file(uri)
+    ctx._workspace_index.remove_file(uri)
     if _diagnostics_enabled():
         ls.text_document_publish_diagnostics(
             types.PublishDiagnosticsParams(uri=uri, diagnostics=[])
@@ -1294,31 +181,30 @@ def did_change_watched_files(
     """
     for change in params.changes:
         _log.debug("watchedFile: %s type=%s", _short_uri(change.uri), change.type)
-        change_path = _path_from_uri(change.uri)
+        change_path = ctx._path_from_uri(change.uri)
         if os.path.basename(change_path) == _FORMAT_CONFIG_FILENAME:
             _refresh_format_config()
             continue
         is_rpy = change_path.endswith((".rpy", ".rpym"))
         if change.type == types.FileChangeType.Created:
             if is_rpy:
-                _workspace_index.add_file(change_path)
+                ctx._workspace_index.add_file(change_path)
             else:
                 # Might be an image file — invalidate image cache
-                _image_cache.clear()
+                ctx._image_cache.clear()
         elif change.type == types.FileChangeType.Deleted:
             if is_rpy:
-                _workspace_index.remove_file_from_list(change_path)
-                _workspace_index.remove_file(change.uri)
+                ctx._workspace_index.remove_file_from_list(change_path)
+                ctx._workspace_index.remove_file(change.uri)
                 with _cache_lock:
                     _parse_cache.pop(change.uri, None)
             else:
-                _image_cache.clear()
+                ctx._image_cache.clear()
         elif change.type == types.FileChangeType.Changed:
             # An external change — evict the old cache entry so next access re-reads.
             with _cache_lock:
                 _parse_cache.pop(change.uri, None)
-            _workspace_index.remove_file(change.uri)
-
+            ctx._workspace_index.remove_file(change.uri)
 
 # ─────────────────────── Document Symbols ────────────────────────────────
 
@@ -1328,7 +214,7 @@ def document_symbols(
     ls: LanguageServer, params: types.DocumentSymbolParams
 ) -> List[types.DocumentSymbol]:
     _log.debug("documentSymbol: %s", _short_uri(params.text_document.uri))
-    ast, parser = _get_parse(params.text_document.uri)
+    ast, parser = ctx._get_parse(params.text_document.uri)
     symbols = _build_symbols(ast.body)
     _log.debug(
         "documentSymbol: %s → %d symbol(s)",
@@ -1475,7 +361,7 @@ def folding_ranges(
 ) -> List[types.FoldingRange]:
     """Return folding ranges for block-level constructs."""
     _log.debug("foldingRange: %s", _short_uri(params.text_document.uri))
-    ast, parser = _get_parse(params.text_document.uri)
+    ast, parser = ctx._get_parse(params.text_document.uri)
     ranges: List[types.FoldingRange] = []
     _collect_folding_ranges(ast, ranges)
     _log.debug(
@@ -1537,7 +423,7 @@ def goto_definition(
         pos.character,
         word,
     )
-    ast, parser = _get_parse(uri)
+    ast, parser = ctx._get_parse(uri)
 
     # ── 0) If cursor is on a label/screen definition, show all usages ──
     lineno = pos.line + 1  # 1-based
@@ -1548,8 +434,8 @@ def goto_definition(
             results: List[types.Location] = []
             seen: set = set()  # (uri, lineno) to dedupe
             label_name = node.name
-            for fp in _get_workspace_rpy_files():
-                file_uri, file_ast, file_parser = _get_parse_for_file(fp)
+            for fp in ctx._get_workspace_rpy_files():
+                file_uri, file_ast, file_parser = ctx._get_parse_for_file(fp)
                 for j in file_parser.get_all_jumps():
                     if j.target == label_name:
                         key = (file_uri, j.lineno)
@@ -1573,8 +459,8 @@ def goto_definition(
             results = []
             seen = set()
             screen_name = node.name
-            for fp in _get_workspace_rpy_files():
-                file_uri, file_ast, file_parser = _get_parse_for_file(fp)
+            for fp in ctx._get_workspace_rpy_files():
+                file_uri, file_ast, file_parser = ctx._get_parse_for_file(fp)
                 for n in file_parser._collect(file_ast, CallScreen):
                     if n.screen_name == screen_name:
                         key = (file_uri, n.lineno)
@@ -1600,7 +486,7 @@ def goto_definition(
     # ── 2) Quoted string → file path ──
     quoted = _extract_quoted_string(line_text, col)
     if quoted:
-        resolved = _resolve_renpy_file(quoted, source_uri=uri)
+        resolved = ctx._resolve_renpy_file(quoted, source_uri=uri)
         if resolved:
             return [_make_file_location(resolved)]
 
@@ -1619,47 +505,47 @@ def goto_definition(
     # ── 4) Symbol lookup across workspace ──
 
     # Labels
-    all_labels = _get_all_workspace_labels()
+    all_labels = ctx._get_all_workspace_labels()
     if word in all_labels:
         return _dedup_locations(
             [_make_node_location(u, lb) for u, lb in all_labels[word]]
         )
 
     # Defines / Defaults
-    all_defines = _get_all_workspace_defines()
+    all_defines = ctx._get_all_workspace_defines()
     if word in all_defines:
         return _dedup_locations(
             [_make_node_location(u, d) for u, d in all_defines[word]]
         )
-    all_defaults = _get_all_workspace_defaults()
+    all_defaults = ctx._get_all_workspace_defaults()
     if word in all_defaults:
         return _dedup_locations(
             [_make_node_location(u, d) for u, d in all_defaults[word]]
         )
 
     # Screens
-    all_screens = _get_all_workspace_screens()
+    all_screens = ctx._get_all_workspace_screens()
     if word in all_screens:
         return _dedup_locations(
             [_make_node_location(u, s) for u, s in all_screens[word]]
         )
 
     # Images
-    all_images = _get_all_workspace_images()
+    all_images = ctx._get_all_workspace_images()
     if word in all_images:
         return _dedup_locations(
             [_make_node_location(u, img) for u, img in all_images[word]]
         )
 
     # Transforms
-    all_transforms = _get_all_workspace_transforms()
+    all_transforms = ctx._get_all_workspace_transforms()
     if word in all_transforms:
         return _dedup_locations(
             [_make_node_location(u, t) for u, t in all_transforms[word]]
         )
 
     # Python variables (defined in python: blocks or $ one-liners)
-    py_vars = _find_python_var_across_workspace(word)
+    py_vars = ctx._find_python_var_across_workspace(word)
     if py_vars:
         return [
             types.Location(
@@ -1696,7 +582,7 @@ def _resolve_node_definition(
             if not _cursor_on_image_name(line_text, col, image_name):
                 return None
         # 1) Look for an explicit ``image`` definition
-        all_images = _get_all_workspace_images()
+        all_images = ctx._get_all_workspace_images()
         if image_name in all_images:
             locs = [_make_node_location(u, img) for u, img in all_images[image_name]]
             # If the image definition has a file expression, also add that
@@ -1704,7 +590,7 @@ def _resolve_node_definition(
                 if img.expression:
                     file_path = _try_extract_path(img.expression)
                     if file_path:
-                        resolved = _resolve_renpy_file(file_path, source_uri=source_uri)
+                        resolved = ctx._resolve_renpy_file(file_path, source_uri=source_uri)
                         if resolved:
                             locs.append(_make_file_location(resolved))
             return locs
@@ -1719,14 +605,14 @@ def _resolve_node_definition(
         if tag_matches:
             return [_make_node_location(u, img) for u, img in tag_matches]
         # 3) Try to find a matching file via Ren'Py's auto-image detection
-        resolved = _resolve_image_name_to_file(image_name)
+        resolved = ctx._resolve_image_name_to_file(image_name)
         if resolved:
             return _make_file_location(resolved)
         return None
 
     # ── Call Screen / Show Screen → screen definition ──
     if isinstance(node, (CallScreen, ShowScreen)):
-        all_screens = _get_all_workspace_screens()
+        all_screens = ctx._get_all_workspace_screens()
         sname = node.screen_name.strip()
         if sname in all_screens:
             return [_make_node_location(u, s) for u, s in all_screens[sname]]
@@ -1734,7 +620,7 @@ def _resolve_node_definition(
 
     # ── Voice → voice file ──
     if isinstance(node, Voice):
-        resolved = _resolve_renpy_file(node.filename, source_uri=source_uri)
+        resolved = ctx._resolve_renpy_file(node.filename, source_uri=source_uri)
         if resolved:
             return _make_file_location(resolved)
         return None
@@ -1743,11 +629,11 @@ def _resolve_node_definition(
     if isinstance(node, PlayMusic):
         filename = node.filename.strip()
         if filename:
-            resolved = _resolve_renpy_file(filename, source_uri=source_uri)
+            resolved = ctx._resolve_renpy_file(filename, source_uri=source_uri)
             if resolved:
                 return _make_file_location(resolved)
         # filename might be a define name (e.g.  play music OldTime)
-        all_defines = _get_all_workspace_defines()
+        all_defines = ctx._get_all_workspace_defines()
         # Try the raw text after channel as a define name
         if filename in all_defines:
             return [_make_node_location(u, d) for u, d in all_defines[filename]]
@@ -1760,11 +646,11 @@ def _resolve_node_definition(
     if isinstance(node, QueueMusic):
         filename = node.filename.strip()
         if filename:
-            resolved = _resolve_renpy_file(filename, source_uri=source_uri)
+            resolved = ctx._resolve_renpy_file(filename, source_uri=source_uri)
             if resolved:
                 return _make_file_location(resolved)
         # filename might be a define name
-        all_defines = _get_all_workspace_defines()
+        all_defines = ctx._get_all_workspace_defines()
         if filename in all_defines:
             return [_make_node_location(u, d) for u, d in all_defines[filename]]
         # Also try with "audio." prefix
@@ -1777,7 +663,7 @@ def _resolve_node_definition(
     if isinstance(node, ImageDef) and node.expression:
         file_path = _try_extract_path(node.expression)
         if file_path:
-            resolved = _resolve_renpy_file(file_path, source_uri=source_uri)
+            resolved = ctx._resolve_renpy_file(file_path, source_uri=source_uri)
             if resolved:
                 return _make_file_location(resolved)
         return None
@@ -1785,498 +671,7 @@ def _resolve_node_definition(
     return None
 
 
-def _try_extract_path(expression: str) -> Optional[str]:
-    """Try to extract a file path from an image expression like ``"path/to/img.png"``."""
-    m = re.match(r"""^["'](.+?)["']$""", expression.strip())
-    if m:
-        return m.group(1)
-    return None
 
-
-def _word_at_position(line: str, col: int) -> str:
-    """Extract the word under the cursor.
-
-    Supports alphanumerics, underscores, dots, and CJK characters, plus
-    hyphens (common in Ren'Py image names like ``日内-彩票站屏幕``).
-    """
-    if col >= len(line):
-        col = max(0, len(line) - 1)
-    if not line:
-        return ""
-
-    def _is_word_char(ch: str) -> bool:
-        return (
-            ch.isalnum()
-            or ch in "_."
-            or ch == "-"
-            or "\u4e00" <= ch <= "\u9fff"
-            or "\u3400" <= ch <= "\u4dbf"
-        )
-
-    start = col
-    while start > 0 and _is_word_char(line[start - 1]):
-        start -= 1
-    end = col
-    while end < len(line) and _is_word_char(line[end]):
-        end += 1
-    return line[start:end]
-
-
-# ─────────────────────── Completion ──────────────────────────────────────
-
-# Ren'Py keyword/transition/transform lists are in renpy_data.py.
-
-_COMPLETION_NAME_RE = r"[\w.\-\u4e00-\u9fff\u3400-\u4dbf ]*"
-_COMPLETION_IDENTIFIER_RE = r"[\w.\u4e00-\u9fff\u3400-\u4dbf]*"
-
-# Dotted define/default path right before the cursor, with an optional
-# partial member after the last dot ("music.", "music.un", "music.sub.x").
-_RE_DOTTED_MEMBER_PREFIX = re.compile(
-    r"([a-zA-Z_\u4e00-\u9fff\u3400-\u4dbf][\w\u4e00-\u9fff\u3400-\u4dbf]*"
-    r"(?:\.[\w\u4e00-\u9fff\u3400-\u4dbf]+)*)\.[\w\u4e00-\u9fff\u3400-\u4dbf]*$"
-)
-
-
-def _add_completion_item(
-    items: List[types.CompletionItem],
-    seen: set,
-    label: str,
-    kind: types.CompletionItemKind,
-    detail: Optional[str] = None,
-) -> None:
-    """Append a completion item once, preserving first-seen ordering."""
-    if not label or label in seen:
-        return
-    seen.add(label)
-    items.append(types.CompletionItem(label=label, kind=kind, detail=detail))
-
-
-def _add_workspace_symbol_completions(
-    items: List[types.CompletionItem],
-    seen: set,
-    symbols: Dict[str, List[Tuple[str, Node]]],
-    *,
-    kind: types.CompletionItemKind,
-    detail_label: str,
-    expression_attr: Optional[str] = None,
-) -> None:
-    """Append completions from a workspace symbol map."""
-    for name in sorted(symbols):
-        entries = symbols[name]
-        if not entries:
-            continue
-        target_uri, node = entries[0]
-        fname = os.path.basename(_path_from_uri(target_uri))
-        detail = f"{detail_label} ({fname}:{node.lineno})"
-        if expression_attr:
-            expression = getattr(node, expression_attr, None)
-            if expression:
-                detail = f"{detail_label}: {expression}"
-        _add_completion_item(items, seen, name, kind, detail)
-
-
-def _add_keyword_completions(
-    items: List[types.CompletionItem],
-    seen: set,
-    names: List[str],
-    *,
-    kind: types.CompletionItemKind,
-    detail: Optional[str] = None,
-) -> None:
-    for name in names:
-        _add_completion_item(items, seen, name, kind, detail)
-
-
-def _current_symbol_map(
-    uri: str, nodes: List[Node]
-) -> Dict[str, List[Tuple[str, Node]]]:
-    symbols: Dict[str, List[Tuple[str, Node]]] = {}
-    for node in nodes:
-        name = getattr(node, "name", "")
-        if name:
-            symbols.setdefault(name, []).append((uri, node))
-    return symbols
-
-
-def _merge_current_symbols(
-    workspace_symbols: Dict[str, List[Tuple[str, Node]]],
-    uri: str,
-    nodes: List[Node],
-) -> Dict[str, List[Tuple[str, Node]]]:
-    merged = {name: list(entries) for name, entries in workspace_symbols.items()}
-    for name, entries in _current_symbol_map(uri, nodes).items():
-        existing = merged.setdefault(name, [])
-        existing_keys = {(entry_uri, node.lineno) for entry_uri, node in existing}
-        for entry in entries:
-            if (entry[0], entry[1].lineno) not in existing_keys:
-                existing.append(entry)
-    return merged
-
-
-def _line_indent(line: str) -> int:
-    return len(line) - len(line.lstrip(" "))
-
-
-def _enclosing_completion_block(lines: List[str], line_no: int, col: int) -> Optional[str]:
-    """Return the nearest enclosing screen/transform/style block for completion."""
-    if line_no >= len(lines):
-        return None
-    current_indent = _line_indent(lines[line_no][:col])
-    if current_indent <= 0:
-        return None
-
-    for i in range(line_no - 1, -1, -1):
-        raw = lines[i]
-        stripped = raw.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        indent = _line_indent(raw)
-        if indent >= current_indent:
-            continue
-        current_indent = indent
-        if re.match(r"^screen\s+[a-zA-Z_\u4e00-\u9fff\u3400-\u4dbf]\w*", stripped):
-            return "screen"
-        if re.match(r"^transform\s+[a-zA-Z_\u4e00-\u9fff\u3400-\u4dbf]\w*", stripped):
-            return "transform"
-        if re.match(r"^style\s+[a-zA-Z_\u4e00-\u9fff\u3400-\u4dbf]\w*", stripped):
-            return "style"
-
-    return None
-
-
-def _prefix_matches(prefix: str, pattern: str) -> bool:
-    return re.match(pattern, prefix, re.IGNORECASE) is not None
-
-
-def _add_label_completions(
-    items: List[types.CompletionItem],
-    seen: set,
-    uri: str,
-    parser: RpyParser,
-) -> None:
-    labels = _merge_current_symbols(
-        _get_all_workspace_labels(), uri, parser.get_all_labels()
-    )
-    _add_workspace_symbol_completions(
-        items,
-        seen,
-        labels,
-        kind=types.CompletionItemKind.Function,
-        detail_label="label",
-    )
-
-
-def _add_transform_completions(
-    items: List[types.CompletionItem],
-    seen: set,
-    uri: str,
-    parser: RpyParser,
-) -> None:
-    _add_keyword_completions(
-        items,
-        seen,
-        RENPY_TRANSFORMS,
-        kind=types.CompletionItemKind.Constant,
-        detail="transform position",
-    )
-    transforms = _merge_current_symbols(
-        _get_all_workspace_transforms(), uri, parser.get_all_transforms()
-    )
-    _add_workspace_symbol_completions(
-        items,
-        seen,
-        transforms,
-        kind=types.CompletionItemKind.Function,
-        detail_label="transform",
-    )
-
-
-def _add_screen_completions(
-    items: List[types.CompletionItem],
-    seen: set,
-    uri: str,
-    parser: RpyParser,
-) -> None:
-    screens = _merge_current_symbols(
-        _get_all_workspace_screens(), uri, parser.get_all_screens()
-    )
-    _add_workspace_symbol_completions(
-        items,
-        seen,
-        screens,
-        kind=types.CompletionItemKind.Class,
-        detail_label="screen",
-    )
-
-
-def _add_style_completions(
-    items: List[types.CompletionItem],
-    seen: set,
-    uri: str,
-    parser: RpyParser,
-) -> None:
-    styles = _merge_current_symbols(
-        _get_all_workspace_styles(), uri, parser.get_all_styles()
-    )
-    _add_workspace_symbol_completions(
-        items,
-        seen,
-        styles,
-        kind=types.CompletionItemKind.Property,
-        detail_label="style",
-    )
-
-
-def _add_image_completions(
-    items: List[types.CompletionItem],
-    seen: set,
-    uri: str,
-    parser: RpyParser,
-) -> None:
-    images = _merge_current_symbols(
-        _get_all_workspace_images(), uri, parser.get_all_images()
-    )
-    _add_workspace_symbol_completions(
-        items,
-        seen,
-        images,
-        kind=types.CompletionItemKind.File,
-        detail_label="image",
-    )
-    _ensure_image_cache()
-    explicit_names = {name.lower() for name in images}
-    for auto_name in sorted(_image_cache):
-        if auto_name.lower() in explicit_names:
-            continue
-        _add_completion_item(
-            items,
-            seen,
-            auto_name,
-            types.CompletionItemKind.File,
-            "image (auto)",
-        )
-
-
-def _add_audio_define_completions(
-    items: List[types.CompletionItem],
-    seen: set,
-    uri: str,
-    parser: RpyParser,
-) -> None:
-    defines = _merge_current_symbols(
-        _get_all_workspace_defines(), uri, parser.get_all_defines()
-    )
-    for dname in sorted(defines):
-        if not dname.startswith("audio."):
-            continue
-        entries = defines[dname]
-        if not entries:
-            continue
-        target_uri, node = entries[0]
-        fname = os.path.basename(_path_from_uri(target_uri))
-        _add_completion_item(
-            items,
-            seen,
-            dname[len("audio.") :],
-            types.CompletionItemKind.Variable,
-            f"{dname} ({fname}:{node.lineno})",
-        )
-
-
-def _add_namespace_member_completions(
-    items: List[types.CompletionItem],
-    seen: set,
-    uri: str,
-    parser: RpyParser,
-    namespace: str,
-) -> None:
-    """Complete members of a dotted define/default namespace.
-
-    ``define music.track1 = "..."`` → typing ``music.`` offers ``track1``.
-    Nested namespaces (``music.sub.x``) contribute the intermediate segment
-    (``sub``) so completion works level by level.
-    """
-    prefix = namespace + "."
-    namespaces: set = set()
-    for getter, fallback_getter, detail_label in (
-        (_get_all_workspace_defines, parser.get_all_defines, "define"),
-        (_get_all_workspace_defaults, parser.get_all_defaults, "default"),
-    ):
-        symbols = _merge_current_symbols(getter(), uri, fallback_getter())
-        for name in sorted(symbols):
-            if not name.startswith(prefix):
-                continue
-            remainder = name[len(prefix) :]
-            if not remainder:
-                continue
-            if "." in remainder:
-                head = remainder.split(".", 1)[0]
-                if head not in namespaces:
-                    namespaces.add(head)
-                    _add_completion_item(
-                        items,
-                        seen,
-                        head,
-                        types.CompletionItemKind.Module,
-                        f"{detail_label} namespace {prefix}{head}",
-                    )
-                continue
-            entries = symbols[name]
-            if not entries:
-                continue
-            target_uri, node = entries[0]
-            fname = os.path.basename(_path_from_uri(target_uri))
-            detail = f"{detail_label} {name} ({fname}:{node.lineno})"
-            if node.expression:
-                detail = f"{detail_label} {name}: {node.expression}"
-            _add_completion_item(
-                items,
-                seen,
-                remainder,
-                types.CompletionItemKind.Variable,
-                detail,
-            )
-
-
-def _add_variable_completions(
-    items: List[types.CompletionItem],
-    seen: set,
-    uri: str,
-    parser: RpyParser,
-) -> None:
-    defines = _merge_current_symbols(
-        _get_all_workspace_defines(), uri, parser.get_all_defines()
-    )
-    defaults = _merge_current_symbols(
-        _get_all_workspace_defaults(), uri, parser.get_all_defaults()
-    )
-    _add_workspace_symbol_completions(
-        items,
-        seen,
-        defines,
-        kind=types.CompletionItemKind.Variable,
-        detail_label="define",
-        expression_attr="expression",
-    )
-    _add_workspace_symbol_completions(
-        items,
-        seen,
-        defaults,
-        kind=types.CompletionItemKind.Variable,
-        detail_label="default",
-        expression_attr="expression",
-    )
-
-
-def _completion_items_for_context(
-    uri: str,
-    parser: RpyParser,
-    lines: List[str],
-    line_no: int,
-    col: int,
-) -> List[types.CompletionItem]:
-    line_text = lines[line_no] if line_no < len(lines) else ""
-    prefix = line_text[:col]
-    items: List[types.CompletionItem] = []
-    seen: set = set()
-
-    # Keep trailing spaces in prefix matching. Removing them breaks trigger
-    # contexts like "jump " and "with ".
-
-    # Dotted define/default namespace members first: "music." → "music.*".
-    # Falls through to the regular contexts when the namespace is unknown.
-    ns_match = _RE_DOTTED_MEMBER_PREFIX.search(prefix)
-    if ns_match is not None:
-        _add_namespace_member_completions(
-            items, seen, uri, parser, ns_match.group(1)
-        )
-        if items:
-            return items
-
-    if _prefix_matches(
-        prefix,
-        rf"^\s*(?:show|hide|call)\s+screen\s+{_COMPLETION_IDENTIFIER_RE}$",
-    ) or _prefix_matches(prefix, rf"^\s*use\s+{_COMPLETION_IDENTIFIER_RE}$"):
-        _add_screen_completions(items, seen, uri, parser)
-    elif _prefix_matches(
-        prefix,
-        rf"^\s*(?:jump|call)\s+(?:expression\s+)?{_COMPLETION_IDENTIFIER_RE}$",
-    ):
-        _add_label_completions(items, seen, uri, parser)
-    elif _prefix_matches(prefix, rf"^.*\bwith\s+{_COMPLETION_IDENTIFIER_RE}$"):
-        _add_keyword_completions(
-            items,
-            seen,
-            RENPY_TRANSITIONS,
-            kind=types.CompletionItemKind.Constant,
-            detail="transition",
-        )
-    elif _prefix_matches(prefix, rf"^.*\bat\s+{_COMPLETION_IDENTIFIER_RE}$"):
-        _add_transform_completions(items, seen, uri, parser)
-    elif _prefix_matches(
-        prefix,
-        rf"^\s*style\s+(?:{_COMPLETION_IDENTIFIER_RE}\s+is\s+)?{_COMPLETION_IDENTIFIER_RE}$",
-    ):
-        _add_style_completions(items, seen, uri, parser)
-    elif _prefix_matches(
-        prefix,
-        rf"^\s*(?:show|scene|hide)\s+{_COMPLETION_NAME_RE}$",
-    ) and not re.search(
-        r"\b(?:at|with|behind|as|onlayer|zorder)\b",
-        prefix,
-        re.IGNORECASE,
-    ):
-        if not _prefix_matches(prefix, r"^\s*(?:show|hide)\s+screen\b"):
-            _add_image_completions(items, seen, uri, parser)
-    elif _prefix_matches(
-        prefix,
-        rf"^\s*(?:play|queue)\s+\w+\s+{_COMPLETION_IDENTIFIER_RE}$",
-    ):
-        _add_audio_define_completions(items, seen, uri, parser)
-    else:
-        block = _enclosing_completion_block(lines, line_no, col)
-        if block == "screen":
-            _add_keyword_completions(
-                items,
-                seen,
-                RENPY_SCREEN_DISPLAYABLES,
-                kind=types.CompletionItemKind.Keyword,
-                detail="screen displayable",
-            )
-            _add_keyword_completions(
-                items,
-                seen,
-                RENPY_SCREEN_PROPERTIES,
-                kind=types.CompletionItemKind.Property,
-                detail="screen property",
-            )
-        elif block == "transform":
-            _add_keyword_completions(
-                items,
-                seen,
-                RENPY_ATL_PROPERTIES,
-                kind=types.CompletionItemKind.Property,
-                detail="ATL statement",
-            )
-        elif block == "style":
-            _add_keyword_completions(
-                items,
-                seen,
-                RENPY_STYLE_PROPERTIES,
-                kind=types.CompletionItemKind.Property,
-                detail="style property",
-            )
-        else:
-            _add_keyword_completions(
-                items,
-                seen,
-                RENPY_KEYWORDS,
-                kind=types.CompletionItemKind.Keyword,
-            )
-            _add_variable_completions(items, seen, uri, parser)
-            _add_label_completions(items, seen, uri, parser)
-
-    return items
 
 
 @LSP_SERVER.feature(
@@ -2296,11 +691,29 @@ def completions(
         "completion: %s L%d prefix=%r", _short_uri(uri), pos.line + 1, line_prefix[-30:]
     )
 
-    _ast, parser = _get_parse(uri)
+    _ast, parser = ctx._get_parse(uri)
     items = _completion_items_for_context(uri, parser, doc.lines, pos.line, col)
 
     _log.debug("completion: %s → %d item(s)", _short_uri(uri), len(items))
     return types.CompletionList(is_incomplete=False, items=items)
+
+
+# ─────────────────────── Code Actions ────────────────────────────────────
+
+
+@LSP_SERVER.feature(types.TEXT_DOCUMENT_CODE_ACTION)
+def code_action(
+    ls: LanguageServer, params: types.CodeActionParams
+) -> Optional[List[types.CodeAction]]:
+    """Quick fixes driven by the diagnostics VS Code sends in the context."""
+    uri = params.text_document.uri
+    doc = ls.workspace.get_text_document(uri)
+    _ast, parser = _get_parse(uri)
+    actions = code_actions.compute_code_actions(
+        uri, params.context.diagnostics, doc.lines, parser
+    )
+    _log.debug("codeAction: %s → %d action(s)", _short_uri(uri), len(actions))
+    return actions or None
 
 
 # ─────────────────────── Hover ───────────────────────────────────────────
@@ -2330,13 +743,13 @@ def hover(ls: LanguageServer, params: types.HoverParams) -> Optional[types.Hover
             )
         )
 
-    ast, parser = _get_parse(uri)
+    ast, parser = ctx._get_parse(uri)
 
     # 2) Check labels across workspace
-    all_labels = _get_all_workspace_labels()
+    all_labels = ctx._get_all_workspace_labels()
     if word in all_labels:
         target_uri, lb = all_labels[word][0]
-        fname = os.path.basename(_path_from_uri(target_uri))
+        fname = os.path.basename(ctx._path_from_uri(target_uri))
         parts = [f"**label** `{lb.name}`"]
         if lb.parameters:
             parts.append(f"Parameters: `{lb.parameters}`")
@@ -2358,10 +771,10 @@ def hover(ls: LanguageServer, params: types.HoverParams) -> Optional[types.Hover
         )
 
     # 3) Check defines (characters, etc.) across workspace
-    all_defines = _get_all_workspace_defines()
+    all_defines = ctx._get_all_workspace_defines()
     if word in all_defines:
         target_uri, d = all_defines[word][0]
-        fname = os.path.basename(_path_from_uri(target_uri))
+        fname = os.path.basename(ctx._path_from_uri(target_uri))
         return types.Hover(
             contents=types.MarkupContent(
                 kind=types.MarkupKind.Markdown,
@@ -2370,10 +783,10 @@ def hover(ls: LanguageServer, params: types.HoverParams) -> Optional[types.Hover
         )
 
     # 4) Check defaults across workspace
-    all_defaults = _get_all_workspace_defaults()
+    all_defaults = ctx._get_all_workspace_defaults()
     if word in all_defaults:
         target_uri, d = all_defaults[word][0]
-        fname = os.path.basename(_path_from_uri(target_uri))
+        fname = os.path.basename(ctx._path_from_uri(target_uri))
         return types.Hover(
             contents=types.MarkupContent(
                 kind=types.MarkupKind.Markdown,
@@ -2382,10 +795,10 @@ def hover(ls: LanguageServer, params: types.HoverParams) -> Optional[types.Hover
         )
 
     # 5) Check screens across workspace
-    all_screens = _get_all_workspace_screens()
+    all_screens = ctx._get_all_workspace_screens()
     if word in all_screens:
         target_uri, s = all_screens[word][0]
-        fname = os.path.basename(_path_from_uri(target_uri))
+        fname = os.path.basename(ctx._path_from_uri(target_uri))
         params_str = f"({s.parameters})" if s.parameters else "()"
         return types.Hover(
             contents=types.MarkupContent(
@@ -2395,10 +808,10 @@ def hover(ls: LanguageServer, params: types.HoverParams) -> Optional[types.Hover
         )
 
     # 6) Check Python variables (defined in python: blocks or $ one-liners)
-    py_vars = _find_python_var_across_workspace(word)
+    py_vars = ctx._find_python_var_across_workspace(word)
     if py_vars:
         uri_v, lineno_v, code_v = py_vars[0]
-        fname = os.path.basename(_path_from_uri(uri_v))
+        fname = os.path.basename(ctx._path_from_uri(uri_v))
         return types.Hover(
             contents=types.MarkupContent(
                 kind=types.MarkupKind.Markdown,
@@ -2486,7 +899,7 @@ def _find_say_at_line(
     uri: str, line: int
 ) -> Optional[Tuple[Union[Say, NarratorSay], Optional[str]]]:
     """Return the Say/NarratorSay node at *line* (0-based) and its enclosing label, if any."""
-    ast, parser = _get_parse(uri)
+    ast, parser = ctx._get_parse(uri)
     if ast is None:
         return None
     for node, label_name in _collect_dialogue_with_labels(ast.body):
@@ -2990,15 +1403,15 @@ def find_references(
     results: List[types.Location] = []
 
     # Check if it's a label
-    all_labels = _get_all_workspace_labels()
+    all_labels = ctx._get_all_workspace_labels()
     if word in all_labels:
         # Include the definition(s) if requested
         if params.context.include_declaration:
             for target_uri, lb in all_labels[word]:
                 results.append(_make_node_location(target_uri, lb))
         # Find all jump/call references
-        for fp in _get_workspace_rpy_files():
-            file_uri, ast, parser = _get_parse_for_file(fp)
+        for fp in ctx._get_workspace_rpy_files():
+            file_uri, ast, parser = ctx._get_parse_for_file(fp)
             for j in parser.get_all_jumps():
                 if j.target == word:
                     results.append(_make_node_location(file_uri, j))
@@ -3008,14 +1421,14 @@ def find_references(
         return results if results else None
 
     # Check if it's a screen
-    all_screens = _get_all_workspace_screens()
+    all_screens = ctx._get_all_workspace_screens()
     if word in all_screens:
         if params.context.include_declaration:
             for target_uri, s in all_screens[word]:
                 results.append(_make_node_location(target_uri, s))
         # Find call screen / show screen references
-        for fp in _get_workspace_rpy_files():
-            file_uri, ast, parser = _get_parse_for_file(fp)
+        for fp in ctx._get_workspace_rpy_files():
+            file_uri, ast, parser = ctx._get_parse_for_file(fp)
             for node in parser._collect(ast, CallScreen):
                 if node.screen_name == word:
                     results.append(_make_node_location(file_uri, node))
@@ -3025,8 +1438,8 @@ def find_references(
         return results if results else None
 
     # Check defines/defaults
-    all_defines = _get_all_workspace_defines()
-    all_defaults = _get_all_workspace_defaults()
+    all_defines = ctx._get_all_workspace_defines()
+    all_defaults = ctx._get_all_workspace_defaults()
     if word in all_defines or word in all_defaults:
         if params.context.include_declaration:
             if word in all_defines:
@@ -3036,7 +1449,7 @@ def find_references(
                 for target_uri, d in all_defaults[word]:
                     results.append(_make_node_location(target_uri, d))
         # Text search for usages (simple grep)
-        for fp in _get_workspace_rpy_files():
+        for fp in ctx._get_workspace_rpy_files():
             file_uri = _uri_from_path(fp)
             try:
                 lines = (
@@ -3197,8 +1610,8 @@ def prepare_rename(
         return None
 
     # Only allow renaming labels and screens
-    all_labels = _get_all_workspace_labels()
-    all_screens = _get_all_workspace_screens()
+    all_labels = ctx._get_all_workspace_labels()
+    all_screens = ctx._get_all_workspace_screens()
 
     if word in all_labels or word in all_screens:
         # Find the word boundaries
@@ -3251,7 +1664,7 @@ def rename(
     changes: Dict[str, List[types.TextEdit]] = {}
 
     # Rename labels
-    all_labels = _get_all_workspace_labels()
+    all_labels = ctx._get_all_workspace_labels()
     if old_name in all_labels:
         # Rename label definitions
         for target_uri, lb in all_labels[old_name]:
@@ -3285,18 +1698,18 @@ def rename(
                     )
 
         # Rename jump/call references — only scan files that contain matching targets
-        _jump_uris = set(_workspace_index.get_jump_target_uris(old_name))
-        _call_uris = set(_workspace_index.get_call_target_uris(old_name))
+        _jump_uris = set(ctx._workspace_index.get_jump_target_uris(old_name))
+        _call_uris = set(ctx._workspace_index.get_call_target_uris(old_name))
         _ref_uris = _jump_uris | _call_uris
         for ref_uri in _ref_uris:
             try:
                 file_doc = ls.workspace.get_text_document(ref_uri)
             except Exception:
                 continue
-            fp = _path_from_uri(ref_uri)
+            fp = ctx._path_from_uri(ref_uri)
             if not fp:
                 continue
-            _, ast, parser = _get_parse_for_file(fp)
+            _, ast, parser = ctx._get_parse_for_file(fp)
 
             if ref_uri in _jump_uris:
                 for j in parser.get_all_jumps():
@@ -3361,7 +1774,7 @@ def rename(
         return types.WorkspaceEdit(changes=changes) if changes else None
 
     # Rename screens
-    all_screens = _get_all_workspace_screens()
+    all_screens = ctx._get_all_workspace_screens()
     if old_name in all_screens:
         # Rename screen definitions
         for target_uri, s in all_screens[old_name]:
@@ -3394,8 +1807,8 @@ def rename(
                     )
 
         # Rename call screen / show screen references
-        for fp in _get_workspace_rpy_files():
-            file_uri, ast, parser = _get_parse_for_file(fp)
+        for fp in ctx._get_workspace_rpy_files():
+            file_uri, ast, parser = ctx._get_parse_for_file(fp)
             file_doc = ls.workspace.get_text_document(file_uri)
 
             for node in parser._collect(ast, CallScreen):
@@ -3474,8 +1887,8 @@ def cmd_refresh_workspace() -> Dict[str, object]:
 
     # Full rebuild of workspace index (re-globs + re-parses all files)
     t0 = _time.monotonic()
-    _workspace_index.rebuild()
-    files = _workspace_index.get_file_list()
+    ctx._workspace_index.rebuild()
+    files = ctx._workspace_index.get_file_list()
     elapsed = (_time.monotonic() - t0) * 1000
     _log.info(
         "command refreshWorkspace: re-parsed %d file(s) in %.1f ms", len(files), elapsed
@@ -3492,7 +1905,7 @@ def cmd_refresh_workspace() -> Dict[str, object]:
 def cmd_show_stats() -> Dict[str, object]:
     """Collect and return project statistics."""
     _log.info("command showStats: collecting statistics")
-    files = _get_workspace_rpy_files()
+    files = ctx._get_workspace_rpy_files()
     total_lines = 0
     total_labels = 0
     total_screens = 0
@@ -3504,7 +1917,7 @@ def cmd_show_stats() -> Dict[str, object]:
     total_words = 0
 
     for fp in files:
-        _, ast, parser = _get_parse_for_file(fp)
+        _, ast, parser = ctx._get_parse_for_file(fp)
 
         # Count lines
         try:

@@ -1,5 +1,24 @@
 # Changelog
 
+## [1.8.0] - 2026-09-29
+
+### Added
+
+- **New cross-workspace diagnostics**
+  - `show`/`scene`/`hide` of an image that is neither defined via `image` statements nor auto-detected under `images/` now warns (`undefined-image`). Built-in displayables (`black`, `white`, `window`), `show expression`, `show layer`, and bare `scene` are exempt, and attribute lists like `show eileen vhappy` are satisfied by any image with the `eileen` tag.
+  - `at` clauses referencing an unknown transform now warn (`undefined-transform`). `transform` definitions, built-in positionals (`left`, `center`, …), `define`/`default` names (e.g. `define zoom = Transform(...)`) and inline expressions such as `Transform(xpos=0.5)` are all accepted.
+  - `style x is parent` with an unknown parent now warns (`undefined-style`). Project styles and Ren'Py's built-in styles (`default`, `button_text`, `say_dialogue`, …) are recognized.
+- **Quick fixes (Code Actions)**
+  - `Label "…" is not defined in the project` → *Create label "…"* appends a stub `label …:` block at the end of the file.
+  - `Label "…" is defined but never used` → *Delete unused label "…"* removes the whole label block (without swallowing the blank-line separator before the next statement).
+- All diagnostics now carry machine-readable `code` values (`undefined-label`, `unused-label`, `undefined-image`, `undefined-transform`, `undefined-style`, `duplicate-label`, `duplicate-screen`, `missing-image-file`, `empty-atl-block`, `unknown-statement`), which the quick fixes match on.
+
+### Changed
+
+- **Performance test suite** — new `tests/test_performance.py` (pytest `perf` marker, deselect with `-m "not perf"`): parser throughput and 2×-input scaling checks, 100-file workspace index warm-up, cold/warm full-diagnostics budgets, completion latency, and formatter throughput on a ~9k-line synthetic file. Measured on the synthetic project: 9k-line parse ≈ 90 ms (linear), index warm-up ≈ 160 ms, warm full diagnostics ≈ 2 ms.
+- The new `undefined-transform` check resolves unknown names with a **single batched workspace scan** (`server_context._all_workspace_python_names()`) instead of one full scan per unknown name — the shape that the new scaling tests guard.
+- **Server modularization** — `lsp_server.py` (~3550 lines) was split for maintainability: shared state and helpers moved to `server_context.py`, diagnostics (computation, publishing, background scheduling) to `diagnostics.py`, context-aware completion to `completion.py`, and quick fixes to `code_actions.py`. Behavior is unchanged; the pytest suite grew from 39 to 60 tests (new `test_diagnostics.py`, `test_code_actions.py`).
+
 ## [1.7.0] - 2026-09-29
 
 ### Added
