@@ -88,7 +88,7 @@ from urllib.parse import unquote as url_unquote
 
 MAX_WORKERS = 4
 LSP_SERVER = LanguageServer(
-    name="renpy-server", version="1.6.3", max_workers=MAX_WORKERS
+    name="renpy-server", version="1.7.0", max_workers=MAX_WORKERS
 )
 
 # Suppress noisy "Cancel notification for unknown message id" warnings.
@@ -1829,6 +1829,13 @@ def _word_at_position(line: str, col: int) -> str:
 _COMPLETION_NAME_RE = r"[\w.\-\u4e00-\u9fff\u3400-\u4dbf ]*"
 _COMPLETION_IDENTIFIER_RE = r"[\w.\u4e00-\u9fff\u3400-\u4dbf]*"
 
+# Dotted define/default path right before the cursor, with an optional
+# partial member after the last dot ("music.", "music.un", "music.sub.x").
+_RE_DOTTED_MEMBER_PREFIX = re.compile(
+    r"([a-zA-Z_\u4e00-\u9fff\u3400-\u4dbf][\w\u4e00-\u9fff\u3400-\u4dbf]*"
+    r"(?:\.[\w\u4e00-\u9fff\u3400-\u4dbf]+)*)\.[\w\u4e00-\u9fff\u3400-\u4dbf]*$"
+)
+
 
 def _add_completion_item(
     items: List[types.CompletionItem],
@@ -2076,6 +2083,61 @@ def _add_audio_define_completions(
         )
 
 
+def _add_namespace_member_completions(
+    items: List[types.CompletionItem],
+    seen: set,
+    uri: str,
+    parser: RpyParser,
+    namespace: str,
+) -> None:
+    """Complete members of a dotted define/default namespace.
+
+    ``define music.track1 = "..."`` → typing ``music.`` offers ``track1``.
+    Nested namespaces (``music.sub.x``) contribute the intermediate segment
+    (``sub``) so completion works level by level.
+    """
+    prefix = namespace + "."
+    namespaces: set = set()
+    for getter, fallback_getter, detail_label in (
+        (_get_all_workspace_defines, parser.get_all_defines, "define"),
+        (_get_all_workspace_defaults, parser.get_all_defaults, "default"),
+    ):
+        symbols = _merge_current_symbols(getter(), uri, fallback_getter())
+        for name in sorted(symbols):
+            if not name.startswith(prefix):
+                continue
+            remainder = name[len(prefix) :]
+            if not remainder:
+                continue
+            if "." in remainder:
+                head = remainder.split(".", 1)[0]
+                if head not in namespaces:
+                    namespaces.add(head)
+                    _add_completion_item(
+                        items,
+                        seen,
+                        head,
+                        types.CompletionItemKind.Module,
+                        f"{detail_label} namespace {prefix}{head}",
+                    )
+                continue
+            entries = symbols[name]
+            if not entries:
+                continue
+            target_uri, node = entries[0]
+            fname = os.path.basename(_path_from_uri(target_uri))
+            detail = f"{detail_label} {name} ({fname}:{node.lineno})"
+            if node.expression:
+                detail = f"{detail_label} {name}: {node.expression}"
+            _add_completion_item(
+                items,
+                seen,
+                remainder,
+                types.CompletionItemKind.Variable,
+                detail,
+            )
+
+
 def _add_variable_completions(
     items: List[types.CompletionItem],
     seen: set,
@@ -2120,6 +2182,17 @@ def _completion_items_for_context(
 
     # Keep trailing spaces in prefix matching. Removing them breaks trigger
     # contexts like "jump " and "with ".
+
+    # Dotted define/default namespace members first: "music." → "music.*".
+    # Falls through to the regular contexts when the namespace is unknown.
+    ns_match = _RE_DOTTED_MEMBER_PREFIX.search(prefix)
+    if ns_match is not None:
+        _add_namespace_member_completions(
+            items, seen, uri, parser, ns_match.group(1)
+        )
+        if items:
+            return items
+
     if _prefix_matches(
         prefix,
         rf"^\s*(?:show|hide|call)\s+screen\s+{_COMPLETION_IDENTIFIER_RE}$",

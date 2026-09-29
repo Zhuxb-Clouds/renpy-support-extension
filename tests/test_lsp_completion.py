@@ -127,6 +127,69 @@ def test_completion_suggests_variables_styles_transforms_and_screens(monkeypatch
     assert "theme" in audio
 
 
+def test_namespace_member_completion_after_dot(monkeypatch) -> None:
+    lines, parser = parse(
+        """
+        define music.track1 = "audio/music/track1.ogg"
+        define music.未命名1 = "audio/music/Foxtail-Grass Studio - 氷だらけのアイスコーヒー.mp3"
+        define music.sub.deep = "audio/deep.ogg"
+        define gui.text_color = "#ffffff"
+        default music.flag = False
+        label start:
+            $ x = music.
+        """
+    )
+    patch_workspace_symbols(monkeypatch, parser)
+
+    items = complete(lines, parser, 6)
+    got = labels(items)
+    assert {"track1", "未命名1", "sub", "flag"} <= got
+    # Members of other namespaces must not leak in.
+    assert "text_color" not in got
+    assert "music.track1" not in got
+
+
+def test_namespace_member_completion_partial_and_nested(monkeypatch) -> None:
+    lines, parser = parse(
+        """
+        define music.未命名1 = "audio/a.mp3"
+        define music.sub.deep = "audio/deep.ogg"
+        define gui.text_color = "#ffffff"
+        label start:
+            $ x = music.未
+            $ y = music.sub.
+            play music music.
+        """
+    )
+    patch_workspace_symbols(monkeypatch, parser)
+
+    partial = labels(complete(lines, parser, 4))
+    assert "未命名1" in partial
+    assert "sub" in partial
+
+    nested = labels(complete(lines, parser, 5))
+    assert nested == {"deep"}
+
+    play_items = labels(complete(lines, parser, 6))
+    assert "未命名1" in play_items
+
+
+def test_unknown_namespace_falls_through_to_normal_context(monkeypatch) -> None:
+    lines, parser = parse(
+        """
+        define music.track1 = "audio/a.mp3"
+        label start:
+            jump foo.
+        """
+    )
+    patch_workspace_symbols(monkeypatch, parser)
+
+    # "foo." has no defines → fall back to label completions as before.
+    items = labels(complete(lines, parser, 2))
+    assert "start" in items
+    assert "track1" not in items
+
+
 def test_completion_inside_screen_transform_and_style_blocks() -> None:
     text = (
         "screen hud():\n"

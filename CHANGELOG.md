@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.7.0] - 2026-09-29
+
+### Added
+
+- Completion now understands dotted define/default namespaces: with `define music.未命名1 = "audio/..."` in the project, typing `music.` anywhere in a script offers `未命名1` (plus every other `music.*` member, including nested namespaces such as `music.sub.*` level by level). Items show the full define path and defining file/line, and unknown namespaces fall back to the previous context-specific completions.
+
 ## [1.6.3] - 2026-08-19
 
 ### Fixed
