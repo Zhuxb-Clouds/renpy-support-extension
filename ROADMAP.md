@@ -22,14 +22,14 @@
 
 - [x] **pytest 测试**：为 `ast_parser`（1413 行手写解析器）与 LSP 特性建立测试基座（基于 `test_samples/` 扩展）。4700 行 Python 零测试，必须先做再叠加新特性，否则每加一个分支都在积累回归风险
 - [x] **补全缺口**：`define`/`default` 变量补全、`style` 名补全、`transform` 语句名补全、screen 内属性补全
-- [ ] **Signature help**：`show`/`call`/`with`/`play music` 等语句的参数提示
+- [x] **Signature help**（v1.9.0）：`call label/screen(...)` 解析真实参数 + 全语句模板子句提示
 - [x] **Code actions**：诊断快速修复——未定义 label 一键创建（v1.8.0）；未使用 label 一键删除块（v1.8.0）
 - [x] **模板代码片段**：`label`、`screen`、`menu`、`define` 的 snippet（纯 `package.json` 声明，零 LSP 成本，半天工作量）
 
 ## 阶段二：Ren'Py 特有深度功能
 
-- [ ] **诊断缺口**：~~`show`/`scene` 引用未定义 image、`at` 引用未定义 transform、`style` 引用未定义 style~~（v1.8.0 已完成）、未使用 define/default 变量
-- [ ] **翻译 `old`/`new` 一致性诊断**：原文改动后 `old` 字符串失配检测（翻译者最大痛点，已有翻译 ID hover，自然延伸，差异化价值高）
+- [x] **诊断缺口**：`show`/`scene` 引用未定义 image、`at` 引用未定义 transform、`style` 引用未定义 style（v1.8.0）、未使用 define/default 变量（v1.9.0）
+- [x] **翻译工具链**（v1.9.0）：old/new 一致性诊断、对话行 ⇄ tl 条目跳转、按语言覆盖率报告
 - [ ] **Inlay hints / Code lens**：变量类型推断、label 被引用次数（锦上添花，低优先级）
 - [ ] **ATL / screen 语法专门支持**：LSP 层解析 screen 内部语法（大工程：use、transclude、python 块、位置属性等）
 - [ ] **Semantic tokens**：语义级高亮修正 regex TextMate 高亮误判（中等优先级）

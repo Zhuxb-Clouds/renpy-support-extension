@@ -12,6 +12,8 @@
   - 未定义的 `jump`/`call` label、重复的 label/screen 定义、缺失的图像文件、未使用的 label
   - `show`/`scene`/`hide` 引用未定义的 image、`at` 引用未知的 transform、`style x is parent` 的父样式不存在
 - **快速修复** — 针对诊断的 Code Action：一键创建缺失的 label、删除未使用的 label 块
+- **签名帮助** — `call label(...)` / `call screen ...(...)` 显示真实参数；语句模板展示可用的子句关键字（`at`、`with`、`fadeout` 等）
+- **翻译工具** — `tl/` 目录的过期翻译诊断、对话行与翻译条目之间的跳转、按语言的翻译覆盖率报告
 - **上下文补全** — label、image、transform、transition、screen、style、`define`/`default` 变量（含 `music.` 这类点分命名空间），以及 screen/ATL/style 属性
 - **翻译 ID 悬停** — 悬停对话行可查看 Ren'Py 翻译标识符
 - **Markdown 支持** — Markdown 文件中 Ren'Py 代码块的语法高亮
@@ -37,12 +39,16 @@
 | `Ren'Py LSP: Stop Language Server`    | 停止语言服务器                 |
 | `Ren'Py LSP: Restart Language Server` | 重启语言服务器                 |
 | `Ren'Py LSP: Format All Ren'Py Files` | 格式化工作区中所有 `.rpy` 文件 |
+| `Ren'Py LSP: Show Translation Report` | 按语言显示翻译覆盖率 |
+| `Ren'Py LSP: Run Ren'Py Lint` | 运行 Ren'Py SDK 的 lint（需设置 `renpy-lsp.sdkPath`） |
+| `Ren'Py LSP: Launch Project` | 通过 SDK 启动游戏 |
 
 ## 设置
 
 | 设置项                            | 默认值 | 描述                                       |
 | --------------------------------- | ------ | ------------------------------------------ |
 | `renpy-lsp.pythonPath`            | `""`   | 自定义 Python 解释器路径（留空则自动检测） |
+| `renpy-lsp.sdkPath`               | `""`   | Ren'Py SDK 目录（启用 lint 与启动游戏命令） |
 | `renpy-lsp.formatting.enabled`    | `true` | 启用文档格式化                             |
 | `renpy-lsp.formatting.indentSize` | `4`    | 每级缩进的空格数                           |
 | `renpy-lsp.formatting.blankLines` | `collapse` | 空行处理：`preserve`（不动）、`collapse`（折叠为一行）、`betweenSay`（另在 `label` 脚本块内的对白/旁白行之间插入空行）、`strip`（全部删除） |

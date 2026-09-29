@@ -1,5 +1,24 @@
 # Changelog
 
+## [1.9.0] - 2026-09-29
+
+### Added
+
+- **Signature help** (`textDocument/signatureHelp`) — typing `call label(...)` or `call screen name(...)` shows the target's real parameters from the workspace with per-argument highlighting; clause layouts for `show`/`scene`/`hide`/`play`/`queue`/`stop`/`camera`/`with`/`define`/`label`/… show the accepted clause keywords (`at`, `with`, `fadeout`, …) with the active clause tracked from the cursor.
+- **Unused variable diagnostics** — `define`/`default` names never used outside their own definition line are hinted with the *Unnecessary* tag (`unused-define`). Word-based usage scan across the workspace (false-negative by design, so dialogue text containing the name keeps it "used"); dotted namespaces, `_`-prefixed internals, and engine-read names like `save_name` are exempt.
+- **Translation tooling for `tl/` directories**
+  - Consistency diagnostics: `old`/`new` pairing errors (`translation-missing-new`/`-missing-old`, errors), `old` strings no longer present in the project (`translation-stale`, warning), and dialogue blocks whose `<label>_<hash>` id no longer matches any source say statement (`translation-stale`).
+  - Translation navigation: go-to-definition from a dialogue line jumps to its `translate` entry in `tl/` (dialogue block by translation id, `strings` block by `old` text); from a tl entry (`new` line, dialogue line, or `translate` header) jumps back to the source line.
+  - **Show Translation Report** command — per-language coverage (dialogue translated/total, stale counts, `strings` pairs) with a sample of stale entries in the Output channel.
+- **Ren'Py SDK integration** (client-side)
+  - New `renpy-lsp.sdkPath` setting pointing at the SDK directory.
+  - **Run Ren'Py Lint** command — runs the SDK's `lint`, parses `lint.txt`/stdout into the Problems panel (collection `renpy-lint`) and the Output channel.
+  - **Launch Project** command — launches the game through the SDK launcher.
+
+### Changed
+
+- New server modules: `translation.py` (tl checks/navigation/reporting — the translation-id helpers moved out of `lsp_server.py`) and `signatures.py`. Test suite grew 66 → 86 (`test_signatures.py`, `test_translation.py`, unused-define cases).
+
 ## [1.8.0] - 2026-09-29
 
 ### Added

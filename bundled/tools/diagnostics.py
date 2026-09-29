@@ -18,7 +18,7 @@ from __future__ import annotations
 import os
 import threading
 import time as _time
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from lsprotocol import types
 
@@ -27,6 +27,8 @@ from renpy_data import RENPY_TRANSFORMS, RENPY_BUILTIN_STYLES
 
 import server_context as ctx
 from server_context import LSP_SERVER, _log
+
+import translation
 
 # Labels that are script entry points — never referenced via jump/call.
 ENTRY_LABELS = {"start", "main_menu", "splashscreen", "after_load", "quit"}
@@ -340,10 +342,76 @@ def _check_style_references(uri: str, parser: RpyParser, diags: List) -> None:
         )
 
 
-def _collect_full_diagnostics(uri: str, parser: RpyParser) -> List[types.Diagnostic]:
+def _check_unused_defines(
+    uri: str, parser: RpyParser, diags: List, text: Optional[str] = None
+) -> None:
+    """Hint on ``define``/``default`` names never used outside their own
+    definition line(s).
+
+    Usage is a plain word occurrence in any workspace file (dialogue text
+    counts, so false negatives are possible but false positives are not).
+    Dotted namespaces and ``_``-prefixed internals are skipped.
+    """
+    from server_context import _ENGINE_READ_NAMES
+
+    candidates: Dict[str, set] = {}  # name → own definition lines
+    for d in parser.get_all_defines() + parser.get_all_defaults():
+        name = d.name
+        if not name or "." in name or name.startswith("_"):
+            continue
+        if name in _ENGINE_READ_NAMES:
+            continue
+        candidates.setdefault(name, set()).add(d.lineno)
+    if not candidates:
+        return
+
+    # Which names are used outside their definition lines?
+    unused = {name: lines for name, lines in candidates.items()}
+    file_uris = {uri}  # current file first (covers non-workspace files)
+    try:
+        workspace_files = ctx._get_workspace_rpy_files()
+    except Exception:
+        workspace_files = []  # workspace not initialized (e.g. in tests)
+    for fp in workspace_files:
+        try:
+            file_uris.add(ctx._get_parse_for_file(fp)[0])
+        except Exception:
+            continue
+    for file_uri in file_uris:
+        if not unused:
+            break
+        words = ctx._file_word_lines(file_uri)
+        if not words and file_uri == uri and text is not None:
+            # No cache entry for the current file (e.g. tests) — use the
+            # text we were handed instead.
+            words = ctx._word_map_from_text(text)
+        for name in list(unused):
+            own = candidates[name] if file_uri == uri else ()
+            for lineno in words.get(name, ()):
+                if lineno not in own:
+                    unused.pop(name)
+                    break
+
+    for d in parser.get_all_defines() + parser.get_all_defaults():
+        if d.name in unused:
+            diags.append(
+                _diag(
+                    d.lineno,
+                    f'Variable "{d.name}" is defined but never used',
+                    types.DiagnosticSeverity.Hint,
+                    "unused-define",
+                    tags=[types.DiagnosticTag.Unnecessary],
+                )
+            )
+
+
+def _collect_full_diagnostics(
+    uri: str, parser: RpyParser, text: Optional[str] = None
+) -> List[types.Diagnostic]:
     """All diagnostics for *uri*: syntax checks plus cross-workspace checks.
 
     Pure with respect to the workspace index — callers publish the result.
+    *text* is the document source when the parse cache may not hold it.
     """
     diags: List[types.Diagnostic] = []
     diags.extend(_collect_light_diagnostics(parser))
@@ -351,9 +419,11 @@ def _collect_full_diagnostics(uri: str, parser: RpyParser) -> List[types.Diagnos
     _check_duplicate_definitions(uri, diags)
     _check_missing_image_files(uri, parser, diags)
     _check_unused_labels(uri, parser, diags)
+    _check_unused_defines(uri, parser, diags, text)
     _check_image_references(uri, parser, diags)
     _check_transform_references(uri, parser, diags)
     _check_style_references(uri, parser, diags)
+    translation.check_translations(uri, parser, diags)
     return diags
 
 
@@ -401,9 +471,12 @@ def _publish_diagnostics(uri: str):
     _log.info("_publish_diagnostics: %s", ctx._short_uri(uri))
     t0 = _time.monotonic()
     _ast, parser = ctx._get_parse(uri)
+    with ctx._cache_lock:
+        cached = ctx._parse_cache.get(uri)
+    text = cached[1] if cached else None
     # Ensure workspace index is up-to-date for the current file
     ctx._workspace_index.update_file(uri)
-    diags = _collect_full_diagnostics(uri, parser)
+    diags = _collect_full_diagnostics(uri, parser, text)
 
     elapsed = (_time.monotonic() - t0) * 1000
     _log.info(

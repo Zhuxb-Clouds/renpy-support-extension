@@ -10,7 +10,6 @@ from __future__ import annotations
 import os
 import re
 import sys
-import hashlib
 
 # Ensure the bundled/tools directory is on sys.path so we can import ast_parser.
 _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -90,8 +89,11 @@ from diagnostics import (
 )
 from completion import _completion_items_for_context
 import code_actions
+import signatures
+import translation
+from translation import _renpy_translate_id, _find_say_at_line
 
-from typing import Dict, Generator, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 from pathlib import Path
 import time as _time
 
@@ -483,6 +485,11 @@ def goto_definition(
         if loc:
             return loc if isinstance(loc, list) else [loc]
 
+    # ── 1.5) Translation navigation: dialogue line ⇄ tl entry ──
+    trans_locs = translation.find_translation_jump(uri, pos.line, parser)
+    if trans_locs:
+        return trans_locs
+
     # ── 2) Quoted string → file path ──
     quoted = _extract_quoted_string(line_text, col)
     if quoted:
@@ -716,6 +723,34 @@ def code_action(
     return actions or None
 
 
+# ─────────────────────── Signature Help ──────────────────────────────────
+
+
+@LSP_SERVER.feature(
+    types.TEXT_DOCUMENT_SIGNATURE_HELP,
+    types.SignatureHelpOptions(trigger_characters=["(", ",", " "]),
+)
+def signature_help(
+    ls: LanguageServer, params: types.SignatureHelpParams
+) -> Optional[types.SignatureHelp]:
+    uri = params.text_document.uri
+    doc = ls.workspace.get_text_document(uri)
+    line_text = (
+        doc.lines[params.position.line]
+        if params.position.line < len(doc.lines)
+        else ""
+    )
+    col = _utf16_col_to_utf32(line_text, params.position.character)
+    result = signatures.compute_signature_help(doc.lines, params.position.line, col)
+    _log.debug(
+        "signatureHelp: %s L%d → %s",
+        _short_uri(uri),
+        params.position.line + 1,
+        "sig" if result else "none",
+    )
+    return result
+
+
 # ─────────────────────── Hover ───────────────────────────────────────────
 
 # Keyword documentation lives in renpy_data.KEYWORD_DOCS.
@@ -835,77 +870,6 @@ def hover(ls: LanguageServer, params: types.HoverParams) -> Optional[types.Hover
     return None
 
 
-# ─────────────────────── Translation ID helpers ─────────────────────────
-
-
-def _say_get_code(who: Optional[str], what: str) -> str:
-    """Reproduce Ren'Py ``Say.get_code()`` for simple say statements.
-
-    Our parser's ``Say.what`` is captured verbatim from the source between
-    quotes (escapes preserved), which matches the output of Ren'Py's
-    ``encode_say_string(parsed_what)``. So we just wrap it in quotes.
-    """
-    parts: List[str] = []
-    if who:
-        parts.append(who)
-    parts.append('"' + what + '"')
-    return " ".join(parts)
-
-
-def _renpy_translate_id(label: Optional[str], who: Optional[str], what: str) -> str:
-    """Compute a Ren'Py-compatible translation identifier.
-
-    Algorithm (from ``renpy/translation/__init__.py`` — ``Restructurer``):
-      1. ``code = Say.get_code()``
-      2. ``md5.update((code + '\\r\\n').encode('utf-8'))``
-      3. ``digest = md5.hexdigest()[:8]``
-      4. With label: ``label.replace('.', '_') + '_' + digest``
-         Without label: just ``digest``
-    """
-    code = _say_get_code(who, what)
-    md5 = hashlib.md5()
-    md5.update((code + "\r\n").encode("utf-8"))
-    digest = md5.hexdigest()[:8]
-    if label is None:
-        return digest
-    return label.replace(".", "_") + "_" + digest
-
-
-def _collect_dialogue_with_labels(
-    nodes: List[Node], current_label: Optional[str] = None
-) -> Generator[Tuple[Union[Say, NarratorSay], Optional[str]], None, None]:
-    """Walk *nodes* recursively, yielding ``(say_node, enclosing_label_name)``."""
-    for node in nodes:
-        if isinstance(node, Label):
-            current_label = node.name
-        if isinstance(node, (Say, NarratorSay)):
-            yield node, current_label
-        # Recurse into children (body, elif, else, menu items, …)
-        children: List[Node] = []
-        if hasattr(node, "body") and isinstance(node.body, list):
-            children.extend(node.body)
-        if isinstance(node, If):
-            for ec in node.elif_clauses:
-                children.append(ec)
-                children.extend(ec.body)
-            children.extend(node.else_body)
-        if isinstance(node, Menu):
-            children.extend(node.body)
-        if children:
-            yield from _collect_dialogue_with_labels(children, current_label)
-
-
-def _find_say_at_line(
-    uri: str, line: int
-) -> Optional[Tuple[Union[Say, NarratorSay], Optional[str]]]:
-    """Return the Say/NarratorSay node at *line* (0-based) and its enclosing label, if any."""
-    ast, parser = ctx._get_parse(uri)
-    if ast is None:
-        return None
-    for node, label_name in _collect_dialogue_with_labels(ast.body):
-        if node.lineno - 1 == line:
-            return node, label_name
-    return None
 
 
 # ─────────────────────── Formatting (indentation-normalizer) ─────────────
@@ -1955,6 +1919,21 @@ def cmd_show_stats() -> Dict[str, object]:
         "dialogueLines": total_dialogue_lines,
         "words": total_words,
     }
+
+
+# ─────────────────────── Translation Report ──────────────────────────────
+
+
+@LSP_SERVER.command("renpy.translationReport")
+def cmd_translation_report() -> Dict[str, object]:
+    """Per-language translation coverage (dialogue + strings blocks)."""
+    report = translation.translation_report()
+    _log.info(
+        "translationReport: %d source lines, %d language(s)",
+        report["sourceDialogue"],
+        len(report["languages"]),
+    )
+    return report
 
 
 # ─────────────────────── Entry Point ─────────────────────────────────────

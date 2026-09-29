@@ -12,6 +12,8 @@ A Visual Studio Code extension providing language support for Ren'Py script file
   - Undefined `jump`/`call` labels, duplicate label/screen definitions, missing image files, unused labels
   - `show`/`scene`/`hide` of undefined images, `at` clauses referencing unknown transforms, `style x is parent` with an unknown parent
 - **Quick Fixes** — Code Actions on diagnostics: create a missing label with one click, delete an unused label block
+- **Signature Help** — `call label(...)` / `call screen ...(...)` show real parameters; statement templates document clause keywords (`at`, `with`, `fadeout`, …)
+- **Translation Tools** — stale-translation diagnostics for `tl/` files, go-to-definition between dialogue and its translation entry, and a per-language **Translation Report**
 - **Context-Aware Completion** — labels, images, transforms, transitions, screens, styles, `define`/`default` variables (including dotted namespaces like `music.`), and screen/ATL/style properties
 - **Translation ID Hover** — hovering a dialogue line shows the Ren'Py translation identifier
 - **Markdown Support** — Syntax highlighting for Ren'Py code blocks in Markdown files
@@ -37,12 +39,16 @@ Open Command Palette (`Ctrl+Shift+P` / `Cmd+Shift+P`) and type:
 | `Ren'Py LSP: Stop Language Server` | Stop the LSP server |
 | `Ren'Py LSP: Restart Language Server` | Restart the LSP server |
 | `Ren'Py LSP: Format All Ren'Py Files` | Format all `.rpy` files in workspace |
+| `Ren'Py LSP: Show Translation Report` | Per-language translation coverage |
+| `Ren'Py LSP: Run Ren'Py Lint` | Run the Ren'Py SDK lint (requires `renpy-lsp.sdkPath`) |
+| `Ren'Py LSP: Launch Project` | Launch the game via the SDK launcher |
 
 ## Settings
 
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `renpy-lsp.pythonPath` | `""` | Custom Python interpreter path (auto-detect if empty) |
+| `renpy-lsp.sdkPath` | `""` | Ren'Py SDK directory (enables the lint & launch commands) |
 | `renpy-lsp.formatting.enabled` | `true` | Enable document formatting |
 | `renpy-lsp.formatting.indentSize` | `4` | Spaces per indentation level |
 | `renpy-lsp.formatting.blankLines` | `collapse` | Blank-line handling: `preserve` (untouched), `collapse` (fold consecutive to one), `betweenSay` (also insert one between dialogue/narration lines inside `label` blocks), `strip` (remove all) |

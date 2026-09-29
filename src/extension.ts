@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import * as path from "path";
 import * as fs from "fs-extra";
+import { spawn, ChildProcess } from "child_process";
 import {
   LanguageClient,
   LanguageClientOptions,
@@ -13,6 +14,7 @@ let extensionContext: vscode.ExtensionContext | undefined;
 
 // ─── Output Channel Logger ─────────────────────────────────────────────
 const outputChannel = vscode.window.createOutputChannel("Ren'Py LSP");
+const lintDiagnostics = vscode.languages.createDiagnosticCollection("renpy-lint");
 
 function log(msg: string) {
   const ts = new Date().toISOString();
@@ -152,6 +154,7 @@ export function activate(context: vscode.ExtensionContext) {
     `Workspace folders: ${(vscode.workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath).join(", ") || "(none)"}`,
   );
   extensionContext = context;
+  context.subscriptions.push(lintDiagnostics);
 
   // Commands
   context.subscriptions.push(
@@ -179,6 +182,18 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand("renpy-lsp.showStats", () => {
       log("Command: showStats");
       showProjectStats();
+    }),
+    vscode.commands.registerCommand("renpy-lsp.translationReport", () => {
+      log("Command: translationReport");
+      showTranslationReport();
+    }),
+    vscode.commands.registerCommand("renpy-lsp.runLint", () => {
+      log("Command: runLint");
+      runRenpyLint();
+    }),
+    vscode.commands.registerCommand("renpy-lsp.launchProject", () => {
+      log("Command: launchProject");
+      launchProject();
     }),
 
   );
@@ -422,6 +437,281 @@ async function showProjectStats() {
     logError("showProjectStats: request failed", err);
     vscode.window.showErrorMessage(`Ren'Py LSP: Error getting statistics: ${err}`);
   }
+}
+
+// ─── Translation Report ────────────────────────────────────────────────
+
+interface StaleSample {
+  file: string;
+  line: number;
+  old?: string;
+  id?: string;
+}
+
+interface LanguageReport {
+  language: string;
+  translatedDialogue: number;
+  staleDialogue: number;
+  stringsPairs: number;
+  staleStrings: number;
+  missingNew: number;
+  staleSamples: StaleSample[];
+}
+
+interface TranslationReport {
+  sourceDialogue: number;
+  languages: LanguageReport[];
+}
+
+async function showTranslationReport() {
+  log("showTranslationReport: requesting report from server");
+  if (!client) {
+    logWarn("showTranslationReport: server not running");
+    vscode.window.showWarningMessage("Ren'Py LSP: Language server is not running.");
+    return;
+  }
+
+  let report: TranslationReport;
+  try {
+    report = (await client.sendRequest("workspace/executeCommand", {
+      command: "renpy.translationReport",
+      arguments: [],
+    })) as TranslationReport;
+  } catch (err) {
+    logError("showTranslationReport: request failed", err);
+    vscode.window.showErrorMessage(`Ren'Py LSP: Error building translation report: ${err}`);
+    return;
+  }
+  if (!report) {
+    vscode.window.showWarningMessage("Ren'Py LSP: Failed to build translation report.");
+    return;
+  }
+
+  if (!report.languages.length) {
+    vscode.window.showInformationMessage(
+      `Ren'Py LSP: No translations found (no tl/ directory). ` +
+      `${report.sourceDialogue} source dialogue line(s) in the project.`,
+    );
+    return;
+  }
+
+  const summary = report.languages
+    .map((lang) => {
+      const done = lang.translatedDialogue;
+      const total = report.sourceDialogue;
+      const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+      const issues: string[] = [];
+      if (lang.staleDialogue > 0) issues.push(`${lang.staleDialogue} stale`);
+      if (lang.staleStrings > 0) issues.push(`${lang.staleStrings} stale strings`);
+      if (lang.missingNew > 0) issues.push(`${lang.missingNew} missing new`);
+      const issueStr = issues.length ? ` ⚠ ${issues.join(", ")}` : "";
+      return `🌐 ${lang.language}: ${done}/${total} dialogue (${pct}%)${issueStr}`;
+    })
+    .join("\n");
+
+  // Full detail (stale samples) goes to the output channel.
+  outputChannel.appendLine(`\n[Translation report] ${new Date().toISOString()}`);
+  outputChannel.appendLine(`Source dialogue lines: ${report.sourceDialogue}`);
+  for (const lang of report.languages) {
+    outputChannel.appendLine(
+      `\n## ${lang.language}: ${lang.translatedDialogue}/${report.sourceDialogue} dialogue translated`,
+    );
+    outputChannel.appendLine(
+      `   strings pairs: ${lang.stringsPairs} (stale: ${lang.staleStrings}, missing new: ${lang.missingNew}), ` +
+      `stale dialogue: ${lang.staleDialogue}`,
+    );
+    if (lang.staleSamples.length) {
+      outputChannel.appendLine("   stale entries:");
+      for (const s of lang.staleSamples) {
+        const what = s.old !== undefined ? `old="${s.old}"` : `id=${s.id}`;
+        outputChannel.appendLine(`     - ${s.file}:${s.line} ${what}`);
+      }
+    }
+  }
+  outputChannel.show(true);
+
+  const choice = await vscode.window.showInformationMessage(
+    `Ren'Py Translation Report:\n\n${summary}`,
+    { modal: true },
+    "Copy to Clipboard",
+  );
+  if (choice === "Copy to Clipboard") {
+    await vscode.env.clipboard.writeText(summary);
+    vscode.window.showInformationMessage("Report copied to clipboard!");
+  }
+}
+
+// ─── Ren'Py SDK integration (lint / launch) ────────────────────────────
+
+/** Resolve the Ren'Py launcher inside the configured `renpy-lsp.sdkPath`. */
+function resolveSdkBinary(): string | undefined {
+  const cfg = vscode.workspace.getConfiguration("renpy-lsp");
+  const sdkPath: string = cfg.get<string>("sdkPath", "").trim();
+  if (!sdkPath) {
+    logWarn("resolveSdkBinary: renpy-lsp.sdkPath is not configured");
+    vscode.window
+      .showErrorMessage(
+        "Ren'Py LSP: set renpy-lsp.sdkPath to your Ren'Py SDK directory first.",
+        "Open Settings",
+      )
+      .then((choice) => {
+        if (choice === "Open Settings") {
+          vscode.commands.executeCommand("workbench.action.openSettings", "renpy-lsp.sdkPath");
+        }
+      });
+    return undefined;
+  }
+  const candidates = [
+    "renpy.sh",
+    "renpy",
+    "renpy.exe",
+    "renpy.cmd",
+    path.join("lib", "linux-x86_64", "renpy"),
+  ].map((rel) => path.join(sdkPath, rel));
+  for (const candidate of candidates) {
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK);
+      log(`resolveSdkBinary: using "${candidate}"`);
+      return candidate;
+    } catch {
+      // try next candidate
+    }
+  }
+  logError(`resolveSdkBinary: no launcher found in "${sdkPath}"`);
+  vscode.window.showErrorMessage(
+    `Ren'Py LSP: no Ren'Py launcher (renpy.sh / renpy.exe) found in "${sdkPath}".`,
+  );
+  return undefined;
+}
+
+function projectRoot(): vscode.WorkspaceFolder | undefined {
+  const root = vscode.workspace.workspaceFolders?.[0];
+  if (!root) {
+    vscode.window.showErrorMessage("Ren'Py LSP: no workspace folder is open.");
+  }
+  return root;
+}
+
+interface LintHit {
+  file: string;
+  line: number;
+  message: string;
+}
+
+/** Parse lint report lines: `game/script.rpy:23 message…` (continuation
+ * lines are appended to the previous hit). */
+export function parseLintReport(text: string): LintHit[] {
+  const lineRe = /^(\S+?\.(?:rpy|rpym)):(\d+)\s+(.*)$/;
+  const hits: LintHit[] = [];
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.replace(/\t/g, "    ");
+    const m = lineRe.exec(line);
+    if (m) {
+      hits.push({ file: m[1], line: parseInt(m[2], 10), message: m[3].trim() });
+    } else if (hits.length && line.trim() && line.trim() !== "-".repeat(8)) {
+      const last = hits[hits.length - 1];
+      last.message += (last.message ? " " : "") + line.trim();
+    }
+  }
+  return hits;
+}
+
+async function runRenpyLint() {
+  log("runRenpyLint: starting");
+  const binary = resolveSdkBinary();
+  if (!binary) {
+    return;
+  }
+  const root = projectRoot();
+  if (!root) {
+    return;
+  }
+
+  let stdout = "";
+  let exitCode: number | null = null;
+  const finished = new Promise<void>((resolve) => {
+    const child: ChildProcess = spawn(binary, [root.uri.fsPath, "lint"], {
+      cwd: root.uri.fsPath,
+    });
+    child.stdout?.on("data", (d) => (stdout += String(d)));
+    child.stderr?.on("data", (d) => (stdout += String(d)));
+    child.on("error", (err) => {
+      logError("runRenpyLint: spawn failed", err);
+      vscode.window.showErrorMessage(`Ren'Py LSP: failed to run lint: ${err.message}`);
+      resolve();
+    });
+    child.on("close", (code) => {
+      exitCode = code;
+      resolve();
+    });
+  });
+  await finished;
+
+  // Ren'Py writes the report next to the game data.
+  let reportText = stdout;
+  for (const candidate of [
+    path.join(root.uri.fsPath, "lint.txt"),
+    path.join(root.uri.fsPath, "game", "lint.txt"),
+  ]) {
+    if (fs.existsSync(candidate)) {
+      reportText = fs.readFileSync(candidate, "utf-8");
+      break;
+    }
+  }
+
+  lintDiagnostics.clear();
+  const byFile = new Map<string, vscode.Diagnostic[]>();
+  for (const hit of parseLintReport(reportText)) {
+    const abs = path.resolve(root.uri.fsPath, hit.file);
+    const uri = vscode.Uri.file(abs);
+    const range = new vscode.Range(
+      Math.max(0, hit.line - 1), 0,
+      Math.max(0, hit.line - 1), 999,
+    );
+    const diag = new vscode.Diagnostic(
+      range,
+      hit.message,
+      vscode.DiagnosticSeverity.Warning,
+    );
+    diag.source = "renpy-lint";
+    const list = byFile.get(uri.toString()) ?? [];
+    list.push(diag);
+    byFile.set(uri.toString(), list);
+  }
+  for (const [key, diags] of byFile) {
+    lintDiagnostics.set(vscode.Uri.parse(key), diags);
+  }
+
+  outputChannel.appendLine(`\n[Ren'Py lint] exit=${exitCode}, ${byFile.size} file(s) with findings`);
+  outputChannel.appendLine(reportText || "(no lint output)");
+  vscode.window.showInformationMessage(
+    `Ren'Py Lint: ${byFile.size} file(s) with findings — see Problems and the Output channel.`,
+  );
+  log(`runRenpyLint: done, exit=${exitCode}`);
+}
+
+async function launchProject() {
+  log("launchProject: starting");
+  const binary = resolveSdkBinary();
+  if (!binary) {
+    return;
+  }
+  const root = projectRoot();
+  if (!root) {
+    return;
+  }
+  const child = spawn(binary, [root.uri.fsPath], {
+    cwd: root.uri.fsPath,
+    detached: true,
+    stdio: "ignore",
+  });
+  child.on("error", (err) => {
+    logError("launchProject: spawn failed", err);
+    vscode.window.showErrorMessage(`Ren'Py LSP: failed to launch the game: ${err.message}`);
+  });
+  child.unref();
+  log(`launchProject: launched ${binary} ${root.uri.fsPath}`);
+  vscode.window.showInformationMessage("Ren'Py LSP: launching the game…");
 }
 
 // ─── Server lifecycle ──────────────────────────────────────────────────

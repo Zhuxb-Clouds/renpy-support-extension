@@ -2,7 +2,7 @@
   "name": "renpy-support-extension",
   "publisher": "zhuxb-clouds",
   "displayName": "Ren'Py Language Support",
-  "version": "1.8.0",
+  "version": "1.9.0",
   "description": "Language support for Ren'Py script files (.rpy)",
   "icon": "icons/renpy.png",
   "main": "./dist/extension.js",
@@ -141,6 +141,21 @@
         "command": "renpy-lsp.showStats",
         "title": "Show Project Statistics",
         "category": "Ren'Py LSP"
+      },
+      {
+        "command": "renpy-lsp.translationReport",
+        "title": "Show Translation Report",
+        "category": "Ren'Py LSP"
+      },
+      {
+        "command": "renpy-lsp.runLint",
+        "title": "Run Ren'Py Lint",
+        "category": "Ren'Py LSP"
+      },
+      {
+        "command": "renpy-lsp.launchProject",
+        "title": "Launch Project",
+        "category": "Ren'Py LSP"
       }
     ],
     "configuration": {
@@ -150,6 +165,11 @@
           "type": "string",
           "default": "",
           "markdownDescription": "Absolute path to the Python 3 interpreter used to run the language server. Leave empty to auto-detect (tries `.venv/bin/python3`, then system `python3`)."
+        },
+        "renpy-lsp.sdkPath": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Path to the Ren'Py SDK directory (the one containing `renpy.sh` / `renpy.exe`). Enables the **Run Ren'Py Lint** and **Launch Project** commands."
         },
         "renpy-lsp.formatting.enabled": {
           "type": "boolean",

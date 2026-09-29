@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from textwrap import dedent
 
 import server_context as ctx
@@ -52,9 +53,10 @@ def patch_index(monkeypatch, parser: RpyParser, *, image_files=None) -> None:
 
 
 def collect(monkeypatch, source: str, **kwargs) -> list:
+    text = __import__("textwrap").dedent(source).strip("\n") + "\n"
     parser = parse(source)
     patch_index(monkeypatch, parser, **kwargs)
-    return diagnostics._collect_full_diagnostics(URI, parser)
+    return diagnostics._collect_full_diagnostics(URI, parser, text)
 
 
 def codes(diags) -> list:
@@ -108,6 +110,64 @@ def test_missing_image_file_in_image_definition(monkeypatch) -> None:
         'image bg = "images/nope.png"\nlabel start:\n    "hi"\n',
     )
     assert "missing-image-file" in codes(diags)
+
+
+# ── new: unused define/default variables ─────────────────────────────────
+
+
+def test_unused_define_is_hinted(monkeypatch) -> None:
+    diags = collect(
+        monkeypatch,
+        'define lonely = Character("nobody")\nlabel start:\n    "hi"\n',
+    )
+    unused = [d for d in diags if str(d.code) == "unused-define"]
+    assert len(unused) == 1
+    assert unused[0].severity == types.DiagnosticSeverity.Hint
+    assert types.DiagnosticTag.Unnecessary in unused[0].tags
+    assert 'Variable "lonely"' in unused[0].message
+
+
+def test_used_define_is_not_hinted(monkeypatch) -> None:
+    diags = collect(
+        monkeypatch,
+        'define e = Character("Eileen")\nlabel start:\n    e "hi"\n',
+    )
+    assert "unused-define" not in codes(diags)
+
+
+def test_define_used_in_other_file_is_not_hinted(monkeypatch, tmp_path) -> None:
+    other = tmp_path / "other.rpy"
+    other.write_text('label other:\n    $ lonely()\n', encoding="utf-8")
+    monkeypatch.setattr(
+        ctx, "_get_workspace_rpy_files", lambda: [str(other)]
+    )
+
+    def fake_parse(path):
+        uri = ctx._uri_from_path(path)
+        text = Path(path).read_text(encoding="utf-8")
+        parser = RpyParser(text)
+        parser.parse()
+        with ctx._cache_lock:
+            ctx._parse_cache[uri] = (hash(text), text, parser.root, parser)
+        return uri, parser.root, parser
+
+    monkeypatch.setattr(ctx, "_get_parse_for_file", fake_parse)
+    diags = collect(
+        monkeypatch,
+        'define lonely = Character("nobody")\nlabel start:\n    "hi"\n',
+    )
+    assert "unused-define" not in codes(diags)
+
+
+def test_dotted_and_underscore_defines_are_skipped(monkeypatch) -> None:
+    diags = collect(
+        monkeypatch,
+        'define music.track = "a.ogg"\n'
+        "define _internal = 1\n"
+        "define save_name = \"save\"\n"
+        'label start:\n    "hi"\n',
+    )
+    assert "unused-define" not in codes(diags)
 
 
 # ── new: undefined image references ──────────────────────────────────────

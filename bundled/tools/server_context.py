@@ -66,7 +66,7 @@ _logging.getLogger("pygls.protocol.json_rpc").setLevel(_logging.ERROR)
 
 MAX_WORKERS = 4
 LSP_SERVER = LanguageServer(
-    name="renpy-server", version="1.8.0", max_workers=MAX_WORKERS
+    name="renpy-server", version="1.9.0", max_workers=MAX_WORKERS
 )
 
 # ── Server logger (prints to stderr, which VS Code captures in the Output channel) ──
@@ -579,6 +579,46 @@ def _all_workspace_python_names() -> set:
         _uri, defs = _find_python_definitions_in_py_file(fp)
         names.update(defs)
     return names
+
+
+# uri → (content_hash, {word: [1-based line numbers]})
+_word_map_cache: Dict[str, Tuple[int, Dict[str, List[int]]]] = {}
+
+# Variables the Ren'Py engine reads without any script reference — never
+# reported as unused.
+_ENGINE_READ_NAMES = {"save_name"}
+
+
+def _word_map_from_text(text: str) -> Dict[str, List[int]]:
+    """Word → 1-based line numbers for *text* (pure)."""
+    words: Dict[str, List[int]] = {}
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        for word in re.findall(r"\w+", line):
+            lines_for_word = words.get(word)
+            if lines_for_word is None:
+                words[word] = [lineno]
+            else:
+                lines_for_word.append(lineno)
+    return words
+
+
+def _file_word_lines(uri: str) -> Dict[str, List[int]]:
+    """Word → line-number map of *uri*'s cached text, cached per version.
+
+    Backs the unused-define diagnostic, which needs to know whether a
+    candidate name occurs anywhere outside its own definition line.
+    """
+    with _cache_lock:
+        cached = _parse_cache.get(uri)
+    if not cached:
+        return {}
+    content_hash, text = cached[0], cached[1]
+    hit = _word_map_cache.get(uri)
+    if hit and hit[0] == content_hash:
+        return hit[1]
+    words = _word_map_from_text(text)
+    _word_map_cache[uri] = (content_hash, words)
+    return words
 
 
 def _find_python_var_across_workspace(
