@@ -55,12 +55,19 @@ jobs:
         run: pnpm run vsix
 
       - name: Publish to VS Code Marketplace
+        id: marketplace-publish
         if: env.VSCE_PAT != ''
+        continue-on-error: true
         run: pnpm exec vsce publish --no-dependencies
 
-      - name: Warn about missing VSCE_PAT
-        if: env.VSCE_PAT == ''
-        run: echo "::warning::VSCE_PAT secret is not set; skipped Marketplace publish (GitHub Release only)"
+      - name: Report Marketplace publish outcome
+        if: always()
+        run: |
+          if [ "${{ steps.marketplace-publish.outcome }}" = "failure" ]; then
+            echo "::warning::Marketplace publish failed (see its log above); continuing with the GitHub Release"
+          elif [ "${{ steps.marketplace-publish.outcome }}" = "skipped" ]; then
+            echo "::warning::VSCE_PAT secret is not set; skipped Marketplace publish (GitHub Release only)"
+          fi
 
       - name: Extract release notes from CHANGELOG.md
         run: |
