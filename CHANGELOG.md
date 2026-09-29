@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.6.3] - 2026-08-19
+
+### Fixed
+
+- Fixed the formatter leaving a stray space after prefix (unary / splat) operators, e.g. `def f(label, * args):` and `pos (45, - 400)` were left untouched instead of being tightened to `*args` and `-400`. Prefix `*` / `**` / `-` / `+` followed by an operand are now collapsed; binary operators (including `a - -b`) keep their spacing.
+
 ## [1.6.2] - 2026-08-19
 
 ### Fixed

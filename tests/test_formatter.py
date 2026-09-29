@@ -30,6 +30,83 @@ def test_normalize_binary_star_spacing_avoids_strings_comments_and_star_args() -
     )
 
 
+def test_normalize_expression_spacing_tightens_splat_operators() -> None:
+    # A stray space after a splat ``*`` / ``**`` is collapsed so ``* args``
+    # becomes ``*args``.
+    assert (
+        lsp_server._normalize_expression_spacing("def set_current_label(label, * args):")
+        == "def set_current_label(label, *args):"
+    )
+    assert (
+        lsp_server._normalize_expression_spacing("f(* args, ** kwargs)")
+        == "f(*args, **kwargs)"
+    )
+    assert (
+        lsp_server._normalize_expression_spacing("$ callback(* args, ** kwargs)")
+        == "$ callback(*args, **kwargs)"
+    )
+    # Already-tight splat stays tight.
+    assert (
+        lsp_server._normalize_expression_spacing("$ callback(*args, **kwargs)")
+        == "$ callback(*args, **kwargs)"
+    )
+
+
+def test_normalize_expression_spacing_tightens_unary_minus_and_plus() -> None:
+    # A stray space after a unary ``-`` / ``+`` is collapsed: ``- 400`` → ``-400``.
+    assert (
+        lsp_server._normalize_expression_spacing("pos (45, - 400)")
+        == "pos (45, -400)"
+    )
+    assert (
+        lsp_server._normalize_expression_spacing("pos (45, + 400)")
+        == "pos (45, +400)"
+    )
+    assert (
+        lsp_server._normalize_expression_spacing("(- 400)")
+        == "(-400)"
+    )
+    assert (
+        lsp_server._normalize_expression_spacing("$ x = - 5 + 3")
+        == "$ x = -5 + 3"
+    )
+    # Already-tight unary stays tight.
+    assert (
+        lsp_server._normalize_expression_spacing("pos (45, -400)")
+        == "pos (45, -400)"
+    )
+
+
+def test_normalize_expression_spacing_keeps_binary_op_before_unary_operand() -> None:
+    # ``a - -b`` keeps the binary space and tightens the unary prefix: the
+    # first ``-`` is binary (kept spaced), the second is unary (tightened).
+    assert (
+        lsp_server._normalize_expression_spacing("a - - b")
+        == "a - -b"
+    )
+    assert (
+        lsp_server._normalize_expression_spacing("a - -b")
+        == "a - -b"
+    )
+    assert (
+        lsp_server._normalize_expression_spacing("5 - -400")
+        == "5 - -400"
+    )
+    assert (
+        lsp_server._normalize_expression_spacing("a * *b")
+        == "a * *b"
+    )
+    # Binary operators elsewhere stay spaced.
+    assert (
+        lsp_server._normalize_expression_spacing("5 - 400")
+        == "5 - 400"
+    )
+    assert (
+        lsp_server._normalize_expression_spacing("$ result = a + b * c - 5")
+        == "$ result = a + b * c - 5"
+    )
+
+
 def test_normalize_expression_spacing_for_common_renpy_and_python_syntax() -> None:
     assert (
         lsp_server._normalize_expression_spacing(
@@ -373,4 +450,31 @@ def test_format_collapses_spaced_dashes_in_image_names() -> None:
         '\n'
         'image 便利店-内部:\n'
         '    "#000"\n'
+    )
+
+
+def test_format_tightens_splat_and_unary_operators() -> None:
+    # Regression: a stray space after a splat ``*`` or unary ``-`` was left
+    # in place, producing ``* args`` and ``- 400``.  The formatter now
+    # collapses them to ``*args`` and ``-400``.
+    source = (
+        'init python:\n'
+        '    def set_current_label(label, * args):\n'
+        '        pass\n'
+        '\n'
+        'label start:\n'
+        '    scene bg with dissolve\n'
+        '    show char at center\n'
+        '    $ camera_pos = pos (45, - 400)\n'
+    )
+    assert (
+        _format(source)
+        == 'init python:\n'
+        '    def set_current_label(label, *args):\n'
+        '        pass\n'
+        '\n'
+        'label start:\n'
+        '    scene bg with dissolve\n'
+        '    show char at center\n'
+        '    $ camera_pos = pos (45, -400)\n'
     )

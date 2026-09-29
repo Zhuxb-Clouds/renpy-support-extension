@@ -88,7 +88,7 @@ from urllib.parse import unquote as url_unquote
 
 MAX_WORKERS = 4
 LSP_SERVER = LanguageServer(
-    name="renpy-server", version="1.6.2", max_workers=MAX_WORKERS
+    name="renpy-server", version="1.6.3", max_workers=MAX_WORKERS
 )
 
 # Suppress noisy "Cancel notification for unknown message id" warnings.
@@ -2740,6 +2740,15 @@ def _normalize_expression_spacing(text: str) -> str:
             next_ch = _next_significant(i + 1)
             if _can_be_binary_operator(ch, prev_ch, next_ch):
                 _append_spaced_operator(ch)
+                i = _skip_following_spaces(i + 1)
+                continue
+            # Prefix (unary / splat) operator: tighten it to the following
+            # operand, collapsing any stray space so ``* args`` → ``*args`` and
+            # ``- 400`` → ``-400``.  When the next significant char is itself
+            # an operator/closer (e.g. ``a - -b``) this is a binary operator
+            # whose RHS starts with a unary op — leave the space untouched.
+            if ch in "+-*" and next_ch and next_ch not in ")]},=:+-*/%<>":
+                result.append(ch)
                 i = _skip_following_spaces(i + 1)
                 continue
 
