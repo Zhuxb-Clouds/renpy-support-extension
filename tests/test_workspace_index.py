@@ -79,3 +79,50 @@ label end:
     assert list(transforms) == ["bounce"]
     assert set(labels) == {"start", "end"}
     assert index.get_used_labels() == {"end"}
+
+
+def test_workspace_index_collects_show_as_tags(tmp_path: Path) -> None:
+    game_dir = tmp_path / "game"
+    game_dir.mkdir()
+    (game_dir / "script.rpy").write_text(
+        """
+label begin:
+    show expression chapter_show_display() as chapter_show_display with diss
+    show noel normal at pos_center as noel with diss
+    show plain at left
+    return
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+    parse_cache = {}
+    path_to_uri = {}
+
+    def normalize_path(path: str) -> str:
+        return os.path.normcase(os.path.abspath(path))
+
+    def get_parse_for_file(filepath: str):
+        uri = uri_from_path(filepath)
+        text = Path(filepath).read_text(encoding="utf-8")
+        parser = RpyParser(text)
+        ast = parser.parse()
+        parse_cache[uri] = (hash(text), text, ast, parser)
+        path_to_uri[normalize_path(filepath)] = uri
+        return uri, ast, parser
+
+    server = SimpleNamespace(
+        workspace=SimpleNamespace(
+            folders={"root": SimpleNamespace(uri=uri_from_path(tmp_path))}
+        )
+    )
+    index = WorkspaceIndex(
+        server=server,
+        parse_cache=parse_cache,
+        cache_lock=threading.Lock(),
+        path_to_uri=path_to_uri,
+        path_from_uri_fn=path_from_uri,
+        normalize_path_fn=normalize_path,
+        get_parse_for_file_fn=get_parse_for_file,
+    )
+
+    assert index.get_show_tags() == {"chapter_show_display", "noel"}

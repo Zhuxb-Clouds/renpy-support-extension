@@ -1,13 +1,21 @@
 """Diagnostics for the Ren'Py LSP server.
 
-Two tiers:
+One full pass = syntax-only checks (parser errors, empty ATL blocks) plus
+cross-workspace reference checks (undefined jump/call labels, duplicate
+definitions, missing image files, unused labels/defines, and undefined
+image/transform/style references).
 
-* light — syntax-only checks on the edited file (parser errors, empty ATL
-  blocks).  Runs debounced on every change.
-* full — adds cross-workspace reference checks (undefined jump/call labels,
-  duplicate definitions, missing image files, unused labels, and undefined
-  image/transform/style references).  Runs on open/save via a coalescing
-  background queue.
+Triggers:
+
+* ``didOpen`` — repopulates the client (diagnostics are ephemeral, so a
+  window reload must re-run the pass).
+* ``didChange`` — through a coalescing background queue, so results follow
+  edits without waiting for a save.
+* ``didSave`` — only when ``diagnostics.fullOnSave`` is enabled *and* the
+  content changed since the last pass; otherwise a save re-runs nothing.
+
+Per-check severity overrides (``diagnostics.severity``, including
+``"none"`` to suppress a check entirely) are applied when publishing.
 
 Every diagnostic carries a machine-readable ``code`` so ``code_actions``
 can match quick fixes without regex-ing messages.
@@ -225,9 +233,35 @@ def _strip_image_clauses(image: str) -> str:
     return image.strip()
 
 
-def _image_is_known(image: str, merged_images: Dict[str, list]) -> bool:
+def _split_top_level(text: str, sep: str = ",") -> List[str]:
+    """Split on *sep* only outside parentheses — ``fx_waves(a, b), left``
+    must stay one entry instead of yielding ``b)`` / `` left`` fragments."""
+    parts: List[str] = []
+    current: List[str] = []
+    depth = 0
+    for ch in text:
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        if ch == sep and depth <= 0:
+            parts.append("".join(current))
+            current = []
+        else:
+            current.append(ch)
+    parts.append("".join(current))
+    return parts
+
+
+def _image_is_known(
+    image: str,
+    merged_images: Dict[str, list],
+    known_tags: "set[str]" = frozenset(),
+) -> bool:
     tag = image.split()[0] if " " in image else image
     if image in _BUILTIN_IMAGES or tag in _BUILTIN_IMAGES:
+        return True
+    if image in known_tags or tag in known_tags:
         return True
     if image in merged_images:
         return True
@@ -244,10 +278,19 @@ def _image_is_known(image: str, merged_images: Dict[str, list]) -> bool:
 
 def _check_image_references(uri: str, parser: RpyParser, diags: List) -> None:
     """Warn on ``show``/``scene``/``hide`` of images that are neither defined
-    via ``image`` statements nor auto-detected under ``images/``."""
+    via ``image`` statements nor auto-detected under ``images/``.
+
+    Tags introduced by ``show X as tag`` count as known targets too —
+    ``hide chapter_show_display`` refers to such a tag, not to an image.
+    """
     merged = _merge_current_file_symbols(
         ctx._get_all_workspace_images(), uri, parser.get_all_images()
     )
+    known_tags = set(ctx._get_all_workspace_show_tags())
+    for cls in (Show, Scene):
+        for node in parser._collect(parser.root, cls):
+            if node.as_tag:
+                known_tags.add(node.as_tag)
     for cls in (Scene, Show, Hide):
         for node in parser._collect(parser.root, cls):
             raw = (node.image or "").strip()
@@ -257,7 +300,7 @@ def _check_image_references(uri: str, parser: RpyParser, diags: List) -> None:
             if lowered.startswith(("expression", "layer ", "text ", '"', "'")):
                 continue
             image = _strip_image_clauses(raw)
-            if not image or _image_is_known(image, merged):
+            if not image or _image_is_known(image, merged, known_tags):
                 continue
             diags.append(
                 _diag(
@@ -297,7 +340,7 @@ def _check_transform_references(uri: str, parser: RpyParser, diags: List) -> Non
             at = getattr(node, "at_transform", None)
             if not at:
                 continue
-            for name in at.split(","):
+            for name in _split_top_level(at):
                 name = name.strip()
                 if not name or "(" in name or "." in name:
                     continue
@@ -412,6 +455,7 @@ def _collect_full_diagnostics(
 
     Pure with respect to the workspace index — callers publish the result.
     *text* is the document source when the parse cache may not hold it.
+    Per-check severity overrides (``diagnostics.severity``) are applied.
     """
     diags: List[types.Diagnostic] = []
     diags.extend(_collect_light_diagnostics(parser))
@@ -424,38 +468,76 @@ def _collect_full_diagnostics(
     _check_transform_references(uri, parser, diags)
     _check_style_references(uri, parser, diags)
     translation.check_translations(uri, parser, diags)
-    return diags
+    return _apply_severity_overrides(diags)
+
+
+# ── Severity overrides ───────────────────────────────────────────────────
+
+_SEVERITY_ALIASES = {
+    "error": types.DiagnosticSeverity.Error,
+    "warning": types.DiagnosticSeverity.Warning,
+    "information": types.DiagnosticSeverity.Information,
+    "hint": types.DiagnosticSeverity.Hint,
+}
+
+
+def _apply_severity_overrides(diags: List[types.Diagnostic]) -> List[types.Diagnostic]:
+    """Rewrite severities per ``diagnostics.severity``; drop ``"none"`` ones."""
+    overrides = ctx._diagnostic_severity_overrides()
+    if not overrides or not diags:
+        return diags
+    out: List[types.Diagnostic] = []
+    for d in diags:
+        name = overrides.get(str(d.code) if d.code is not None else "")
+        if name is None:
+            out.append(d)
+            continue
+        if name == "none":
+            continue  # check suppressed by settings
+        severity = _SEVERITY_ALIASES.get(name)
+        if severity is not None and severity != d.severity:
+            d.severity = severity
+        out.append(d)
+    return out
 
 
 # ── Publishing ───────────────────────────────────────────────────────────
 
+# Content hash at the time of the last full-diagnostics publish — lets a
+# save skip the pass when nothing changed since (every edit already flows
+# through didChange, so an unchanged save is pure repetition).
+_last_full_hash: Dict[str, int] = {}
 
-def _publish_diagnostics_light(uri: str):
-    """Fast diagnostics: only current-file syntax checks (no workspace scan).
 
-    Called from ``didChange`` (debounced).  This covers parser errors and
-    empty-ATL-block errors — the things the user wants instant feedback on.
-    """
+def full_diagnostics_needed(uri: str) -> bool:
+    """True when the document content differs from the last full pass."""
+    with ctx._cache_lock:
+        cached = ctx._parse_cache.get(uri)
+    if not cached:
+        return True  # never parsed / already closed — nothing to compare
+    with _diag_queue_lock:
+        return _last_full_hash.get(uri) != cached[0]
+
+
+def forget_document(uri: str) -> None:
+    """Drop bookkeeping for a closed document."""
+    with _diag_queue_lock:
+        _last_full_hash.pop(uri, None)
+
+
+def refresh_open_documents() -> None:
+    """Re-run full diagnostics for every open ``.rpy`` document — used after
+    a settings change so severity overrides apply without reopening files."""
     if not ctx._diagnostics_enabled():
         return
-    _log.info("_publish_diagnostics_light: %s", ctx._short_uri(uri))
-    t0 = _time.monotonic()
-    _ast, parser = ctx._get_parse(uri)
-    # Update the workspace index for this single file so subsequent
-    # queries (hover, goto-def, …) see the latest symbols.
-    ctx._workspace_index.update_file(uri)
-    diags = _collect_light_diagnostics(parser)
-
-    elapsed = (_time.monotonic() - t0) * 1000
-    _log.info(
-        "_publish_diagnostics_light: %s → %d diagnostic(s) in %.1f ms",
-        ctx._short_uri(uri),
-        len(diags),
-        elapsed,
-    )
-    LSP_SERVER.text_document_publish_diagnostics(
-        types.PublishDiagnosticsParams(uri=uri, diagnostics=diags)
-    )
+    try:
+        documents = list(LSP_SERVER.workspace.text_documents.items())
+    except Exception:
+        return
+    for uri, doc in documents:
+        path = getattr(doc, "path", "") or uri
+        if path.endswith((".rpy", ".rpym")):
+            _schedule_full_diagnostics(uri)
 
 
 def _publish_diagnostics(uri: str):
@@ -463,8 +545,8 @@ def _publish_diagnostics(uri: str):
 
     This includes cross-workspace checks (undefined labels, duplicate
     definitions, unused labels, missing image files, undefined
-    image/transform/style references).  Called from ``didOpen`` and
-    ``didSave``.
+    image/transform/style references).  Called for ``didOpen``, coalesced
+    ``didChange`` runs, and content-changing saves.
     """
     if not ctx._diagnostics_enabled():
         return
@@ -488,13 +570,12 @@ def _publish_diagnostics(uri: str):
     LSP_SERVER.text_document_publish_diagnostics(
         types.PublishDiagnosticsParams(uri=uri, diagnostics=diags)
     )
+    if cached:
+        with _diag_queue_lock:
+            _last_full_hash[uri] = cached[0]
 
 
 # ── Background scheduling ────────────────────────────────────────────────
-
-# Debounce timers for didChange → lightweight diagnostics.
-_DEBOUNCE_DELAY = 0.3  # seconds
-_debounce_timers: Dict[str, threading.Timer] = {}
 
 # Lock to serialise background diagnostic runs so at most one runs at a time.
 _diag_lock = threading.Lock()
@@ -504,13 +585,6 @@ _diag_queue: Dict[str, float] = {}  # uri → timestamp when queued
 _diag_queue_lock = threading.Lock()
 _diag_thread_running = False
 _DIAG_COALESCE_DELAY = 0.15  # seconds — wait briefly to batch rapid saves
-
-
-def cancel_pending_light_diagnostics(uri: str) -> None:
-    """Cancel a pending debounced light-diagnostics run for *uri*, if any."""
-    old = _debounce_timers.pop(uri, None)
-    if old is not None:
-        old.cancel()
 
 
 def _schedule_full_diagnostics(uri: str) -> None:
@@ -557,22 +631,3 @@ def _schedule_full_diagnostics(uri: str) -> None:
 
     t = threading.Thread(target=_drain, daemon=True, name="diag-drain")
     t.start()
-
-
-def _schedule_light_diagnostics(uri: str) -> None:
-    """Schedule a debounced lightweight diagnostic run for *uri*."""
-    if not ctx._diagnostics_enabled():
-        return
-    cancel_pending_light_diagnostics(uri)
-
-    def _run():
-        _debounce_timers.pop(uri, None)
-        try:
-            _publish_diagnostics_light(uri)
-        except Exception:
-            _log.exception("Error in debounced light diagnostics for %s", uri)
-
-    timer = threading.Timer(_DEBOUNCE_DELAY, _run)
-    timer.daemon = True
-    _debounce_timers[uri] = timer
-    timer.start()

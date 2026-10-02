@@ -84,8 +84,9 @@ import server_context as ctx
 
 from diagnostics import (
     _schedule_full_diagnostics,
-    _schedule_light_diagnostics,
-    cancel_pending_light_diagnostics,
+    forget_document,
+    full_diagnostics_needed,
+    refresh_open_documents,
 )
 from completion import _completion_items_for_context
 import code_actions
@@ -113,6 +114,9 @@ def did_change_configuration(
 ) -> None:
     _update_settings(params.settings)
     _refresh_format_config()
+    # Severity overrides may have changed — re-run open documents so the
+    # panel reflects them without requiring a reopen.
+    refresh_open_documents()
 
 
 @LSP_SERVER.feature(types.TEXT_DOCUMENT_DID_OPEN)
@@ -124,46 +128,44 @@ def did_open(ls: LanguageServer, params: types.DidOpenTextDocumentParams):
     # Kick off background index warm-up on the first file open.
     if not ctx._workspace_index.is_ready() and not ctx._workspace_index._warming:
         ctx._workspace_index.warm()
-    # Run index update + full diagnostics in a background thread.
+    # Repopulate client state — diagnostics are ephemeral, so after a window
+    # reload this is the only chance to publish them.  Background thread.
     if _diagnostics_enabled():
         _schedule_full_diagnostics(uri)
 
 
 @LSP_SERVER.feature(types.TEXT_DOCUMENT_DID_CHANGE)
 def did_change(ls: LanguageServer, params: types.DidChangeTextDocumentParams):
-    _log.debug("didChange: %s", _short_uri(params.text_document.uri))
-    # Parse immediately so the cache is warm for completions/hover, but
-    # defer diagnostics behind a debounce timer.
-    ctx._get_parse(params.text_document.uri)
-    _schedule_light_diagnostics(params.text_document.uri)
+    uri = params.text_document.uri
+    _log.debug("didChange: %s", _short_uri(uri))
+    # Parse immediately so the cache is warm for completions/hover; the
+    # diagnostics pass follows through the coalescing background queue —
+    # results track edits without waiting for a save.
+    ctx._get_parse(uri)
+    if _diagnostics_enabled():
+        _schedule_full_diagnostics(uri)
 
 
 @LSP_SERVER.feature(types.TEXT_DOCUMENT_DID_SAVE)
 def did_save(ls: LanguageServer, params: types.DidSaveTextDocumentParams):
     uri = params.text_document.uri
     _log.info("didSave: %s", _short_uri(uri))
-    # Cancel any pending light-diagnostics timer — we'll do a full pass now.
-    cancel_pending_light_diagnostics(uri)
     if not _diagnostics_enabled():
         LSP_SERVER.text_document_publish_diagnostics(
             types.PublishDiagnosticsParams(uri=uri, diagnostics=[])
         )
         return
-
-    if _full_diagnostics_on_save():
-        # Index update + full diagnostics run in a background thread.
+    # Edits already flow through didChange, so a save re-runs the full pass
+    # only when the user opted in *and* the content actually changed since.
+    if _full_diagnostics_on_save() and full_diagnostics_needed(uri):
         _schedule_full_diagnostics(uri)
-    else:
-        # Keep saves responsive: only syntax/empty-block diagnostics run after save.
-        _schedule_light_diagnostics(uri)
 
 
 @LSP_SERVER.feature(types.TEXT_DOCUMENT_DID_CLOSE)
 def did_close(ls: LanguageServer, params: types.DidCloseTextDocumentParams):
     uri = params.text_document.uri
     _log.info("didClose: %s", _short_uri(uri))
-    # Cancel pending timer
-    cancel_pending_light_diagnostics(uri)
+    forget_document(uri)
     with _cache_lock:
         _parse_cache.pop(uri, None)
     ctx._workspace_index.remove_file(uri)

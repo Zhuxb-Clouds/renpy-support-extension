@@ -53,7 +53,8 @@
 | `renpy-lsp.formatting.indentSize` | `4`    | 每级缩进的空格数                           |
 | `renpy-lsp.formatting.blankLines` | `collapse` | 空行处理：`preserve`（不动）、`collapse`（折叠为一行）、`betweenSay`（另在 `label` 脚本块内的对白/旁白行之间插入空行）、`strip`（全部删除） |
 | `renpy-lsp.diagnostics.enabled`   | `true` | 启用诊断功能                               |
-| `renpy-lsp.diagnostics.fullOnSave` | `false` | 每次保存时运行跨工作区完整诊断             |
+| `renpy-lsp.diagnostics.fullOnSave` | `false` | 保存时也重跑完整诊断(编辑时已随变更队列重跑;内容未变化的保存不会重跑) |
+| `renpy-lsp.diagnostics.severity`  | `{}` | 按检查项覆盖严重级别,如 `{ "unused-label": "none", "undefined-transform": "information" }`;`none` 表示彻底关闭该检查 |
 
 ### 项目级格式化配置
 

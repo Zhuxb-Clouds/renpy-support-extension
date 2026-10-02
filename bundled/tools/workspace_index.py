@@ -32,8 +32,10 @@ from ast_parser import (
     Jump,
     Label,
     RpyParser,
+    Scene,
     Script,
     ScreenDef,
+    Show,
     StyleDef,
     TransformDef,
 )
@@ -88,6 +90,8 @@ class WorkspaceIndex:
         # Per-URI jump/call targets  {uri: set_of_target_names}
         self._jump_targets: Dict[str, set] = {}
         self._call_targets: Dict[str, set] = {}
+        # Per-URI tags from ``show X as tag``  {uri: set_of_tags}
+        self._show_tags: Dict[str, set] = {}
         # Track which URIs have been indexed and with which content hash
         self._indexed_hashes: Dict[str, int] = {}
         # ── Aggregation cache (invalidated per-store on update_file) ──
@@ -184,6 +188,8 @@ class WorkspaceIndex:
             StyleDef: [],
             Jump: [],
             Call: [],
+            Show: [],
+            Scene: [],
         }
         parser._collect_multi(ast, type_map)
 
@@ -210,6 +216,12 @@ class WorkspaceIndex:
             styles.setdefault(s.name, []).append(s)
         jt: set = {j.target for j in type_map[Jump] if not j.is_expression}
         ct: set = {c.target for c in type_map[Call] if not c.is_expression}
+        st: set = {
+            n.as_tag
+            for cls in (Show, Scene)
+            for n in type_map[cls]
+            if getattr(n, "as_tag", None)
+        }
 
         with self._lock:
             if self._labels.get(uri) != labels:
@@ -251,6 +263,9 @@ class WorkspaceIndex:
                 self._agg_cache.pop("used_labels", None)
             self._jump_targets[uri] = jt
             self._call_targets[uri] = ct
+            if self._show_tags.get(uri) != st:
+                self._agg_cache.pop("show_tags", None)
+            self._show_tags[uri] = st
             self._indexed_hashes[uri] = content_hash
         _log.debug("WorkspaceIndex: updated index for %s", self._short_uri(uri))
 
@@ -281,6 +296,7 @@ class WorkspaceIndex:
                 changed = True
             self._jump_targets.pop(uri, None)
             self._call_targets.pop(uri, None)
+            self._show_tags.pop(uri, None)
             self._indexed_hashes.pop(uri, None)
             if changed:
                 self._agg_cache.clear()
@@ -395,6 +411,7 @@ class WorkspaceIndex:
             self._styles.clear()
             self._jump_targets.clear()
             self._call_targets.clear()
+            self._show_tags.clear()
             self._indexed_hashes.clear()
             self._agg_cache.clear()
         self.ensure_current()
@@ -463,6 +480,19 @@ class WorkspaceIndex:
             for targets in self._call_targets.values():
                 result |= targets
             self._agg_cache["used_labels"] = result
+        return set(result)
+
+    def get_show_tags(self) -> set:
+        """Return the set of all tags introduced by ``show X as tag``."""
+        self.ensure_current()
+        with self._lock:
+            cached = self._agg_cache.get("show_tags")
+            if cached is not None:
+                return set(cached)
+            result: set = set()
+            for tags in self._show_tags.values():
+                result |= tags
+            self._agg_cache["show_tags"] = result
         return set(result)
 
     def get_jump_target_uris(self, label_name: str) -> List[str]:

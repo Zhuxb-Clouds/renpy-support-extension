@@ -234,6 +234,7 @@ class Scene(Node):
     image: str = ""
     at_transform: Optional[str] = None
     with_transition: Optional[str] = None
+    as_tag: Optional[str] = None  # tag from the ``as`` clause, if any
     has_block: bool = False
     body: List[Node] = field(default_factory=list)
 
@@ -245,6 +246,7 @@ class Show(Node):
     image: str = ""
     at_transform: Optional[str] = None
     with_transition: Optional[str] = None
+    as_tag: Optional[str] = None  # tag from the ``as`` clause, if any
     has_block: bool = False
     body: List[Node] = field(default_factory=list)
 
@@ -457,6 +459,44 @@ _RE_SHOW = re.compile(
 )
 _RE_HIDE = re.compile(r"^hide\s+(.+?)(?:\s+with\s+(\w+(?:\([^)]*\))?))?\s*:?\s*$")
 _RE_WITH = re.compile(r"^with\s+(.+)$")
+
+# Clauses that can follow the ``at`` list (or the image expression) but have
+# no regex group of their own — they end up glued onto the captured text
+# unless cut off.  The ``as`` group captures the tag for :attr:`Show.as_tag`.
+_AT_TAIL_CLAUSE = re.compile(
+    r"\s+(?:as\s+([\w\u4e00-\u9fff\u3400-\u4dbf]+)|onlayer\s+\S+|zorder\s+\S+|behind\s+\S+)"
+)
+
+
+def _split_at_clause(at: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    """Strip trailing ``as``/``onlayer``/``zorder``/``behind`` clauses that
+    the show/scene regexes captured as part of the ``at`` transform list.
+
+    Returns ``(transform_list, as_tag)``.
+    """
+    if not at:
+        return at, None
+    m = _AT_TAIL_CLAUSE.search(at)
+    if not m:
+        return at, None
+    return at[: m.start()].strip(), m.group(1)
+
+
+def _clean_at_clause(at: Optional[str]) -> Optional[str]:
+    """:func:`_split_at_clause` without the tag (``camera`` has no ``as``)."""
+    return _split_at_clause(at)[0]
+
+
+def _split_image_clauses(image: str) -> Tuple[str, Optional[str]]:
+    """The show/scene regexes have no clause groups, so ``as``/``behind``/…
+    clauses can end up glued onto the image expression — cut them off.
+
+    Returns ``(image_expression, as_tag)``.
+    """
+    m = _AT_TAIL_CLAUSE.search(image)
+    if not m:
+        return image, None
+    return image[: m.start()].strip(), m.group(1)
 
 _RE_PLAY = re.compile(
     r"^play\s+(\w+)\s+(?:[\"']([^\"']+)[\"']|([a-zA-Z_\u4e00-\u9fff\u3400-\u4dbf]\w*))(.*)$"
@@ -1069,7 +1109,7 @@ class RpyParser:
                 lineno=lineno,
                 end_lineno=lineno,
                 indent=indent,
-                at_transform=m.group(2),
+                at_transform=_clean_at_clause(m.group(2)),
                 with_transition=m.group(3),
                 has_block=content.rstrip().endswith(":"),
             )
@@ -1086,13 +1126,16 @@ class RpyParser:
 
         m = _RE_SCENE.match(content)
         if m:
+            image, img_tag = _split_image_clauses(m.group(1).strip())
+            at, at_tag = _split_at_clause(m.group(2))
             return Scene(
                 lineno=lineno,
                 end_lineno=lineno,
                 indent=indent,
-                image=m.group(1).strip(),
-                at_transform=m.group(2),
+                image=image,
+                at_transform=at,
                 with_transition=m.group(3),
+                as_tag=img_tag or at_tag,
                 has_block=content.rstrip().endswith(":"),
             )
 
@@ -1108,13 +1151,16 @@ class RpyParser:
 
         m = _RE_SHOW.match(content)
         if m:
+            image, img_tag = _split_image_clauses(m.group(1).strip())
+            at, at_tag = _split_at_clause(m.group(2))
             return Show(
                 lineno=lineno,
                 end_lineno=lineno,
                 indent=indent,
-                image=m.group(1).strip(),
-                at_transform=m.group(2),
+                image=image,
+                at_transform=at,
                 with_transition=m.group(3),
+                as_tag=img_tag or at_tag,
                 has_block=content.rstrip().endswith(":"),
             )
 

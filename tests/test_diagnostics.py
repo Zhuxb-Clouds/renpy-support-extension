@@ -47,6 +47,9 @@ def patch_index(monkeypatch, parser: RpyParser, *, image_files=None) -> None:
     )
     monkeypatch.setattr(ctx, "_all_workspace_python_names", lambda: set())
     monkeypatch.setattr(
+        ctx, "_get_all_workspace_show_tags", lambda: set()
+    )
+    monkeypatch.setattr(
         ctx._workspace_index, "get_used_labels", lambda: set()
     )
     monkeypatch.setattr(ctx, "_same_file_uri", lambda a, b: a == b)
@@ -251,6 +254,25 @@ def test_scene_with_as_clause_strips_clause(monkeypatch) -> None:
     assert "undefined-image" not in codes(diags)
 
 
+def test_hide_of_show_as_tag_is_not_reported(monkeypatch) -> None:
+    """``hide <tag>`` targets a tag introduced by ``show X as tag``, not an
+    image statement (regression: 'Image "chapter_show_display" is not
+    defined')."""
+    diags = collect(
+        monkeypatch,
+        """
+        label begin:
+            show expression chapter_show_display() as chapter_show_display with diss
+            return
+
+        label end:
+            hide chapter_show_display with diss
+            return
+        """,
+    )
+    assert "undefined-image" not in codes(diags)
+
+
 # ── new: undefined transform references ──────────────────────────────────
 
 
@@ -280,6 +302,50 @@ def test_at_known_transforms_are_not_reported(monkeypatch) -> None:
             show eileen at wobble, slide_in, left
             show lucy at Transform(xpos=0.5)
             scene bg at Position(xalign=0.1)
+        """,
+    )
+    assert "undefined-transform" not in codes(diags)
+
+
+def test_as_clause_is_not_treated_as_transform_name(monkeypatch) -> None:
+    """``show e at left as tag`` must report only the transform itself,
+    never the glued ``as`` clause (regression: 'pos_center as noel')."""
+    diags = collect(
+        monkeypatch,
+        """
+        transform pos_left:
+            xalign 0.0
+
+        label start:
+            show fred_normal_happy at pos_left as fred with dissolve
+        """,
+    )
+    assert "undefined-transform" not in codes(diags)
+
+
+def test_undefined_transform_message_excludes_as_clause(monkeypatch) -> None:
+    diags = collect(
+        monkeypatch,
+        """
+        label start:
+            show noel_normal at pos_center as noel with dissolve
+        """,
+    )
+    tr = [d for d in diags if str(d.code) == "undefined-transform"]
+    assert len(tr) == 1
+    assert tr[0].message == 'Transform "pos_center" is not defined in the project'
+
+
+def test_at_call_with_kwargs_is_one_transform(monkeypatch) -> None:
+    """``at fx_waves(dark=dark, lite=lite)`` is a single expression — its
+    keyword arguments must not surface as transform names (regression:
+    'Transform "lite=lite)" is not defined')."""
+    diags = collect(
+        monkeypatch,
+        """
+        label start:
+            scene expression background at fx_waves(dark=dark, lite=lite) with trans
+            show eileen at slide(1, 2), left with diss
         """,
     )
     assert "undefined-transform" not in codes(diags)
@@ -334,3 +400,78 @@ def test_light_collector_reports_parser_errors_and_empty_blocks() -> None:
     diags = diagnostics._collect_light_diagnostics(parser)
     assert "unknown-statement" in codes(diags)
     assert "empty-atl-block" in codes(diags)
+
+
+# ── severity overrides & save re-run guard ───────────────────────────────
+
+
+def _save_diag_settings() -> dict:
+    return dict(ctx._settings["diagnostics"])
+
+
+def _restore_diag_settings(state: dict) -> None:
+    ctx._settings["diagnostics"].clear()
+    ctx._settings["diagnostics"].update(state)
+
+
+def test_severity_override_suppresses_checks(monkeypatch) -> None:
+    state = _save_diag_settings()
+    try:
+        ctx._settings["diagnostics"]["severity"] = {"unused-label": "none"}
+        diags = collect(
+            monkeypatch,
+            """
+        label orphan:
+            return
+        """,
+        )
+        assert "unused-label" not in codes(diags)
+    finally:
+        _restore_diag_settings(state)
+
+
+def test_severity_override_downgrades_severity(monkeypatch) -> None:
+    state = _save_diag_settings()
+    try:
+        ctx._settings["diagnostics"]["severity"] = {
+            "undefined-transform": "hint"
+        }
+        diags = collect(
+            monkeypatch,
+            """
+        label start:
+            show eileen at zoomy
+        """,
+        )
+        tr = [d for d in diags if str(d.code) == "undefined-transform"]
+        assert len(tr) == 1
+        assert tr[0].severity == types.DiagnosticSeverity.Hint
+    finally:
+        _restore_diag_settings(state)
+
+
+def test_full_diagnostics_needed_tracks_published_hash(monkeypatch) -> None:
+    uri = "file:///workspace/game/guard.rpy"
+    parser = parse("label start:\n    return\n")
+    try:
+        # Unknown document → a full pass is needed.
+        assert diagnostics.full_diagnostics_needed(uri) is True
+
+        # Simulate a published pass for the cached content.
+        with ctx._cache_lock:
+            ctx._parse_cache[uri] = (hash("text"), "text", None, parser)
+        with diagnostics._diag_queue_lock:
+            diagnostics._last_full_hash[uri] = hash("text")
+        assert diagnostics.full_diagnostics_needed(uri) is False
+
+        # Content changed → needed again.
+        with ctx._cache_lock:
+            ctx._parse_cache[uri] = (hash("text2"), "text2", None, parser)
+        assert diagnostics.full_diagnostics_needed(uri) is True
+
+        diagnostics.forget_document(uri)
+        assert diagnostics.full_diagnostics_needed(uri) is True
+    finally:
+        with ctx._cache_lock:
+            ctx._parse_cache.pop(uri, None)
+        diagnostics.forget_document(uri)

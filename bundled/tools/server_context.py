@@ -98,6 +98,7 @@ _settings = {
     "diagnostics": {
         "enabled": True,
         "fullOnSave": False,
+        "severity": {},
     },
 }
 
@@ -135,6 +136,28 @@ def _coerce_choice(value: object, allowed: Tuple[str, ...], default: str) -> str
     if isinstance(value, str) and value in allowed:
         return value
     return default
+
+
+# Allowed values for ``diagnostics.severity`` overrides; ``none`` suppresses
+# the check entirely.
+_SEVERITY_NAMES = ("error", "warning", "information", "hint", "none")
+
+
+def _coerce_severity_overrides(raw: dict) -> dict:
+    """Validate a {check_code: severity_name} map, dropping unknown entries."""
+    out: Dict[str, str] = {}
+    for code, value in raw.items():
+        if isinstance(code, str) and isinstance(value, str):
+            name = value.strip().lower()
+            if name in _SEVERITY_NAMES:
+                out[code] = name
+            else:
+                _log.warning(
+                    "diagnostics.severity: unknown severity %r for %r — ignored",
+                    value,
+                    code,
+                )
+    return out
 
 
 def _extract_renpy_settings(raw_settings: object) -> dict:
@@ -179,6 +202,11 @@ def _update_settings(raw_settings: object) -> None:
         _settings["diagnostics"]["fullOnSave"] = _coerce_bool(
             diagnostics.get("fullOnSave"), _settings["diagnostics"]["fullOnSave"]
         )
+        raw_severity = diagnostics.get("severity")
+        if isinstance(raw_severity, dict):
+            _settings["diagnostics"]["severity"] = _coerce_severity_overrides(
+                raw_severity
+            )
     elif "diagnostics.enabled" in settings:
         _settings["diagnostics"]["enabled"] = _coerce_bool(
             settings.get("diagnostics.enabled"), _settings["diagnostics"]["enabled"]
@@ -192,12 +220,14 @@ def _update_settings(raw_settings: object) -> None:
 
     _log.info(
         "settings: formatting.enabled=%s formatting.indentSize=%s "
-        "formatting.blankLines=%s diagnostics.enabled=%s diagnostics.fullOnSave=%s",
+        "formatting.blankLines=%s diagnostics.enabled=%s diagnostics.fullOnSave=%s "
+        "diagnostics.severity=%d override(s)",
         _settings["formatting"]["enabled"],
         _settings["formatting"]["indentSize"],
         _settings["formatting"]["blankLines"],
         _settings["diagnostics"]["enabled"],
         _settings["diagnostics"]["fullOnSave"],
+        len(_settings["diagnostics"]["severity"]),
     )
 
 
@@ -267,6 +297,12 @@ def _diagnostics_enabled() -> bool:
 
 def _full_diagnostics_on_save() -> bool:
     return bool(_settings["diagnostics"]["fullOnSave"])
+
+
+def _diagnostic_severity_overrides() -> Dict[str, str]:
+    """Per-check severity overrides: {check_code: "error"|"warning"|
+    "information"|"hint"|"none"} — ``none`` suppresses the check."""
+    return dict(_settings["diagnostics"].get("severity") or {})
 
 # ── UTF-16 → Python (UTF-32) column offset conversion ──────────────────
 
@@ -471,6 +507,11 @@ def _get_all_workspace_images() -> Dict[str, List[Tuple[str, "ImageDef"]]]:
 def _get_all_workspace_transforms() -> Dict[str, List[Tuple[str, "TransformDef"]]]:
     """Return {name: [(uri, TransformDef), ...]} across all workspace .rpy files."""
     return _workspace_index.get_transforms()
+
+
+def _get_all_workspace_show_tags() -> "set[str]":
+    """Return all tags introduced by ``show X as tag`` across the workspace."""
+    return _workspace_index.get_show_tags()
 
 
 def _get_all_workspace_styles() -> Dict[str, List[Tuple[str, "StyleDef"]]]:

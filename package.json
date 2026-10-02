@@ -2,7 +2,7 @@
   "name": "renpy-support-extension",
   "publisher": "zhuxb-clouds",
   "displayName": "Ren'Py Language Support",
-  "version": "1.9.0",
+  "version": "1.9.1",
   "description": "Language support for Ren'Py script files (.rpy)",
   "icon": "icons/renpy.png",
   "main": "./dist/extension.js",
@@ -202,7 +202,29 @@
         "renpy-lsp.diagnostics.fullOnSave": {
           "type": "boolean",
           "default": false,
-          "description": "Run full cross-workspace diagnostics on every save. Disable for faster saves in large projects; lightweight syntax diagnostics still run."
+          "description": "Also re-run the full cross-workspace pass on save. Edits already re-run it through the change queue; a save only re-runs when this is enabled and the content changed since the last pass."
+        },
+        "renpy-lsp.diagnostics.severity": {
+          "type": "object",
+          "default": {},
+          "markdownDescription": "Per-check severity overrides. Keys are check codes, values one of `error`, `warning`, `information`, `hint`, or `none` (disable the check). Example: `{ \"unused-label\": \"none\", \"undefined-transform\": \"information\" }`.\n\nChecks: `unknown-statement`, `empty-atl-block`, `undefined-label`, `duplicate-label`, `duplicate-screen`, `missing-image-file`, `undefined-image`, `undefined-transform`, `undefined-style`, `unused-label`, `unused-define`, `translation-missing-old`, `translation-missing-new`, `translation-stale`.",
+          "properties": {
+            "unknown-statement": { "type": "string", "enum": ["error", "warning", "information", "hint", "none"] },
+            "empty-atl-block": { "type": "string", "enum": ["error", "warning", "information", "hint", "none"] },
+            "undefined-label": { "type": "string", "enum": ["error", "warning", "information", "hint", "none"] },
+            "duplicate-label": { "type": "string", "enum": ["error", "warning", "information", "hint", "none"] },
+            "duplicate-screen": { "type": "string", "enum": ["error", "warning", "information", "hint", "none"] },
+            "missing-image-file": { "type": "string", "enum": ["error", "warning", "information", "hint", "none"] },
+            "undefined-image": { "type": "string", "enum": ["error", "warning", "information", "hint", "none"] },
+            "undefined-transform": { "type": "string", "enum": ["error", "warning", "information", "hint", "none"] },
+            "undefined-style": { "type": "string", "enum": ["error", "warning", "information", "hint", "none"] },
+            "unused-label": { "type": "string", "enum": ["error", "warning", "information", "hint", "none"] },
+            "unused-define": { "type": "string", "enum": ["error", "warning", "information", "hint", "none"] },
+            "translation-missing-old": { "type": "string", "enum": ["error", "warning", "information", "hint", "none"] },
+            "translation-missing-new": { "type": "string", "enum": ["error", "warning", "information", "hint", "none"] },
+            "translation-stale": { "type": "string", "enum": ["error", "warning", "information", "hint", "none"] }
+          },
+          "additionalProperties": false
         }
       }
     },

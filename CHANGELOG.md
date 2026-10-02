@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.9.1] - 2026-10-03
+
+### Fixed
+
+- `show X at <transform> as <tag>` no longer glues the `as` clause onto the transform names — `Transform "pos_center as noel" is not defined` style false positives are gone, and a defined `pos_left`/`pos_center` is recognized again. `Scene`/`Camera` clauses and `behind`/`onlayer`/`zorder` glued onto the image expression are stripped too, which also fixes go-to-definition on such `show` lines.
+- `at fx_waves(dark=dark, lite=lite)` is treated as one expression — keyword arguments no longer surface as transform names (`Transform "lite=lite)" is not defined`).
+- `hide <tag>` / `show <tag>` recognize tags introduced by `show X as tag` across the workspace (indexed per file), so `Image "chapter_show_display" is not defined` no longer fires for displayables shown via `show expression … as tag`.
+
+### Changed
+
+- **Diagnostics refresh on change, not on save.** The full pass now runs on file open and through a coalescing background queue on every edit — warnings stay up to date while typing instead of being cleared and only flooding back after a save or window reload. A save re-runs the pass only when `renpy-lsp.diagnostics.fullOnSave` is enabled *and* the content changed since the last run (content-hash guard); unchanged saves re-run nothing.
+- **New `renpy-lsp.diagnostics.severity` setting** — per-check severity overrides (`"error"|"warning"|"information"|"hint"|"none"`), e.g. `{ "unused-label": "none", "undefined-transform": "information" }`; `none` suppresses a check entirely. Applies immediately on settings change without reopening files.
+
 ## [1.9.0] - 2026-09-29
 
 ### Added

@@ -5,6 +5,7 @@ from textwrap import dedent
 from ast_parser import (
     Camera,
     RpyParser,
+    Show,
     StyleDef,
 )
 
@@ -63,6 +64,20 @@ def test_parser_collects_core_symbols_and_skips_screen_atl_bodies() -> None:
     assert len(cameras) == 1
     assert cameras[0].at_transform == "center"
     assert cameras[0].with_transition == "dissolve"
+
+
+def test_show_as_clause_is_not_part_of_at_transform() -> None:
+    parser = parse(
+        """
+        label start:
+            show noel normal at pos_center as noel with dissolve
+            show eileen at left, right as e2 onlayer master
+            show eileen as e3 at left
+        """
+    )
+
+    shows = parser._collect(parser.root, Show)
+    assert [s.at_transform for s in shows] == ["pos_center", "left, right", "left"]
 
 
 def test_parser_recovers_unknown_statement_without_losing_later_symbols() -> None:

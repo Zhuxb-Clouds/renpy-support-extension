@@ -141,6 +141,7 @@ function getServerSettings() {
     diagnostics: {
       enabled: cfg.get<boolean>("diagnostics.enabled", true),
       fullOnSave: cfg.get<boolean>("diagnostics.fullOnSave", false),
+      severity: cfg.get<Record<string, string>>("diagnostics.severity", {}),
     },
   };
 }

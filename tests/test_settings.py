@@ -127,3 +127,53 @@ def test_format_config_removal_restores_vscode_style(tmp_path, monkeypatch) -> N
         assert ctx._settings["formatting"]["blankLines"] == "collapse"
     finally:
         _restore_style_state(state)
+
+
+def _save_diag_settings() -> tuple:
+    return dict(ctx._settings["diagnostics"])
+
+
+def _restore_diag_settings(state: tuple) -> None:
+    ctx._settings["diagnostics"].clear()
+    ctx._settings["diagnostics"].update(state)
+
+
+def test_update_settings_accepts_severity_overrides() -> None:
+    state = _save_diag_settings()
+    try:
+        lsp_server._update_settings(
+            {
+                "diagnostics": {
+                    "severity": {
+                        "unused-label": "none",
+                        "undefined-transform": "Information",
+                        "bogus-code": "warning",
+                    }
+                }
+            }
+        )
+        overrides = ctx._diagnostic_severity_overrides()
+        # Invalid severity names are dropped; unknown *codes* are kept as
+        # inert entries (no diagnostic carries them) so the server stays
+        # forward-compatible with new check codes.
+        assert overrides["unused-label"] == "none"
+        assert overrides["undefined-transform"] == "information"
+        assert "bogus-code" in overrides
+
+        # A fresh update replaces the whole map.
+        lsp_server._update_settings(
+            {"diagnostics": {"severity": {"unused-label": "loud"}}}
+        )
+        assert ctx._diagnostic_severity_overrides() == {}
+    finally:
+        _restore_diag_settings(state)
+
+
+def test_update_settings_keeps_severity_when_absent() -> None:
+    state = _save_diag_settings()
+    try:
+        lsp_server._update_settings({"diagnostics": {"severity": {"unused-label": "none"}}})
+        lsp_server._update_settings({"diagnostics": {"enabled": True}})
+        assert ctx._diagnostic_severity_overrides() == {"unused-label": "none"}
+    finally:
+        _restore_diag_settings(state)

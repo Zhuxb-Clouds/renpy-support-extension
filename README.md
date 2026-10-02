@@ -53,7 +53,8 @@ Open Command Palette (`Ctrl+Shift+P` / `Cmd+Shift+P`) and type:
 | `renpy-lsp.formatting.indentSize` | `4` | Spaces per indentation level |
 | `renpy-lsp.formatting.blankLines` | `collapse` | Blank-line handling: `preserve` (untouched), `collapse` (fold consecutive to one), `betweenSay` (also insert one between dialogue/narration lines inside `label` blocks), `strip` (remove all) |
 | `renpy-lsp.diagnostics.enabled` | `true` | Enable diagnostics |
-| `renpy-lsp.diagnostics.fullOnSave` | `false` | Run full cross-workspace diagnostics on every save |
+| `renpy-lsp.diagnostics.fullOnSave` | `false` | Also re-run the full pass on save (edits already re-run it; saves re-run only when the content changed) |
+| `renpy-lsp.diagnostics.severity` | `{}` | Per-check severity overrides, e.g. `{ "unused-label": "none", "undefined-transform": "information" }` — `none` disables a check |
 
 ### Per-project format config
 
