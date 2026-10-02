@@ -273,6 +273,24 @@ def test_hide_of_show_as_tag_is_not_reported(monkeypatch) -> None:
     assert "undefined-image" not in codes(diags)
 
 
+def test_show_and_hide_screen_are_not_image_references(monkeypatch) -> None:
+    """``show screen`` / ``hide screen`` reference screens, not images
+    (regression: 'Image "screen twitter_feed" is not defined')."""
+    diags = collect(
+        monkeypatch,
+        """
+        screen twitter_feed:
+            frame:
+                text "hi"
+
+        label start:
+            show screen twitter_feed with dissolve
+            hide screen twitter_feed with dissolve
+        """,
+    )
+    assert "undefined-image" not in codes(diags)
+
+
 # ── new: undefined transform references ──────────────────────────────────
 
 

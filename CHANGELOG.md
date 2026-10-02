@@ -7,6 +7,7 @@
 - `show X at <transform> as <tag>` no longer glues the `as` clause onto the transform names — `Transform "pos_center as noel" is not defined` style false positives are gone, and a defined `pos_left`/`pos_center` is recognized again. `Scene`/`Camera` clauses and `behind`/`onlayer`/`zorder` glued onto the image expression are stripped too, which also fixes go-to-definition on such `show` lines.
 - `at fx_waves(dark=dark, lite=lite)` is treated as one expression — keyword arguments no longer surface as transform names (`Transform "lite=lite)" is not defined`).
 - `hide <tag>` / `show <tag>` recognize tags introduced by `show X as tag` across the workspace (indexed per file), so `Image "chapter_show_display" is not defined` no longer fires for displayables shown via `show expression … as tag`.
+- `show screen` / `hide screen` are parsed as their own statements — `hide screen twitter_feed with dissolve` no longer reports `Image "screen twitter_feed" is not defined`. `hide screen` gains the same support as `show screen`: go-to-definition, find-references, and rename now cover it, and `show screen` accepts a trailing `with` clause.
 
 ### Changed
 

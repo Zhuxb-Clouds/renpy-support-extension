@@ -49,6 +49,7 @@ from ast_parser import (
     Node,
     CallScreen,
     ShowScreen,
+    HideScreen,
 )
 
 from renpy_data import KEYWORD_DOCS, count_words
@@ -477,6 +478,12 @@ def goto_definition(
                         if key not in seen:
                             seen.add(key)
                             results.append(_make_node_location(file_uri, n))
+                for n in file_parser._collect(file_ast, HideScreen):
+                    if n.screen_name == screen_name:
+                        key = (file_uri, n.lineno)
+                        if key not in seen:
+                            seen.add(key)
+                            results.append(_make_node_location(file_uri, n))
             return results if results else None
 
     # ── 1) AST-based resolution: find node at cursor line ──
@@ -619,8 +626,8 @@ def _resolve_node_definition(
             return _make_file_location(resolved)
         return None
 
-    # ── Call Screen / Show Screen → screen definition ──
-    if isinstance(node, (CallScreen, ShowScreen)):
+    # ── Call Screen / Show Screen / Hide Screen → screen definition ──
+    if isinstance(node, (CallScreen, ShowScreen, HideScreen)):
         all_screens = ctx._get_all_workspace_screens()
         sname = node.screen_name.strip()
         if sname in all_screens:
@@ -1401,6 +1408,9 @@ def find_references(
             for node in parser._collect(ast, ShowScreen):
                 if node.screen_name == word:
                     results.append(_make_node_location(file_uri, node))
+            for node in parser._collect(ast, HideScreen):
+                if node.screen_name == word:
+                    results.append(_make_node_location(file_uri, node))
         return results if results else None
 
     # Check defines/defaults
@@ -1813,6 +1823,34 @@ def rename(
                         node_line = file_doc.lines[node.lineno - 1]
                         m = re.search(
                             rf"\bshow\s+screen\s+{re.escape(old_name)}\b", node_line
+                        )
+                        if m:
+                            start_col = node_line.find(old_name, m.start())
+                            if start_col >= 0:
+                                changes[file_uri].append(
+                                    types.TextEdit(
+                                        range=types.Range(
+                                            start=types.Position(
+                                                line=node.lineno - 1,
+                                                character=start_col,
+                                            ),
+                                            end=types.Position(
+                                                line=node.lineno - 1,
+                                                character=start_col + len(old_name),
+                                            ),
+                                        ),
+                                        new_text=new_name,
+                                    )
+                                )
+
+            for node in parser._collect(ast, HideScreen):
+                if node.screen_name == old_name:
+                    if file_uri not in changes:
+                        changes[file_uri] = []
+                    if node.lineno - 1 < len(file_doc.lines):
+                        node_line = file_doc.lines[node.lineno - 1]
+                        m = re.search(
+                            rf"\bhide\s+screen\s+{re.escape(old_name)}\b", node_line
                         )
                         if m:
                             start_col = node_line.find(old_name, m.start())

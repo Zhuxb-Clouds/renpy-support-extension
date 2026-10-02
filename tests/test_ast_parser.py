@@ -4,8 +4,10 @@ from textwrap import dedent
 
 from ast_parser import (
     Camera,
+    HideScreen,
     RpyParser,
     Show,
+    ShowScreen,
     StyleDef,
 )
 
@@ -99,3 +101,23 @@ def test_parser_recovers_unknown_statement_without_losing_later_symbols() -> Non
     assert [lb.name for lb in parser.get_all_labels()] == ["start", "end"]
     assert [j.target for j in parser.get_all_jumps()] == ["end"]
     assert parser._collect(parser.root, StyleDef)[0].name == "warning_text"
+
+
+def test_show_and_hide_screen_statements() -> None:
+    parser = parse(
+        """
+        label start:
+            show screen twitter_feed with dissolve
+            show screen hud(align=(0.5, 0.5))
+            hide screen twitter_feed with dissolve
+        """
+    )
+
+    shows = parser._collect(parser.root, ShowScreen)
+    assert [s.screen_name for s in shows] == ["twitter_feed", "hud"]
+    assert shows[0].with_transition == "dissolve"
+    assert shows[1].arguments == "align=(0.5, 0.5)"
+
+    hides = parser._collect(parser.root, HideScreen)
+    assert [h.screen_name for h in hides] == ["twitter_feed"]
+    assert hides[0].with_transition == "dissolve"

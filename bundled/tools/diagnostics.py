@@ -297,7 +297,9 @@ def _check_image_references(uri: str, parser: RpyParser, diags: List) -> None:
             if not raw:
                 continue  # bare ``scene``
             lowered = raw.lower()
-            if lowered.startswith(("expression", "layer ", "text ", '"', "'")):
+            if lowered.startswith(
+                ("expression", "layer ", "text ", "screen ", '"', "'")
+            ):
                 continue
             image = _strip_image_clauses(raw)
             if not image or _image_is_known(image, merged, known_tags):

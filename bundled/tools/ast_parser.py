@@ -204,6 +204,15 @@ class ShowScreen(Node):
 
     screen_name: str = ""
     arguments: Optional[str] = None
+    with_transition: Optional[str] = None
+
+
+@dataclass
+class HideScreen(Node):
+    """``hide screen screen_name``."""
+
+    screen_name: str = ""
+    with_transition: Optional[str] = None
 
 
 # ── Dialogue / Narration ──
@@ -443,7 +452,10 @@ _RE_CALL_SCREEN = re.compile(
     r"^call\s+screen\s+([\w\u4e00-\u9fff\u3400-\u4dbf]+)\s*(?:\((.*)\))?\s*$"
 )
 _RE_SHOW_SCREEN = re.compile(
-    r"^show\s+screen\s+([\w\u4e00-\u9fff\u3400-\u4dbf]+)\s*(?:\((.*)\))?\s*$"
+    r"^show\s+screen\s+([\w\u4e00-\u9fff\u3400-\u4dbf]+)\s*(?:\((.*)\))?(?:\s+with\s+(\w+(?:\([^)]*\))?))?\s*:?\s*$"
+)
+_RE_HIDE_SCREEN = re.compile(
+    r"^hide\s+screen\s+([\w\u4e00-\u9fff\u3400-\u4dbf]+)(?:\s+with\s+(\w+(?:\([^)]*\))?))?\s*:?\s*$"
 )
 
 _RE_SCENE = re.compile(
@@ -1147,6 +1159,17 @@ class RpyParser:
                 indent=indent,
                 screen_name=m.group(1),
                 arguments=m.group(2),
+                with_transition=m.group(3),
+            )
+
+        m = _RE_HIDE_SCREEN.match(content)
+        if m:
+            return HideScreen(
+                lineno=lineno,
+                end_lineno=lineno,
+                indent=indent,
+                screen_name=m.group(1),
+                with_transition=m.group(2),
             )
 
         m = _RE_SHOW.match(content)
