@@ -49,10 +49,9 @@ from ast_parser import (
 )
 
 from renpy_data import KEYWORD_DOCS  # noqa: F401  (re-exported for hover)
-from workspace_index import WorkspaceIndex
+from workspace_index import WorkspaceIndex, walk_workspace
 
 from typing import Dict, List, Optional, Tuple
-import glob
 import threading
 import time as _time
 from pathlib import Path
@@ -71,7 +70,7 @@ LSP_SERVER = LanguageServer(
 
 # ── Server logger (prints to stderr, which VS Code captures in the Output channel) ──
 _log = _logging.getLogger("renpy-lsp")
-_log.setLevel(_logging.DEBUG)
+_log.setLevel(_logging.INFO)
 # On Windows the default stderr encoding may not be UTF-8, which garbles CJK
 # characters in log output.  Force UTF-8 so diagnostics are readable.
 _handler = _logging.StreamHandler(
@@ -89,7 +88,15 @@ _log.info("Ren'Py LSP server context module loaded")
 
 # ── Runtime settings ─────────────────────────────────────────────────────
 
+_LOG_LEVELS = {
+    "error": _logging.ERROR,
+    "warning": _logging.WARNING,
+    "info": _logging.INFO,
+    "debug": _logging.DEBUG,
+}
+
 _settings = {
+    "logLevel": "info",
     "formatting": {
         "enabled": True,
         "indentSize": 4,
@@ -216,6 +223,11 @@ def _update_settings(raw_settings: object) -> None:
             _settings["diagnostics"]["fullOnSave"],
         )
 
+    log_level = settings.get("logLevel")
+    if isinstance(log_level, str) and log_level.lower() in _LOG_LEVELS:
+        _settings["logLevel"] = log_level.lower()
+        _log.setLevel(_LOG_LEVELS[_settings["logLevel"]])
+
     _apply_format_config()
 
     _log.info(
@@ -322,6 +334,53 @@ def _utf16_col_to_utf32(line: str, utf16_col: int) -> int:
         utf16_pos += units
     return len(line)
 
+def _utf32_col_to_utf16(line: str, col: int) -> int:
+    """Convert a Python string index into *line* to a UTF-16 offset."""
+    prefix = line[:col]
+    if prefix.isascii():
+        return len(prefix)
+    return len(prefix.encode("utf-16-le")) // 2
+
+
+# ── Main event loop (for thread-safe sends from background threads) ──
+
+_main_loop = None
+
+
+def _remember_main_loop() -> None:
+    """Record the running asyncio loop — call from a handler on the loop."""
+    global _main_loop
+    try:
+        import asyncio
+
+        _main_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        _main_loop = None
+
+
+def _run_on_main_loop(fn, *args) -> None:
+    """Run *fn* on the server's event loop.
+
+    pygls writes to stdout synchronously; two threads writing at once can
+    interleave message bytes, so background threads must hand messages to
+    the loop thread instead of sending directly.
+    """
+    loop = _main_loop
+    if loop is None or loop.is_closed():
+        fn(*args)
+        return
+    try:
+        import asyncio
+
+        running = asyncio.get_running_loop()
+    except RuntimeError:
+        running = None
+    if running is loop:
+        fn(*args)
+    else:
+        loop.call_soon_threadsafe(fn, *args)
+
+
 # ─────────────────────── Cache / Index ───────────────────────────────────
 
 # Per-URI parse cache so we don't re-parse on every request.
@@ -370,14 +429,12 @@ def _get_parse(uri: str, source: Optional[str] = None) -> Tuple[Script, RpyParse
     with _cache_lock:
         cached = _parse_cache.get(uri)
         if cached and cached[0] == text_hash:
-            _log.debug("_get_parse: cache hit for %s", _short_uri(uri))
             return cached[2], cached[3]
-    _log.info("_get_parse: parsing %s (%d chars)", _short_uri(uri), len(text))
     t0 = _time.monotonic()
     parser = RpyParser(text)
     ast = parser.parse()
     elapsed = (_time.monotonic() - t0) * 1000
-    _log.info(
+    _log.debug(
         "_get_parse: parsed %s in %.1f ms (%d top-level nodes)",
         _short_uri(uri),
         elapsed,
@@ -391,6 +448,9 @@ def _get_parse(uri: str, source: Optional[str] = None) -> Tuple[Script, RpyParse
             _path_to_uri[norm_key] = uri
         except Exception:
             pass
+    # Keep the workspace index in step with the buffer — hover, go-to and
+    # completion see new symbols without waiting for a diagnostics pass.
+    _workspace_index.update_file(uri)
     return ast, parser
 
 
@@ -430,11 +490,23 @@ def _get_workspace_renpy_py_files() -> List[str]:
     These are pure-Python files that Ren'Py loads alongside ``.rpy`` scripts.
     They typically contain class and function definitions.
     """
+    global _renpy_py_files
+    cached = _renpy_py_files
+    if cached is not None:
+        return list(cached)
     results: List[str] = []
     for folder in LSP_SERVER.workspace.folders.values():
         root = _path_from_uri(folder.uri)
-        results.extend(glob.glob(os.path.join(root, "**", "*_ren.py"), recursive=True))
-    return results
+        for dirpath, filenames in walk_workspace(root):
+            for fn in filenames:
+                if fn.endswith("_ren.py"):
+                    results.append(os.path.abspath(os.path.join(dirpath, fn)))
+    _renpy_py_files = results
+    return list(results)
+
+
+# Cached ``*_ren.py`` file list; reset by file create/delete events.
+_renpy_py_files: Optional[List[str]] = None
 
 
 def _get_parse_for_file(filepath: str) -> Tuple[str, Script, RpyParser]:
@@ -476,6 +548,9 @@ _workspace_index = WorkspaceIndex(
     path_from_uri_fn=_path_from_uri,
     normalize_path_fn=_normalize_path_key,
     get_parse_for_file_fn=_get_parse_for_file,
+    python_defs_fn=lambda uri, parser, ast: _find_python_definitions_in_file(
+        uri, parser, ast
+    ),
 )
 
 
@@ -560,8 +635,9 @@ def _find_python_definitions_in_file(
     return result
 
 
-# Cache for *_ren.py definitions so we don't re-scan every request.
-_renpy_py_cache: Dict[str, Tuple[str, Dict[str, List[Tuple[int, str]]]]] = {}
+# Cache for *_ren.py definitions, keyed by (mtime_ns, size) so unchanged
+# files are neither re-read nor re-scanned.
+_renpy_py_cache: Dict[str, Tuple[Tuple[int, int], Dict[str, List[Tuple[int, str]]]]] = {}
 
 
 def _find_python_definitions_in_py_file(
@@ -573,13 +649,17 @@ def _find_python_definitions_in_py_file(
     """
     uri = _uri_from_path(filepath)
     try:
+        st = os.stat(filepath)
+    except OSError:
+        return uri, {}
+    stamp = (st.st_mtime_ns, st.st_size)
+    cached = _renpy_py_cache.get(uri)
+    if cached and cached[0] == stamp:
+        return uri, cached[1]
+    try:
         text = Path(filepath).read_text(encoding="utf-8", errors="replace")
     except OSError:
         return uri, {}
-
-    cached = _renpy_py_cache.get(uri)
-    if cached and cached[0] == text:
-        return uri, cached[1]
 
     result: Dict[str, List[Tuple[int, str]]] = {}
     for lineno_0, line in enumerate(text.splitlines()):
@@ -600,22 +680,17 @@ def _find_python_definitions_in_py_file(
         if m:
             result.setdefault(m.group(1), []).append((lineno, line.strip()))
 
-    _renpy_py_cache[uri] = (text, result)
+    _renpy_py_cache[uri] = (stamp, result)
     return uri, result
 
 
 def _all_workspace_python_names() -> set:
     """All Python-level names defined across the workspace (.rpy + *_ren.py).
 
-    One batch scan for callers that need membership tests for *many* names
-    (e.g. the transform-reference diagnostic); far cheaper than calling
-    ``_find_python_var_across_workspace`` once per name, since each of those
-    calls re-walks every file.
+    Served from the workspace index (``.rpy``) and the mtime-keyed
+    ``*_ren.py`` cache — no per-call re-walk of the workspace.
     """
-    names: set = set()
-    for fp in _get_workspace_rpy_files():
-        uri, ast, parser = _get_parse_for_file(fp)
-        names.update(_find_python_definitions_in_file(uri, parser, ast))
+    names: set = set(_workspace_index.get_python_defs())
     for fp in _get_workspace_renpy_py_files():
         _uri, defs = _find_python_definitions_in_py_file(fp)
         names.update(defs)
@@ -667,18 +742,12 @@ def _find_python_var_across_workspace(
 ) -> List[Tuple[str, int, str]]:
     """Return [(uri, lineno, code), ...] for *var_name* across all workspace files.
 
-    Searches .rpy/.rpym files (via AST) and *_ren.py files (via line scanning).
-    Matches variable assignments, class definitions, and function definitions.
+    Covers .rpy/.rpym files (python blocks and ``$`` lines, via the
+    workspace index) and *_ren.py files (top-level class/def/assignment).
     """
-    results: List[Tuple[str, int, str]] = []
-    # 1) .rpy / .rpym files
-    for fp in _get_workspace_rpy_files():
-        uri, ast, parser = _get_parse_for_file(fp)
-        defs = _find_python_definitions_in_file(uri, parser, ast)
-        if var_name in defs:
-            for lineno, code in defs[var_name]:
-                results.append((uri, lineno, code))
-    # 2) *_ren.py files
+    results: List[Tuple[str, int, str]] = list(
+        _workspace_index.get_python_defs().get(var_name, ())
+    )
     for fp in _get_workspace_renpy_py_files():
         uri, defs = _find_python_definitions_in_py_file(fp)
         if var_name in defs:
@@ -747,16 +816,55 @@ def _resolve_renpy_file(
         if os.path.isfile(candidate):
             return os.path.abspath(candidate)
 
-    # Pass 2: recursive glob  **/<filename>  across workspace roots.
-    # This covers config.searchpath with custom directories.
-    for folder in LSP_SERVER.workspace.folders.values():
-        root = _path_from_uri(folder.uri)
-        pattern = os.path.join(root, "**", filename)
-        hits = glob.glob(pattern, recursive=True)
-        if hits:
-            return os.path.abspath(hits[0])
+    # Pass 2: any workspace file whose path ends with <filename> — covers
+    # config.searchpath with custom directories.  Served from the asset
+    # filename index instead of a recursive glob per lookup.
+    suffix = "/" + filename.lstrip("/")
+    for candidate in _asset_index().get(os.path.basename(filename), ()):
+        if candidate.replace(os.sep, "/").endswith(suffix):
+            return candidate
 
     return None
+
+
+# basename → [absolute paths] for every file in the workspace; built lazily
+# and reset by file create/delete events (see invalidate_asset_caches).
+_asset_files: Optional[Dict[str, List[str]]] = None
+
+
+def _asset_index() -> Dict[str, List[str]]:
+    global _asset_files
+    index = _asset_files
+    if index is not None:
+        return index
+    index = {}
+    try:
+        folders = list(LSP_SERVER.workspace.folders.values())
+    except Exception:  # workspace not initialized (e.g. in tests)
+        folders = []
+    for folder in folders:
+        root = _path_from_uri(folder.uri)
+        for dirpath, filenames in walk_workspace(root):
+            for fn in filenames:
+                index.setdefault(fn, []).append(
+                    os.path.abspath(os.path.join(dirpath, fn))
+                )
+    for paths in index.values():
+        paths.sort()
+    _asset_files = index
+    _log.debug("asset index: %d file name(s)", len(index))
+    return index
+
+
+def invalidate_asset_caches(path: Optional[str] = None) -> None:
+    """Drop caches derived from the set of files on disk (call on file
+    create/delete).  *path* narrows which caches are affected."""
+    global _asset_files, _image_cache_built, _renpy_py_files
+    _asset_files = None
+    _image_cache.clear()
+    _image_cache_built = False
+    if path is None or path.endswith("_ren.py"):
+        _renpy_py_files = None
 
 
 # ── Image auto-name cache ──
@@ -809,16 +917,7 @@ def _resolve_image_name_to_file(image_name: str) -> Optional[str]:
 
 def _find_nodes_at_line(parser: RpyParser, lineno: int) -> List[Node]:
     """Return all AST nodes whose ``lineno`` matches *lineno* (1-based)."""
-    result: List[Node] = []
-
-    def _walk(node: Node):
-        if node.lineno == lineno:
-            result.append(node)
-        for child in parser._children_of(node):
-            _walk(child)
-
-    _walk(parser.root)
-    return result
+    return list(parser.nodes_at_line(lineno))
 
 
 def _cursor_on_image_name(line_text: str, col: int, image_name: str) -> bool:
@@ -869,47 +968,64 @@ def _make_file_location(filepath: str) -> types.Location:
     )
 
 
+def _source_lines(uri: str) -> List[str]:
+    """Lines of *uri* from the parse cache (falling back to disk)."""
+    with _cache_lock:
+        cached = _parse_cache.get(uri)
+    if cached:
+        return cached[3].lines
+    try:
+        path = _path_from_uri(uri)
+        if os.path.isfile(path):
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                return f.read().splitlines()
+    except Exception:
+        pass
+    return []
+
+
+def _make_range(
+    uri: str, lineno: int, col: int, length: int, lines: Optional[List[str]] = None
+) -> types.Range:
+    """Range of *length* chars at Python column *col* on 1-based *lineno*,
+    converted to LSP UTF-16 offsets."""
+    if lines is None:
+        lines = _source_lines(uri)
+    raw = lines[lineno - 1] if 0 < lineno <= len(lines) else ""
+    start = _utf32_col_to_utf16(raw, col)
+    end = _utf32_col_to_utf16(raw, col + length)
+    return types.Range(
+        start=types.Position(line=lineno - 1, character=start),
+        end=types.Position(line=lineno - 1, character=end),
+    )
+
+
+def _node_name_span(node: Node, raw_line: str) -> Optional[Tuple[int, int]]:
+    """(col, length) of *node*'s name on its line, if known."""
+    if node.name_col >= 0 and node.name_len > 0:
+        return node.name_col, node.name_len
+    name = getattr(node, "name", None) or getattr(node, "target", None)
+    if not name or not raw_line:
+        return None
+    m = re.search(rf"(?<![\w.]){re.escape(name)}(?![\w])", raw_line)
+    if m:
+        return m.start(), len(name)
+    return None
+
+
 def _make_node_location(uri: str, node: Node) -> types.Location:
-    """Create a Location pointing to a node's name."""
+    """Create a Location pointing to a node's name (whole line if unknown)."""
+    lines = _source_lines(uri)
     line = node.lineno - 1
-    start_char = 0
-    end_char = 10000  # Large value, will be clipped by VS Code
-
-    # Try to find the exact position of the node's name
-    if hasattr(node, "name") and node.name:
-        name = node.name
-        # Get the raw line from parse cache or file
-        raw_line = ""
-        with _cache_lock:
-            cached = _parse_cache.get(uri)
-        if cached:
-            source = cached[1]
-            lines = source.splitlines()
-            if 0 <= line < len(lines):
-                raw_line = lines[line]
-        else:
-            # Try to read from file
-            try:
-                path = _path_from_uri(uri)
-                if os.path.isfile(path):
-                    with open(path, "r", encoding="utf-8") as f:
-                        lines = f.read().splitlines()
-                    if 0 <= line < len(lines):
-                        raw_line = lines[line]
-            except Exception:
-                pass
-
-        if raw_line:
-            idx = raw_line.find(name)
-            if idx >= 0:
-                start_char = idx
-                end_char = idx + len(name)
-
+    raw = lines[line] if 0 <= line < len(lines) else ""
+    span = _node_name_span(node, raw)
+    if span is not None:
+        return types.Location(uri=uri, range=_make_range(uri, node.lineno, *span, lines=lines))
     return types.Location(
         uri=uri,
         range=types.Range(
-            start=types.Position(line=line, character=start_char),
-            end=types.Position(line=line, character=end_char),
+            start=types.Position(line=line, character=0),
+            end=types.Position(line=line, character=_utf32_col_to_utf16(raw, len(raw))),
         ),
     )
 

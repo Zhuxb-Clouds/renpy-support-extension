@@ -37,6 +37,7 @@ import server_context as ctx
 from server_context import LSP_SERVER, _log
 
 import translation
+from workspace_index import extract_references
 
 # Labels that are script entry points — never referenced via jump/call.
 ENTRY_LABELS = {"start", "main_menu", "splashscreen", "after_load", "quit"}
@@ -83,9 +84,8 @@ def _collect_light_diagnostics(parser: RpyParser) -> List[types.Diagnostic]:
     diags: List[types.Diagnostic] = []
 
     for lineno, msg in parser.errors:
-        diags.append(
-            _diag(lineno, msg, types.DiagnosticSeverity.Warning, "unknown-statement")
-        )
+        code = "unclosed-delimiter" if msg.startswith("Unclosed") else "unknown-statement"
+        diags.append(_diag(lineno, msg, types.DiagnosticSeverity.Warning, code))
 
     for node in parser.get_empty_block_errors():
         stmt_type = type(node).__name__.lower()
@@ -105,12 +105,11 @@ def _collect_light_diagnostics(parser: RpyParser) -> List[types.Diagnostic]:
 
 
 def _check_undefined_labels(uri: str, parser: RpyParser, diags: List) -> None:
-    all_labels = ctx._get_all_workspace_labels()
-    # Also include labels from the current document (covers the case where
-    # the file is outside the workspace folders or URI format differs).
-    for lb in parser.get_all_labels():
-        if lb.name not in all_labels:
-            all_labels[lb.name] = [(uri, lb)]
+    # A set copy — the workspace map is a shared cache and must not be
+    # mutated.  Labels from the current document are added so files outside
+    # the workspace folders (or with differing URI forms) still resolve.
+    all_labels = set(ctx._get_all_workspace_labels())
+    all_labels.update(lb.name for lb in parser.get_all_labels())
     for j in parser.get_all_jumps():
         if not j.is_expression and j.target not in all_labels:
             diags.append(
@@ -196,6 +195,10 @@ def _check_unused_labels(uri: str, parser: RpyParser, diags: List) -> None:
     for c in parser.get_all_calls():
         if not c.is_expression:
             all_used_labels.add(c.target)
+    # ``Jump("x")`` / ``Call("x")`` screen actions and renpy.jump strings
+    for ref in extract_references(parser):
+        if ref.kind == "label":
+            all_used_labels.add(ref.name)
 
     for lb in parser.get_all_labels():
         if lb.name in all_used_labels or lb.name in ENTRY_LABELS:
@@ -552,7 +555,6 @@ def _publish_diagnostics(uri: str):
     """
     if not ctx._diagnostics_enabled():
         return
-    _log.info("_publish_diagnostics: %s", ctx._short_uri(uri))
     t0 = _time.monotonic()
     _ast, parser = ctx._get_parse(uri)
     with ctx._cache_lock:
@@ -562,19 +564,37 @@ def _publish_diagnostics(uri: str):
     ctx._workspace_index.update_file(uri)
     diags = _collect_full_diagnostics(uri, parser, text)
 
+    if cached and _is_stale(uri, cached[0]):
+        # The buffer changed while we were computing — a newer pass is
+        # queued; publishing now would flash outdated results.
+        _log.debug("_publish_diagnostics: %s stale, skipped", ctx._short_uri(uri))
+        return
     elapsed = (_time.monotonic() - t0) * 1000
     _log.info(
-        "_publish_diagnostics: %s → %d diagnostic(s) in %.1f ms",
+        "diagnostics: %s → %d in %.1f ms",
         ctx._short_uri(uri),
         len(diags),
         elapsed,
     )
-    LSP_SERVER.text_document_publish_diagnostics(
-        types.PublishDiagnosticsParams(uri=uri, diagnostics=diags)
+    ctx._run_on_main_loop(
+        LSP_SERVER.text_document_publish_diagnostics,
+        types.PublishDiagnosticsParams(uri=uri, diagnostics=diags),
     )
     if cached:
         with _diag_queue_lock:
             _last_full_hash[uri] = cached[0]
+
+
+def _is_stale(uri: str, content_hash: int) -> bool:
+    """True when the open document no longer matches *content_hash*."""
+    with _diag_queue_lock:
+        if uri in _diag_queue:
+            return True
+    try:
+        doc = LSP_SERVER.workspace.text_documents.get(uri)
+    except Exception:
+        return False
+    return doc is not None and hash(doc.source) != content_hash
 
 
 # ── Background scheduling ────────────────────────────────────────────────
@@ -586,7 +606,9 @@ _diag_lock = threading.Lock()
 _diag_queue: Dict[str, float] = {}  # uri → timestamp when queued
 _diag_queue_lock = threading.Lock()
 _diag_thread_running = False
-_DIAG_COALESCE_DELAY = 0.15  # seconds — wait briefly to batch rapid saves
+# Quiet period: a pass starts only once no edit arrived for this long, so
+# typing never queues a whole-workspace pass per keystroke.
+_DIAG_COALESCE_DELAY = 0.35  # seconds
 
 
 def _schedule_full_diagnostics(uri: str) -> None:
@@ -608,12 +630,15 @@ def _schedule_full_diagnostics(uri: str) -> None:
         global _diag_thread_running
         try:
             while True:
-                # Wait a short window to coalesce rapid saves
+                # Debounce: wait until the newest request is old enough
                 _time.sleep(_DIAG_COALESCE_DELAY)
                 with _diag_queue_lock:
                     if not _diag_queue:
                         _diag_thread_running = False
                         return
+                    newest = max(_diag_queue.values())
+                    if _time.monotonic() - newest < _DIAG_COALESCE_DELAY:
+                        continue  # still typing
                     batch = dict(_diag_queue)
                     _diag_queue.clear()
                 with _diag_lock:
@@ -633,3 +658,24 @@ def _schedule_full_diagnostics(uri: str) -> None:
 
     t = threading.Thread(target=_drain, daemon=True, name="diag-drain")
     t.start()
+
+
+# ── Cross-file refresh ───────────────────────────────────────────────────
+
+
+def _on_symbols_changed(changed_uri: str) -> None:
+    """A file's defined/referenced names changed — re-check the *other*
+    open documents, whose cross-file diagnostics (undefined/unused labels,
+    duplicates …) may now be stale."""
+    if not ctx._diagnostics_enabled():
+        return
+    try:
+        documents = list(LSP_SERVER.workspace.text_documents.keys())
+    except Exception:
+        return
+    for uri in documents:
+        if uri != changed_uri and uri.endswith((".rpy", ".rpym")):
+            _schedule_full_diagnostics(uri)
+
+
+ctx._workspace_index.on_symbols_changed = _on_symbols_changed

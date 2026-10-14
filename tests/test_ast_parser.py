@@ -3,9 +3,12 @@ from __future__ import annotations
 from textwrap import dedent
 
 from ast_parser import (
+    CallScreen,
     Camera,
     HideScreen,
+    Label,
     RpyParser,
+    Say,
     Show,
     ShowScreen,
     StyleDef,
@@ -121,3 +124,111 @@ def test_show_and_hide_screen_statements() -> None:
     hides = parser._collect(parser.root, HideScreen)
     assert [h.screen_name for h in hides] == ["twitter_feed"]
     assert hides[0].with_transition == "dissolve"
+
+
+# ── Tree walking / continuation regressions ─────────────────────────────
+
+
+def test_nodes_in_menus_and_elif_are_collected_once() -> None:
+    parser = parse(
+        """
+        label start:
+            menu:
+                "A":
+                    jump a
+            if x:
+                jump b
+            elif y:
+                jump c
+            else:
+                jump d
+        """
+    )
+    assert [j.target for j in parser.get_all_jumps()] == ["a", "b", "c", "d"]
+
+
+def test_bracket_inside_dialogue_does_not_open_a_continuation() -> None:
+    parser = parse(
+        """
+        label start:
+            e "I'm sad :("
+            e "still parsed"
+            jump ending
+        label ending:
+            return
+        """
+    )
+    assert [lb.name for lb in parser.get_all_labels()] == ["start", "ending"]
+    assert [j.target for j in parser.get_all_jumps()] == ["ending"]
+    assert not parser.errors
+
+
+def test_multiline_brackets_and_strings_still_join() -> None:
+    parser = parse(
+        """
+        define e = Character(
+            "Eileen",
+            color="#c8ffc8",
+        )
+        label start:
+            e "first line
+               second line"
+            return
+        """
+    )
+    (define,) = parser.get_all_defines()
+    assert define.name == "e" and 'color="#c8ffc8"' in define.expression
+    say = parser._collect(parser.root, Say)[0]
+    assert say.what == "first line second line"
+    assert not parser.errors
+
+
+def test_unclosed_bracket_does_not_swallow_the_rest_of_the_file() -> None:
+    parser = parse(
+        """
+        label start:
+            $ x = foo(
+            e "hello"
+            jump ending
+        label ending:
+            return
+        """
+    )
+    assert [lb.name for lb in parser.get_all_labels()] == ["start", "ending"]
+    assert parser.errors == [(2, "Unclosed bracket")]
+
+
+def test_local_labels_resolve_against_the_global_label() -> None:
+    parser = parse(
+        """
+        label start:
+            jump .sub
+        label .sub:
+            call start.sub
+            return
+        label other:
+            jump .sub
+        """
+    )
+    assert [lb.name for lb in parser.get_all_labels()] == ["start", "start.sub", "other"]
+    targets = [j.target for j in parser.get_all_jumps() + parser.get_all_calls()]
+    assert targets == ["start.sub", "other.sub", "start.sub"]
+
+
+def test_name_columns_point_at_the_name_as_written() -> None:
+    parser = parse(
+        """
+        label start:
+            call ca
+            jump .sub
+            call screen inventory
+        label .sub:
+            return
+        """
+    )
+    lines = parser.lines
+    for node in parser.get_all_calls() + parser.get_all_jumps() + parser.get_all_labels():
+        written = lines[node.lineno - 1][node.name_col : node.name_col + node.name_len]
+        assert written in (node.name if isinstance(node, Label) else node.target, ".sub")
+    (screen_call,) = parser._collect(parser.root, CallScreen)
+    assert lines[3][screen_call.name_col :] == "inventory"

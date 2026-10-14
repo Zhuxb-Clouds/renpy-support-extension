@@ -1,5 +1,30 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- **A bracket inside dialogue no longer breaks the rest of the file.** Bracket/quote continuation is now string- and comment-aware, so `e "I'm sad :("` stops swallowing every following line (which made labels, completion and go-to vanish). A genuinely unclosed bracket or string — e.g. a half-typed `$ f(` — is reported as `unclosed-delimiter` instead of eating the file.
+- Nodes inside `menu` choices and `elif` branches were collected twice — duplicated find-references results, diagnostics and translation statistics, and a rename that VS Code rejected for overlapping edits.
+- The current file's new labels/screens/defines reach hover, go-to and completion immediately (the index used to update only after a diagnostics pass, i.e. never with diagnostics disabled).
+- Defining a missing label in one file now clears `undefined-label` in other open files (cross-file diagnostics refresh when a file's set of names changes).
+- Creating any non-script file no longer empties the auto-image cache for the rest of the session (`undefined-image` false positives).
+- Diagnostics are sent from the event-loop thread — background passes could previously interleave bytes with request responses on stdout.
+
+### Added
+
+- **Local labels** — `label .sub:` / `jump .sub` resolve against the enclosing global label for go-to, hover, references, rename, diagnostics and completion.
+- **References index** — `use screen`, and label/screen strings in actions (`Jump("x")`, `Call("x")`, `Show("s")`, `renpy.jump("x")` …) count as references for find-references, rename and the `unused-label` check.
+- Completion: image attributes word by word (`show eileen ` → `happy`, `sad`, then `at`/`with` …); workspace transitions after `with` (`define slow = Dissolve(2)`) and `Transform(...)` defines after `at`; character names at the start of a say line; `renpy.` / `config.` members; local labels after `jump .`; label/screen names inside `Jump("…")`/`Show("…")` strings; keyword docs via completion resolve.
+- `renpy-lsp.logLevel` setting (`error`/`warning`/`info`/`debug`, default `info`).
+
+### Changed
+
+- **Completion replaces exactly the typed name** — every item carries a text edit, so names with spaces, dots, dashes or CJK characters are no longer appended to the prefix (`show eileen eileen happy`). Results are sorted current file → workspace → built-ins.
+- **Quieter completion** — nothing is offered inside dialogue strings or comments, after indentation spaces, or in the middle of a statement whose context is unknown; Python-expression contexts (`$`, `if`, `define x =`, python blocks) offer variables instead of keywords and labels.
+- Find-references and rename use exact name ranges; define/default references read open buffers instead of the files on disk.
+- Performance: `didChange` no longer re-parses on every keystroke (requests parse lazily); diagnostics wait for a 350 ms pause in typing and drop results that went stale while computing; hover/go-to no longer re-scan the whole workspace for Python definitions; file lookups use a cached filename index instead of a recursive glob per path; `*_ren.py` scans are cached by mtime; dialogue-heavy scripts parse ~25% faster.
+
 ## [1.9.2] - 2026-10-03
 
 ### Fixed

@@ -71,7 +71,6 @@ from server_context import (
     _FORMAT_CONFIG_FILENAME,
     _get_parse,
     _short_uri,
-    _uri_from_path,
     _find_nodes_at_line,
     _cursor_on_image_name,
     _extract_quoted_string,
@@ -96,7 +95,6 @@ import translation
 from translation import _renpy_translate_id, _find_say_at_line
 
 from typing import Dict, List, Optional, Tuple, Union
-from pathlib import Path
 import time as _time
 
 
@@ -105,6 +103,7 @@ import time as _time
 
 @LSP_SERVER.feature(types.INITIALIZE)
 def initialize(ls: LanguageServer, params: types.InitializeParams) -> None:
+    ctx._remember_main_loop()
     _update_settings(params.initialization_options)
     _refresh_format_config()
 
@@ -138,11 +137,9 @@ def did_open(ls: LanguageServer, params: types.DidOpenTextDocumentParams):
 @LSP_SERVER.feature(types.TEXT_DOCUMENT_DID_CHANGE)
 def did_change(ls: LanguageServer, params: types.DidChangeTextDocumentParams):
     uri = params.text_document.uri
-    _log.debug("didChange: %s", _short_uri(uri))
-    # Parse immediately so the cache is warm for completions/hover; the
-    # diagnostics pass follows through the coalescing background queue —
-    # results track edits without waiting for a save.
-    ctx._get_parse(uri)
+    # No parse here: requests parse lazily (cached per content hash), so a
+    # burst of keystrokes costs nothing until something needs the AST.  The
+    # diagnostics pass follows through the debounced background queue.
     if _diagnostics_enabled():
         _schedule_full_diagnostics(uri)
 
@@ -192,24 +189,60 @@ def did_change_watched_files(
             continue
         is_rpy = change_path.endswith((".rpy", ".rpym"))
         if change.type == types.FileChangeType.Created:
+            ctx.invalidate_asset_caches(change_path)
             if is_rpy:
                 ctx._workspace_index.add_file(change_path)
-            else:
-                # Might be an image file — invalidate image cache
-                ctx._image_cache.clear()
         elif change.type == types.FileChangeType.Deleted:
+            ctx.invalidate_asset_caches(change_path)
             if is_rpy:
                 ctx._workspace_index.remove_file_from_list(change_path)
                 ctx._workspace_index.remove_file(change.uri)
                 with _cache_lock:
                     _parse_cache.pop(change.uri, None)
-            else:
-                ctx._image_cache.clear()
-        elif change.type == types.FileChangeType.Changed:
-            # An external change — evict the old cache entry so next access re-reads.
+        elif change.type == types.FileChangeType.Changed and is_rpy:
+            # The editor buffer is authoritative for open documents (a save
+            # also fires this event) — only evict files changed on disk
+            # behind our back (git checkout, external editors).
+            if _is_open_document(ls, change.uri):
+                continue
             with _cache_lock:
                 _parse_cache.pop(change.uri, None)
             ctx._workspace_index.remove_file(change.uri)
+
+
+def _is_open_document(ls: LanguageServer, uri: str) -> bool:
+    try:
+        open_uris = list(ls.workspace.text_documents.keys())
+    except Exception:
+        return False
+    return any(ctx._same_file_uri(uri, open_uri) for open_uri in open_uris)
+
+
+# ─────────────────────── Symbol references (index-backed) ───────────────
+
+
+def _ref_locations(kind: str, name: str) -> List[types.Location]:
+    """Locations of every *kind* reference to *name* (exact name ranges)."""
+    return [
+        types.Location(
+            uri=ref_uri,
+            range=ctx._make_range(ref_uri, ref.line, ref.col, ref.length),
+        )
+        for ref_uri, ref in ctx._workspace_index.get_references(kind, name)
+    ]
+
+
+def _resolve_label_word(word: str, parser, line0: int) -> str:
+    """Expand a local label reference (``.sub``) to its full name."""
+    if not word.startswith("."):
+        return word
+    current = None
+    for lb in parser.get_all_labels():
+        if lb.lineno - 1 > line0:
+            break
+        current = lb.name.split(".", 1)[0]
+    return f"{current}{word}" if current else word
+
 
 # ─────────────────────── Document Symbols ────────────────────────────────
 
@@ -434,57 +467,16 @@ def goto_definition(
     lineno = pos.line + 1  # 1-based
     nodes = _find_nodes_at_line(parser, lineno)
     for node in nodes:
-        # Label definition → show all jump/call usages
+        # Label definition → show all usages (jump/call, Jump("…") …)
+        # Always return here — usages if found, else None.  Never fall
+        # through to the general label lookup (step 4) which would return a
+        # self-referential definition and cause VS Code to show a
+        # source-code preview in hover.
         if isinstance(node, Label):
-            results: List[types.Location] = []
-            seen: set = set()  # (uri, lineno) to dedupe
-            label_name = node.name
-            for fp in ctx._get_workspace_rpy_files():
-                file_uri, file_ast, file_parser = ctx._get_parse_for_file(fp)
-                for j in file_parser.get_all_jumps():
-                    if j.target == label_name:
-                        key = (file_uri, j.lineno)
-                        if key not in seen:
-                            seen.add(key)
-                            results.append(_make_node_location(file_uri, j))
-                for c in file_parser.get_all_calls():
-                    if c.target == label_name:
-                        key = (file_uri, c.lineno)
-                        if key not in seen:
-                            seen.add(key)
-                            results.append(_make_node_location(file_uri, c))
-            # Always return here — usages if found, else None.
-            # Never fall through to the general label lookup (step 4)
-            # which would return a self-referential definition and
-            # cause VS Code to show a source-code preview in hover.
-            return results if results else None
-
-        # Screen definition → show all call screen/show screen usages
+            return _dedup_locations(_ref_locations("label", node.name)) or None
+        # Screen definition → show all call/show/hide screen and use usages
         if isinstance(node, ScreenDef):
-            results = []
-            seen = set()
-            screen_name = node.name
-            for fp in ctx._get_workspace_rpy_files():
-                file_uri, file_ast, file_parser = ctx._get_parse_for_file(fp)
-                for n in file_parser._collect(file_ast, CallScreen):
-                    if n.screen_name == screen_name:
-                        key = (file_uri, n.lineno)
-                        if key not in seen:
-                            seen.add(key)
-                            results.append(_make_node_location(file_uri, n))
-                for n in file_parser._collect(file_ast, ShowScreen):
-                    if n.screen_name == screen_name:
-                        key = (file_uri, n.lineno)
-                        if key not in seen:
-                            seen.add(key)
-                            results.append(_make_node_location(file_uri, n))
-                for n in file_parser._collect(file_ast, HideScreen):
-                    if n.screen_name == screen_name:
-                        key = (file_uri, n.lineno)
-                        if key not in seen:
-                            seen.add(key)
-                            results.append(_make_node_location(file_uri, n))
-            return results if results else None
+            return _dedup_locations(_ref_locations("screen", node.name)) or None
 
     # ── 1) AST-based resolution: find node at cursor line ──
     for node in nodes:
@@ -517,6 +509,7 @@ def goto_definition(
     )
     if m:
         word = m.group(1)
+    word = _resolve_label_word(word, parser, pos.line)
 
     # ── 4) Symbol lookup across workspace ──
 
@@ -692,7 +685,9 @@ def _resolve_node_definition(
 
 @LSP_SERVER.feature(
     types.TEXT_DOCUMENT_COMPLETION,
-    types.CompletionOptions(trigger_characters=[" ", "."]),
+    types.CompletionOptions(
+        trigger_characters=[" ", ".", '"', "'"], resolve_provider=True
+    ),
 )
 def completions(
     ls: LanguageServer, params: types.CompletionParams
@@ -708,10 +703,27 @@ def completions(
     )
 
     _ast, parser = ctx._get_parse(uri)
-    items = _completion_items_for_context(uri, parser, doc.lines, pos.line, col)
+    trigger = params.context.trigger_character if params.context else None
+    items = _completion_items_for_context(
+        uri, parser, doc.lines, pos.line, col, trigger_character=trigger
+    )
 
     _log.debug("completion: %s → %d item(s)", _short_uri(uri), len(items))
     return types.CompletionList(is_incomplete=False, items=items)
+
+
+@LSP_SERVER.feature(types.COMPLETION_ITEM_RESOLVE)
+def completion_resolve(
+    ls: LanguageServer, item: types.CompletionItem
+) -> types.CompletionItem:
+    """Attach keyword documentation lazily (only for the focused item)."""
+    data = item.data if isinstance(item.data, dict) else None
+    doc = KEYWORD_DOCS.get(data.get("doc", "")) if data else None
+    if doc:
+        item.documentation = types.MarkupContent(
+            kind=types.MarkupKind.Markdown, value=doc
+        )
+    return item
 
 
 # ─────────────────────── Code Actions ────────────────────────────────────
@@ -788,6 +800,7 @@ def hover(ls: LanguageServer, params: types.HoverParams) -> Optional[types.Hover
         )
 
     ast, parser = ctx._get_parse(uri)
+    word = _resolve_label_word(word, parser, params.position.line)
 
     # 2) Check labels across workspace
     all_labels = ctx._get_all_workspace_labels()
@@ -1362,7 +1375,7 @@ def format_document(ls: LanguageServer, params: types.DocumentFormattingParams):
 def find_references(
     ls: LanguageServer, params: types.ReferenceParams
 ) -> Optional[List[types.Location]]:
-    """Find all references to labale/screen/define/default at cursor."""
+    """Find all references to the label/screen/define/default at cursor."""
     uri = params.text_document.uri
     doc = ls.workspace.get_text_document(uri)
     pos = params.position
@@ -1372,86 +1385,73 @@ def find_references(
     _log.info("references: %s L%d word=%r", _short_uri(uri), pos.line + 1, word)
     if not word:
         return None
+    _ast, parser = ctx._get_parse(uri)
+    word = _resolve_label_word(word, parser, pos.line)
+    include_decl = params.context.include_declaration
 
     results: List[types.Location] = []
+    for kind, getter in (
+        ("label", ctx._get_all_workspace_labels),
+        ("screen", ctx._get_all_workspace_screens),
+    ):
+        definitions = getter()
+        if word in definitions:
+            if include_decl:
+                results.extend(_make_node_location(u, n) for u, n in definitions[word])
+            results.extend(_ref_locations(kind, word))
+            return _dedup_ranges(results) or None
 
-    # Check if it's a label
-    all_labels = ctx._get_all_workspace_labels()
-    if word in all_labels:
-        # Include the definition(s) if requested
-        if params.context.include_declaration:
-            for target_uri, lb in all_labels[word]:
-                results.append(_make_node_location(target_uri, lb))
-        # Find all jump/call references
-        for fp in ctx._get_workspace_rpy_files():
-            file_uri, ast, parser = ctx._get_parse_for_file(fp)
-            for j in parser.get_all_jumps():
-                if j.target == word:
-                    results.append(_make_node_location(file_uri, j))
-            for c in parser.get_all_calls():
-                if c.target == word:
-                    results.append(_make_node_location(file_uri, c))
-        return results if results else None
-
-    # Check if it's a screen
-    all_screens = ctx._get_all_workspace_screens()
-    if word in all_screens:
-        if params.context.include_declaration:
-            for target_uri, s in all_screens[word]:
-                results.append(_make_node_location(target_uri, s))
-        # Find call screen / show screen references
-        for fp in ctx._get_workspace_rpy_files():
-            file_uri, ast, parser = ctx._get_parse_for_file(fp)
-            for node in parser._collect(ast, CallScreen):
-                if node.screen_name == word:
-                    results.append(_make_node_location(file_uri, node))
-            for node in parser._collect(ast, ShowScreen):
-                if node.screen_name == word:
-                    results.append(_make_node_location(file_uri, node))
-            for node in parser._collect(ast, HideScreen):
-                if node.screen_name == word:
-                    results.append(_make_node_location(file_uri, node))
-        return results if results else None
-
-    # Check defines/defaults
+    # Defines / defaults: whole-word occurrences, served from the per-file
+    # word map (open buffers included) instead of re-reading every file.
     all_defines = ctx._get_all_workspace_defines()
     all_defaults = ctx._get_all_workspace_defaults()
     if word in all_defines or word in all_defaults:
-        if params.context.include_declaration:
-            if word in all_defines:
-                for target_uri, d in all_defines[word]:
-                    results.append(_make_node_location(target_uri, d))
-            if word in all_defaults:
-                for target_uri, d in all_defaults[word]:
-                    results.append(_make_node_location(target_uri, d))
-        # Text search for usages (simple grep)
+        decl_lines = set()
+        for defs in (all_defines.get(word, ()), all_defaults.get(word, ())):
+            for def_uri, d in defs:
+                decl_lines.add((ctx._normalize_path_key(ctx._path_from_uri(def_uri)), d.lineno))
+                if include_decl:
+                    results.append(_make_node_location(def_uri, d))
+        pattern = re.compile(rf"(?<![\w.]){re.escape(word)}(?!\w)")
         for fp in ctx._get_workspace_rpy_files():
-            file_uri = _uri_from_path(fp)
-            try:
-                lines = (
-                    Path(fp).read_text(encoding="utf-8", errors="replace").splitlines()
-                )
-            except OSError:
+            file_uri, _file_ast, file_parser = ctx._get_parse_for_file(fp)
+            line_numbers = ctx._file_word_lines(file_uri).get(word)
+            if not line_numbers:
                 continue
-            for i, line in enumerate(lines):
-                # Skip define/default lines (definitions)
-                stripped = line.strip()
-                if stripped.startswith("define ") or stripped.startswith("default "):
+            norm = ctx._normalize_path_key(fp)
+            file_lines = file_parser.lines
+            for lineno in sorted(set(line_numbers)):
+                if (norm, lineno) in decl_lines or lineno > len(file_lines):
                     continue
-                # Check if word appears as identifier
-                if re.search(rf"\b{re.escape(word)}\b", line):
+                raw = file_lines[lineno - 1]
+                for m in pattern.finditer(raw):
                     results.append(
                         types.Location(
                             uri=file_uri,
-                            range=types.Range(
-                                start=types.Position(line=i, character=0),
-                                end=types.Position(line=i, character=len(line)),
+                            range=ctx._make_range(
+                                file_uri, lineno, m.start(), len(word), lines=file_lines
                             ),
                         )
                     )
-        return results if results else None
+        return _dedup_ranges(results) or None
 
     return None
+
+
+def _dedup_ranges(locations: List[types.Location]) -> List[types.Location]:
+    """Remove locations with an identical (file, start position)."""
+    seen: set = set()
+    result: List[types.Location] = []
+    for loc in locations:
+        key = (
+            ctx._normalize_path_key(ctx._path_from_uri(loc.uri)),
+            loc.range.start.line,
+            loc.range.start.character,
+        )
+        if key not in seen:
+            seen.add(key)
+            result.append(loc)
+    return result
 
 
 # ─────────────────────── Color Preview ───────────────────────────────────
@@ -1570,53 +1570,76 @@ def color_presentation(
 # ─────────────────────── Rename Support ──────────────────────────────────
 
 
+_RE_RENAME_NAME = re.compile(r"^[a-zA-Z_\u4e00-\u9fff\u3400-\u4dbf][\w\u4e00-\u9fff\u3400-\u4dbf]*$")
+
+
+def _rename_target(ls: LanguageServer, uri: str, position: types.Position):
+    """Resolve the label/screen under the cursor.
+
+    Returns ``(kind, full_name, line_text, span)`` where *span* is the
+    (start, end) Python column range of the renamable segment — the last
+    dotted component, so ``start.sub`` / ``.sub`` rename just ``sub``.
+    """
+    doc = ls.workspace.get_text_document(uri)
+    line_text = doc.lines[position.line] if position.line < len(doc.lines) else ""
+    line_text = line_text.rstrip("\r\n")
+    col = _utf16_col_to_utf32(line_text, position.character)
+    start, end = _word_boundaries(line_text, col)
+    word = line_text[start:end]
+    if not word:
+        return None
+    _ast, parser = ctx._get_parse(uri)
+    full = _resolve_label_word(word, parser, position.line)
+    if full in ctx._get_all_workspace_labels():
+        kind = "label"
+    elif full in ctx._get_all_workspace_screens():
+        kind = "screen"
+    else:
+        return None
+    last_dot = word.rfind(".")
+    if last_dot >= 0:
+        start += last_dot + 1
+    return kind, full, line_text, (start, end)
+
+
 @LSP_SERVER.feature(types.TEXT_DOCUMENT_PREPARE_RENAME)
 def prepare_rename(
     ls: LanguageServer, params: types.PrepareRenameParams
 ) -> Optional[types.Range]:
     """Check if rename is allowed at the cursor position."""
     uri = params.text_document.uri
-    doc = ls.workspace.get_text_document(uri)
-    pos = params.position
-    line_text = doc.lines[pos.line] if pos.line < len(doc.lines) else ""
-    col = _utf16_col_to_utf32(line_text, pos.character)
-    word = _word_at_position(line_text, col)
-    _log.info("prepareRename: %s L%d word=%r", _short_uri(uri), pos.line + 1, word)
-    if not word:
+    target = _rename_target(ls, uri, params.position)
+    _log.info("prepareRename: %s L%d → %s", _short_uri(uri), params.position.line + 1,
+              target[1] if target else None)
+    if target is None:
         return None
-
-    # Only allow renaming labels and screens
-    all_labels = ctx._get_all_workspace_labels()
-    all_screens = ctx._get_all_workspace_screens()
-
-    if word in all_labels or word in all_screens:
-        # Find the word boundaries
-        start, end = _word_boundaries(line_text, col)
-        return types.Range(
-            start=types.Position(line=pos.line, character=start),
-            end=types.Position(line=pos.line, character=end),
-        )
-
-    return None
+    _kind, _full, line_text, (start, end) = target
+    return types.Range(
+        start=types.Position(
+            line=params.position.line, character=ctx._utf32_col_to_utf16(line_text, start)
+        ),
+        end=types.Position(
+            line=params.position.line, character=ctx._utf32_col_to_utf16(line_text, end)
+        ),
+    )
 
 
 def _word_boundaries(line: str, col: int) -> Tuple[int, int]:
-    """Return (start, end) character positions of the word at col."""
+    """Return (start, end) positions of the (possibly dotted) name at col."""
     if col >= len(line):
         col = len(line) - 1
     if col < 0:
         return (0, 0)
 
-    # Find start
+    def is_name_char(ch: str) -> bool:
+        return ch.isalnum() or ch in "_."
+
     start = col
-    while start > 0 and (line[start - 1].isalnum() or line[start - 1] in "_"):
+    while start > 0 and is_name_char(line[start - 1]):
         start -= 1
-
-    # Find end
     end = col
-    while end < len(line) and (line[end].isalnum() or line[end] in "_"):
+    while end < len(line) and is_name_char(line[end]):
         end += 1
-
     return (start, end)
 
 
@@ -1624,256 +1647,58 @@ def _word_boundaries(line: str, col: int) -> Tuple[int, int]:
 def rename(
     ls: LanguageServer, params: types.RenameParams
 ) -> Optional[types.WorkspaceEdit]:
-    """Rename a label or screen across all workspace files."""
+    """Rename a label or screen — definitions and every reference
+    (statements, ``use``, and ``Jump("…")``-style strings) — workspace-wide.
+
+    For a dotted label only the last component is renamed: ``start.sub`` →
+    ``start.new`` and local references ``.sub`` → ``.new``.
+    """
     uri = params.text_document.uri
-    doc = ls.workspace.get_text_document(uri)
-    pos = params.position
-    line_text = doc.lines[pos.line] if pos.line < len(doc.lines) else ""
-    col = _utf16_col_to_utf32(line_text, pos.character)
-    old_name = _word_at_position(line_text, col)
-    new_name = params.new_name
-    _log.info("rename: %s %r → %r", _short_uri(uri), old_name, new_name)
-
-    if not old_name or not new_name:
+    target = _rename_target(ls, uri, params.position)
+    new_segment = params.new_name.strip().lstrip(".")
+    if target is None or not _RE_RENAME_NAME.match(new_segment):
         return None
+    kind, old_full, _line_text, _span = target
+    old_segment = old_full.rsplit(".", 1)[-1]
+    _log.info("rename: %s %r → %r", kind, old_full, new_segment)
 
-    changes: Dict[str, List[types.TextEdit]] = {}
+    edits: Dict[str, List[types.TextEdit]] = {}
+    seen: set = set()
 
-    # Rename labels
-    all_labels = ctx._get_all_workspace_labels()
-    if old_name in all_labels:
-        # Rename label definitions
-        for target_uri, lb in all_labels[old_name]:
-            if target_uri not in changes:
-                changes[target_uri] = []
-            # Find the label name in the line
-            file_doc = ls.workspace.get_text_document(target_uri)
-            if lb.lineno - 1 < len(file_doc.lines):
-                label_line = file_doc.lines[lb.lineno - 1]
-                m = re.search(rf"\blabel\s+{re.escape(old_name)}\b", label_line)
-                if m:
-                    start_col = m.start() + len("label ")
-                    # Skip whitespace
-                    while (
-                        start_col < len(label_line) and label_line[start_col].isspace()
-                    ):
-                        start_col += 1
-                    end_col = start_col + len(old_name)
-                    changes[target_uri].append(
-                        types.TextEdit(
-                            range=types.Range(
-                                start=types.Position(
-                                    line=lb.lineno - 1, character=start_col
-                                ),
-                                end=types.Position(
-                                    line=lb.lineno - 1, character=end_col
-                                ),
-                            ),
-                            new_text=new_name,
-                        )
-                    )
+    def add_edit(edit_uri: str, lineno: int, col: int, text: str, lines) -> None:
+        # *text* is the name as written at (lineno, col): the full name, a
+        # local ``.sub`` form, or the bare segment of a definition.
+        if not text.endswith(old_segment):
+            return
+        seg_col = col + len(text) - len(old_segment)
+        key = (ctx._normalize_path_key(ctx._path_from_uri(edit_uri)), lineno, seg_col)
+        if key in seen:
+            return
+        seen.add(key)
+        edits.setdefault(edit_uri, []).append(
+            types.TextEdit(
+                range=ctx._make_range(edit_uri, lineno, seg_col, len(old_segment), lines=lines),
+                new_text=new_segment,
+            )
+        )
 
-        # Rename jump/call references — only scan files that contain matching targets
-        _jump_uris = set(ctx._workspace_index.get_jump_target_uris(old_name))
-        _call_uris = set(ctx._workspace_index.get_call_target_uris(old_name))
-        _ref_uris = _jump_uris | _call_uris
-        for ref_uri in _ref_uris:
-            try:
-                file_doc = ls.workspace.get_text_document(ref_uri)
-            except Exception:
-                continue
-            fp = ctx._path_from_uri(ref_uri)
-            if not fp:
-                continue
-            _, ast, parser = ctx._get_parse_for_file(fp)
+    definitions = (
+        ctx._get_all_workspace_labels() if kind == "label" else ctx._get_all_workspace_screens()
+    )
+    for def_uri, node in definitions.get(old_full, ()):
+        lines = ctx._source_lines(def_uri)
+        raw = lines[node.lineno - 1] if 0 < node.lineno <= len(lines) else ""
+        span = ctx._node_name_span(node, raw)
+        if span is not None:
+            col, length = span
+            add_edit(def_uri, node.lineno, col, raw[col : col + length], lines)
 
-            if ref_uri in _jump_uris:
-                for j in parser.get_all_jumps():
-                    if j.target == old_name:
-                        if ref_uri not in changes:
-                            changes[ref_uri] = []
-                        if j.lineno - 1 < len(file_doc.lines):
-                            jump_line = file_doc.lines[j.lineno - 1]
-                            m = re.search(
-                                rf"\bjump\s+(?:expression\s+)?{re.escape(old_name)}\b",
-                                jump_line,
-                            )
-                            if m:
-                                start_col = jump_line.find(old_name, m.start())
-                                if start_col >= 0:
-                                    changes[ref_uri].append(
-                                        types.TextEdit(
-                                            range=types.Range(
-                                                start=types.Position(
-                                                    line=j.lineno - 1,
-                                                    character=start_col,
-                                                ),
-                                                end=types.Position(
-                                                    line=j.lineno - 1,
-                                                    character=start_col + len(old_name),
-                                                ),
-                                            ),
-                                            new_text=new_name,
-                                        )
-                                    )
+    for ref_uri, ref in ctx._workspace_index.get_references(kind, old_full):
+        lines = ctx._source_lines(ref_uri)
+        raw = lines[ref.line - 1] if 0 < ref.line <= len(lines) else ""
+        add_edit(ref_uri, ref.line, ref.col, raw[ref.col : ref.col + ref.length], lines)
 
-            if ref_uri in _call_uris:
-                for c in parser.get_all_calls():
-                    if c.target == old_name:
-                        if ref_uri not in changes:
-                            changes[ref_uri] = []
-                        if c.lineno - 1 < len(file_doc.lines):
-                            call_line = file_doc.lines[c.lineno - 1]
-                            m = re.search(
-                                rf"\bcall\s+(?:expression\s+)?{re.escape(old_name)}\b",
-                                call_line,
-                            )
-                            if m:
-                                start_col = call_line.find(old_name, m.start())
-                                if start_col >= 0:
-                                    changes[ref_uri].append(
-                                        types.TextEdit(
-                                            range=types.Range(
-                                                start=types.Position(
-                                                    line=c.lineno - 1,
-                                                    character=start_col,
-                                                ),
-                                                end=types.Position(
-                                                    line=c.lineno - 1,
-                                                    character=start_col + len(old_name),
-                                                ),
-                                            ),
-                                            new_text=new_name,
-                                        )
-                                    )
-
-        return types.WorkspaceEdit(changes=changes) if changes else None
-
-    # Rename screens
-    all_screens = ctx._get_all_workspace_screens()
-    if old_name in all_screens:
-        # Rename screen definitions
-        for target_uri, s in all_screens[old_name]:
-            if target_uri not in changes:
-                changes[target_uri] = []
-            file_doc = ls.workspace.get_text_document(target_uri)
-            if s.lineno - 1 < len(file_doc.lines):
-                screen_line = file_doc.lines[s.lineno - 1]
-                m = re.search(rf"\bscreen\s+{re.escape(old_name)}\b", screen_line)
-                if m:
-                    start_col = m.start() + len("screen ")
-                    while (
-                        start_col < len(screen_line)
-                        and screen_line[start_col].isspace()
-                    ):
-                        start_col += 1
-                    end_col = start_col + len(old_name)
-                    changes[target_uri].append(
-                        types.TextEdit(
-                            range=types.Range(
-                                start=types.Position(
-                                    line=s.lineno - 1, character=start_col
-                                ),
-                                end=types.Position(
-                                    line=s.lineno - 1, character=end_col
-                                ),
-                            ),
-                            new_text=new_name,
-                        )
-                    )
-
-        # Rename call screen / show screen references
-        for fp in ctx._get_workspace_rpy_files():
-            file_uri, ast, parser = ctx._get_parse_for_file(fp)
-            file_doc = ls.workspace.get_text_document(file_uri)
-
-            for node in parser._collect(ast, CallScreen):
-                if node.screen_name == old_name:
-                    if file_uri not in changes:
-                        changes[file_uri] = []
-                    if node.lineno - 1 < len(file_doc.lines):
-                        node_line = file_doc.lines[node.lineno - 1]
-                        m = re.search(
-                            rf"\bcall\s+screen\s+{re.escape(old_name)}\b", node_line
-                        )
-                        if m:
-                            start_col = node_line.find(old_name, m.start())
-                            if start_col >= 0:
-                                changes[file_uri].append(
-                                    types.TextEdit(
-                                        range=types.Range(
-                                            start=types.Position(
-                                                line=node.lineno - 1,
-                                                character=start_col,
-                                            ),
-                                            end=types.Position(
-                                                line=node.lineno - 1,
-                                                character=start_col + len(old_name),
-                                            ),
-                                        ),
-                                        new_text=new_name,
-                                    )
-                                )
-
-            for node in parser._collect(ast, ShowScreen):
-                if node.screen_name == old_name:
-                    if file_uri not in changes:
-                        changes[file_uri] = []
-                    if node.lineno - 1 < len(file_doc.lines):
-                        node_line = file_doc.lines[node.lineno - 1]
-                        m = re.search(
-                            rf"\bshow\s+screen\s+{re.escape(old_name)}\b", node_line
-                        )
-                        if m:
-                            start_col = node_line.find(old_name, m.start())
-                            if start_col >= 0:
-                                changes[file_uri].append(
-                                    types.TextEdit(
-                                        range=types.Range(
-                                            start=types.Position(
-                                                line=node.lineno - 1,
-                                                character=start_col,
-                                            ),
-                                            end=types.Position(
-                                                line=node.lineno - 1,
-                                                character=start_col + len(old_name),
-                                            ),
-                                        ),
-                                        new_text=new_name,
-                                    )
-                                )
-
-            for node in parser._collect(ast, HideScreen):
-                if node.screen_name == old_name:
-                    if file_uri not in changes:
-                        changes[file_uri] = []
-                    if node.lineno - 1 < len(file_doc.lines):
-                        node_line = file_doc.lines[node.lineno - 1]
-                        m = re.search(
-                            rf"\bhide\s+screen\s+{re.escape(old_name)}\b", node_line
-                        )
-                        if m:
-                            start_col = node_line.find(old_name, m.start())
-                            if start_col >= 0:
-                                changes[file_uri].append(
-                                    types.TextEdit(
-                                        range=types.Range(
-                                            start=types.Position(
-                                                line=node.lineno - 1,
-                                                character=start_col,
-                                            ),
-                                            end=types.Position(
-                                                line=node.lineno - 1,
-                                                character=start_col + len(old_name),
-                                            ),
-                                        ),
-                                        new_text=new_name,
-                                    )
-                                )
-
-        return types.WorkspaceEdit(changes=changes) if changes else None
-
-    return None
+    return types.WorkspaceEdit(changes=edits) if edits else None
 
 
 # ─────────────────────── Workspace Commands ─────────────────────────────
@@ -1888,6 +1713,7 @@ def cmd_refresh_workspace() -> Dict[str, object]:
         _parse_cache.clear()
         _path_to_uri.clear()
     _renpy_py_cache.clear()
+    ctx.invalidate_asset_caches()
 
     # Full rebuild of workspace index (re-globs + re-parses all files)
     t0 = _time.monotonic()

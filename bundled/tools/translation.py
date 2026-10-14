@@ -23,9 +23,7 @@ from typing import Dict, Generator, List, Optional, Tuple, Union
 from lsprotocol import types
 
 from ast_parser import (
-    If,
     Label,
-    Menu,
     MenuItem,
     NarratorSay,
     Node,
@@ -87,16 +85,7 @@ def _collect_dialogue_with_labels(
         if isinstance(node, (Say, NarratorSay)):
             yield node, current_label
         # Recurse into children (body, elif, else, menu items, …)
-        children: List[Node] = []
-        if hasattr(node, "body") and isinstance(node.body, list):
-            children.extend(node.body)
-        if isinstance(node, If):
-            for ec in node.elif_clauses:
-                children.append(ec)
-                children.extend(ec.body)
-            children.extend(node.else_body)
-        if isinstance(node, Menu):
-            children.extend(node.body)
+        children = RpyParser._children_of(node)
         if children:
             yield from _collect_dialogue_with_labels(children, current_label)
 

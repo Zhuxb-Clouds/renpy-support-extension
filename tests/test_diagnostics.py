@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from textwrap import dedent
+from types import SimpleNamespace
 
 import server_context as ctx
 from ast_parser import RpyParser
@@ -493,3 +494,73 @@ def test_full_diagnostics_needed_tracks_published_hash(monkeypatch) -> None:
         with ctx._cache_lock:
             ctx._parse_cache.pop(uri, None)
         diagnostics.forget_document(uri)
+
+
+# ── Regressions from the index / scheduling rework ──────────────────────
+
+
+def test_undefined_label_check_does_not_mutate_the_shared_label_map(monkeypatch) -> None:
+    parser = parse(
+        """
+        label start:
+            jump start
+        """
+    )
+    shared: dict = {}
+    patch_index(monkeypatch, parser)
+    monkeypatch.setattr(ctx, "_get_all_workspace_labels", lambda: shared)
+    diags: list = []
+    diagnostics._check_undefined_labels(URI, parser, diags)
+    assert diags == [] and shared == {}
+
+
+def test_label_used_only_by_action_string_is_not_unused(monkeypatch) -> None:
+    diags = collect(
+        monkeypatch,
+        """
+        screen menu_screen():
+            textbutton "Go" action Jump("secret")
+        label secret:
+            return
+        """,
+    )
+    assert "unused-label" not in codes(diags)
+
+
+def test_unclosed_bracket_has_its_own_code(monkeypatch) -> None:
+    diags = collect(
+        monkeypatch,
+        """
+        label start:
+            $ x = foo(
+            return
+        """,
+    )
+    assert "unclosed-delimiter" in codes(diags)
+
+
+def test_stale_results_are_not_published(monkeypatch) -> None:
+    text = "label start:\n    return\n"
+    parser = RpyParser(text)
+    ast = parser.parse()
+    published = []
+    monkeypatch.setitem(ctx._parse_cache, URI, (hash(text), text, ast, parser))
+    monkeypatch.setattr(ctx, "_get_parse", lambda uri: (ast, parser))
+    monkeypatch.setattr(diagnostics, "_collect_full_diagnostics", lambda *a: [])
+    monkeypatch.setattr(ctx._workspace_index, "update_file", lambda uri: None)
+    monkeypatch.setattr(ctx, "_run_on_main_loop", lambda fn, p: published.append(p))
+    fake_server = SimpleNamespace(
+        workspace=SimpleNamespace(text_documents={}),
+        text_document_publish_diagnostics=lambda params: None,
+    )
+    monkeypatch.setattr(diagnostics, "LSP_SERVER", fake_server)
+
+    # Buffer edited while the pass ran → skipped
+    fake_server.workspace.text_documents = {URI: SimpleNamespace(source=text + "x")}
+    diagnostics._publish_diagnostics(URI)
+    assert published == []
+
+    # Buffer unchanged → published
+    fake_server.workspace.text_documents = {URI: SimpleNamespace(source=text)}
+    diagnostics._publish_diagnostics(URI)
+    assert len(published) == 1

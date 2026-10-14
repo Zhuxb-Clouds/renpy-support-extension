@@ -106,8 +106,10 @@ def test_completion_suggests_variables_styles_transforms_and_screens(monkeypatch
     )
     patch_workspace_symbols(monkeypatch, parser)
 
+    # ``$`` is a Python expression: variables, but no labels/keywords
     general = labels(complete(lines, parser, 12))
-    assert {"e", "audio.theme", "has_key", "start"} <= general
+    assert {"e", "audio.theme", "has_key"} <= general
+    assert "start" not in general and "jump" not in general
 
     transforms = labels(complete(lines, parser, 13))
     assert {"center", "bounce"} <= transforms
@@ -208,3 +210,156 @@ def test_completion_inside_screen_transform_and_style_blocks() -> None:
 
     style_items = labels(complete(lines, parser, 7))
     assert {"color", "font", "hover_color"} <= style_items
+
+
+# ── Replace ranges, quiet contexts, new providers ───────────────────────
+
+
+def by_label(items):
+    return {item.label: item for item in items}
+
+
+def edit_span(item) -> tuple[int, int]:
+    rng = item.text_edit.range
+    return rng.start.character, rng.end.character
+
+
+def test_image_attribute_completion_replaces_only_the_last_word(monkeypatch) -> None:
+    lines, parser = parse(
+        """
+        image eileen happy = "e_happy.png"
+        image eileen sad = "e_sad.png"
+        image bg room = "room.png"
+        label start:
+            show eileen ha
+            show eil
+        """
+    )
+    patch_workspace_symbols(monkeypatch, parser)
+    monkeypatch.setattr(ctx, "_ensure_image_cache", lambda: None)
+    monkeypatch.setattr(ctx, "_image_cache", {})
+
+    attrs = by_label(complete(lines, parser, 4))
+    assert {"happy", "sad"} <= set(attrs) and "bg room" not in attrs
+    assert "at" in attrs  # clause keywords follow a complete tag
+    line = lines[4]
+    assert edit_span(attrs["happy"]) == (len(line) - 2, len(line))
+
+    full = by_label(complete(lines, parser, 5))
+    assert "eileen happy" in full
+    line = lines[5]
+    assert edit_span(full["eileen happy"]) == (len(line) - 3, len(line))
+    assert full["eileen happy"].text_edit.new_text == "eileen happy"
+
+
+def test_label_completion_replaces_dotted_and_cjk_prefixes(monkeypatch) -> None:
+    lines, parser = parse(
+        """
+        label 日内-彩票站:
+            return
+        label start:
+            jump 日内
+        """
+    )
+    patch_workspace_symbols(monkeypatch, parser)
+    items = by_label(complete(lines, parser, 3))
+    line = lines[3]
+    assert edit_span(items["start"]) == (len(line) - 2, len(line))
+
+
+def test_no_completion_inside_dialogue_or_comments(monkeypatch) -> None:
+    lines, parser = parse(
+        """
+        define e = Character("Eileen")
+        label start:
+            e "Hello there 
+            # a comment with 
+            e "done" 
+        """
+    )
+    patch_workspace_symbols(monkeypatch, parser)
+    assert complete(lines, parser, 2) == []
+    assert complete(lines, parser, 3) == []
+    # after a finished say statement: unknown mid-statement context
+    assert complete(lines, parser, 4) == []
+
+
+def test_space_trigger_on_indentation_offers_nothing(monkeypatch) -> None:
+    lines, parser = parse(
+        """
+        define e = Character("Eileen")
+        label start:
+        """
+    )
+    lines.append("    ")
+    patch_workspace_symbols(monkeypatch, parser)
+    assert _completion_items_for_context(URI, parser, lines, 2, 4, " ") == []
+    invoked = labels(_completion_items_for_context(URI, parser, lines, 2, 4))
+    assert {"e", "jump", "show"} <= invoked  # characters + statements
+    assert "start" not in invoked
+
+
+def test_label_and_screen_names_complete_inside_action_strings(monkeypatch) -> None:
+    lines, parser = parse(
+        """
+        screen inventory():
+            textbutton "Go" action Jump("en
+            textbutton "Inv" action Show("
+        label ending:
+            return
+        """
+    )
+    patch_workspace_symbols(monkeypatch, parser)
+    jump_items = by_label(complete(lines, parser, 1))
+    assert "ending" in jump_items
+    line = lines[1]
+    assert edit_span(jump_items["ending"]) == (len(line) - 2, len(line))
+    assert "inventory" in labels(complete(lines, parser, 2))
+
+
+def test_with_and_at_include_workspace_transitions_and_transforms(monkeypatch) -> None:
+    lines, parser = parse(
+        """
+        define slowfade = Dissolve(2.0)
+        define bounce = Transform(zoom=1.2)
+        define e = Character("Eileen")
+        label start:
+            show eileen with 
+            show eileen at 
+        """
+    )
+    patch_workspace_symbols(monkeypatch, parser)
+    with_items = labels(complete(lines, parser, 4))
+    assert {"slowfade", "dissolve"} <= with_items and "e" not in with_items
+    at_items = labels(complete(lines, parser, 5))
+    assert {"bounce", "left"} <= at_items and "slowfade" not in at_items
+
+
+def test_local_label_and_engine_namespace_completion(monkeypatch) -> None:
+    lines, parser = parse(
+        """
+        label start:
+            jump .
+        label .sub:
+            $ renpy.
+            return
+        """
+    )
+    patch_workspace_symbols(monkeypatch, parser)
+    assert ".sub" in labels(complete(lines, parser, 1))
+    renpy_items = labels(complete(lines, parser, 3))
+    assert {"jump", "show_screen", "notify"} <= renpy_items
+
+
+def test_local_symbols_sort_before_builtins(monkeypatch) -> None:
+    lines, parser = parse(
+        """
+        transform bounce:
+            alpha 0.0
+        label start:
+            show eileen at 
+        """
+    )
+    patch_workspace_symbols(monkeypatch, parser)
+    items = by_label(complete(lines, parser, 3))
+    assert items["bounce"].sort_text < items["left"].sort_text

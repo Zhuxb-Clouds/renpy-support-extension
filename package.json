@@ -194,6 +194,12 @@
           "default": "collapse",
           "markdownDescription": "Blank-line handling when formatting:\n\n- `preserve` — leave blank lines untouched\n- `collapse` — collapse consecutive blank lines into one\n- `betweenSay` — like `collapse`, plus insert one blank line between dialogue/narration lines inside `label` script blocks\n- `strip` — remove all blank lines\n\nOverridden per key by `.renpy-format.json` in the workspace root when present."
         },
+        "renpy-lsp.logLevel": {
+          "type": "string",
+          "enum": ["error", "warning", "info", "debug"],
+          "default": "info",
+          "description": "Verbosity of the language server's log in the Output panel."
+        },
         "renpy-lsp.diagnostics.enabled": {
           "type": "boolean",
           "default": true,
@@ -207,9 +213,10 @@
         "renpy-lsp.diagnostics.severity": {
           "type": "object",
           "default": {},
-          "markdownDescription": "Per-check severity overrides. Keys are check codes, values one of `error`, `warning`, `information`, `hint`, or `none` (disable the check). Example: `{ \"unused-label\": \"none\", \"undefined-transform\": \"information\" }`.\n\nChecks: `unknown-statement`, `empty-atl-block`, `undefined-label`, `duplicate-label`, `duplicate-screen`, `missing-image-file`, `undefined-image`, `undefined-transform`, `undefined-style`, `unused-label`, `unused-define`, `translation-missing-old`, `translation-missing-new`, `translation-stale`.",
+          "markdownDescription": "Per-check severity overrides. Keys are check codes, values one of `error`, `warning`, `information`, `hint`, or `none` (disable the check). Example: `{ \"unused-label\": \"none\", \"undefined-transform\": \"information\" }`.\n\nChecks: `unknown-statement`, `unclosed-delimiter`, `empty-atl-block`, `undefined-label`, `duplicate-label`, `duplicate-screen`, `missing-image-file`, `undefined-image`, `undefined-transform`, `undefined-style`, `unused-label`, `unused-define`, `translation-missing-old`, `translation-missing-new`, `translation-stale`.",
           "properties": {
             "unknown-statement": { "type": "string", "enum": ["error", "warning", "information", "hint", "none"] },
+            "unclosed-delimiter": { "type": "string", "enum": ["error", "warning", "information", "hint", "none"] },
             "empty-atl-block": { "type": "string", "enum": ["error", "warning", "information", "hint", "none"] },
             "undefined-label": { "type": "string", "enum": ["error", "warning", "information", "hint", "none"] },
             "duplicate-label": { "type": "string", "enum": ["error", "warning", "information", "hint", "none"] },

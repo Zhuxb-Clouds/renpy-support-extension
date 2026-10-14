@@ -22,6 +22,11 @@ class Node:
     lineno: int  # 1-based line number
     end_lineno: int  # 1-based end line (updated after block is parsed)
     indent: int  # column offset (number of leading spaces)
+    # 0-based column of the node's name/target on its first line (-1 = unknown)
+    name_col: int = field(default=-1, compare=False)
+    # Length of the name text at ``name_col`` as written (``.sub`` for a
+    # local label even though ``name`` holds the resolved ``start.sub``)
+    name_len: int = field(default=0, compare=False)
 
     def __post_init__(self):
         if self.end_lineno == 0:
@@ -412,7 +417,7 @@ class Unknown(Node):
 
 # Pre-compiled patterns for performance.
 _RE_LABEL = re.compile(
-    r"^label\s+([a-zA-Z_\u4e00-\u9fff\u3400-\u4dbf][\w.]*)\s*(?:\((.*)\))?\s*:$"
+    r"^label\s+(\.?[a-zA-Z_\u4e00-\u9fff\u3400-\u4dbf][\w.]*)\s*(?:\((.*)\))?\s*:$"
 )
 _RE_DEFINE = re.compile(
     r"^define\s+([a-zA-Z_\u4e00-\u9fff\u3400-\u4dbf][\w.]*)\s*=\s*(.+)$"
@@ -443,10 +448,10 @@ _RE_MENU = re.compile(r"^menu\s*(?:(\w+)\s*)?:$")
 _RE_MENU_ITEM = re.compile(r'^"(.+?)"\s*(?:if\s+(.+))?:$')
 
 _RE_JUMP = re.compile(
-    r"^jump\s+(expression\s+)?([a-zA-Z_\u4e00-\u9fff\u3400-\u4dbf][\w.]*)$"
+    r"^jump\s+(expression\s+)?(\.?[a-zA-Z_\u4e00-\u9fff\u3400-\u4dbf][\w.]*)$"
 )
 _RE_CALL = re.compile(
-    r"^call\s+(expression\s+)?([a-zA-Z_\u4e00-\u9fff\u3400-\u4dbf][\w.]*)\s*(?:\((.*)\))?\s*(?:from\s+([a-zA-Z_\u4e00-\u9fff\u3400-\u4dbf]\w*))?$"
+    r"^call\s+(expression\s+)?(\.?[a-zA-Z_\u4e00-\u9fff\u3400-\u4dbf][\w.]*)\s*(?:\((.*)\))?\s*(?:from\s+([a-zA-Z_\u4e00-\u9fff\u3400-\u4dbf]\w*))?$"
 )
 _RE_CALL_SCREEN = re.compile(
     r"^call\s+screen\s+([\w\u4e00-\u9fff\u3400-\u4dbf]+)\s*(?:\((.*)\))?\s*$"
@@ -543,6 +548,68 @@ _RE_WINDOW = re.compile(r"^window\s+(show|hide|auto)(?:\s+(.+))?$")
 _RE_PAUSE = re.compile(r"^pause(?:\s*\((.+?)\)|\s+(.+))?$")
 
 
+# Complete string literals and trailing comments — removed before counting
+# brackets, so only code outside strings is measured.
+_RE_STRINGS_AND_COMMENT = re.compile(
+    r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|#.*'
+)
+_RE_QUOTE = re.compile(r"[\"']")
+_RE_STRING_REST = {
+    '"': re.compile(r'(?:\\.|[^"\\])*"'),
+    "'": re.compile(r"(?:\\.|[^'\\])*'"),
+}
+
+
+def scan_code(text: str, quote: Optional[str] = None) -> Tuple[int, Optional[str]]:
+    """Scan *text* string- and comment-aware.
+
+    Starts inside the string opened by *quote* (``None`` = code).  Returns
+    ``(bracket_delta, open_quote)``: the net ``([{`` minus ``)]}`` count
+    outside strings, and the quote character still open at the end of the
+    text (``None`` when every string is closed).  A ``#`` outside a string
+    ends the scan.
+    """
+    if quote is not None:
+        m = _RE_STRING_REST[quote].match(text)
+        if m is None:
+            return 0, quote  # the whole text is still inside the string
+        text = text[m.end() :]
+    code = _RE_STRINGS_AND_COMMENT.sub(" ", text)
+    open_quote = None
+    m = _RE_QUOTE.search(code)
+    if m is not None:
+        # An unterminated string: everything after it is string content.
+        open_quote = m.group(0)
+        code = code[: m.start()]
+    depth = (
+        code.count("(") + code.count("[") + code.count("{")
+        - code.count(")") - code.count("]") - code.count("}")
+    )
+    return depth, open_quote
+
+
+# Statement keyword(s) preceding a node's name: ``label ``, ``call screen ``,
+# ``jump expression ``, ``define `` …
+_RE_NAME_START = re.compile(r"^\S+\s+(?:(?:screen|expression)\s+)?")
+
+_RE_FIRST_WORD = re.compile(r"\w+")
+
+# First words that can start a keyword statement (see _parse_statement).
+_STATEMENT_KEYWORDS = frozenset(
+    {
+        "label", "define", "default", "image", "transform", "screen", "style",
+        "init", "python", "translate", "if", "elif", "else", "while", "for",
+        "menu", "jump", "call", "return", "pass", "camera", "scene", "show",
+        "hide", "with", "play", "stop", "queue", "voice", "nvl", "window",
+        "pause",
+    }
+)
+
+# Upper bound on physical lines joined into one logical line — a safety net
+# against an unclosed bracket swallowing the rest of a huge file.
+_MAX_CONTINUATION_LINES = 400
+
+
 # ──────────────────────────── Parser ─────────────────────────────────────
 
 
@@ -579,11 +646,9 @@ class RpyParser:
     def parse(self) -> Script:
         """Parse the source and return the root :class:`Script` node."""
         stack: List[_StackEntry] = [_StackEntry(0, self.root)]
-        # Track bracket nesting for multi-line continuation
-        _bracket_depth = 0
-        _continuation_lines: List[str] = []
-        _continuation_start = 0
-        _continuation_indent = 0
+        # Global label that local labels (``label .sub``) and local jumps
+        # (``jump .sub``) resolve against.
+        self._global_label: Optional[str] = None
 
         while self.pos < len(self.lines):
             raw = self.lines[self.pos]
@@ -591,34 +656,11 @@ class RpyParser:
 
             line = raw.rstrip()
             if not line.strip():
-                # If inside a bracket continuation, keep blank lines
-                if _bracket_depth > 0:
-                    _continuation_lines.append("")
                 continue
 
             indent = len(line) - len(line.lstrip(" "))
             content = line.strip()
             lineno = self.pos  # 1-based
-
-            # ── Handle multi-line bracket continuation ──
-            if _bracket_depth > 0:
-                _continuation_lines.append(content)
-                _bracket_depth += (
-                    content.count("(") + content.count("[") + content.count("{")
-                )
-                _bracket_depth -= (
-                    content.count(")") + content.count("]") + content.count("}")
-                )
-                if _bracket_depth <= 0:
-                    # Rejoin and parse as one logical line
-                    _bracket_depth = 0
-                    content = " ".join(ln for ln in _continuation_lines if ln)
-                    lineno = _continuation_start
-                    indent = _continuation_indent
-                    _continuation_lines = []
-                    # Fall through to normal parsing below
-                else:
-                    continue
 
             # ── Detect triple-quoted strings and skip to closing ──
             if '"""' in content:
@@ -632,45 +674,13 @@ class RpyParser:
                             break
                     continue
 
-            # ── Check for unclosed brackets (multi-line continuation) ──
-            depth = (
-                content.count("(")
-                + content.count("[")
-                + content.count("{")
-                - content.count(")")
-                - content.count("]")
-                - content.count("}")
-            )
-            if depth > 0:
-                _bracket_depth = depth
-                _continuation_lines = [content]
-                _continuation_start = lineno
-                _continuation_indent = indent
-                continue
-
-            # ── Check for unclosed double-quoted strings (multi-line continuation) ──
-            # If the line has an odd number of double quotes and is not a comment,
-            # it's an unclosed string that continues on the next line(s).
+            # ── Multi-line logical lines: unclosed brackets / strings ──
+            # Brackets and quotes are counted string- and comment-aware, so
+            # dialogue such as ``e "I'm sad :("`` never opens a continuation.
             if not content.startswith("#"):
-                _qcount = content.count('"')
-                if _qcount % 2 == 1:
-                    _str_lines = [content]
-                    _str_start = lineno
-                    _str_indent = indent
-                    while self.pos < len(self.lines):
-                        nxt_raw = self.lines[self.pos]
-                        self.pos += 1
-                        nxt = nxt_raw.strip()
-                        if not nxt:
-                            _str_lines.append("")
-                            continue
-                        _str_lines.append(nxt)
-                        _qcount += nxt.count('"')
-                        if _qcount % 2 == 0:
-                            break
-                    content = " ".join(ln for ln in _str_lines if ln)
-                    lineno = _str_start
-                    indent = _str_indent
+                joined = self._join_continuation(content, indent, lineno)
+                if joined is not None:
+                    content = joined
 
             # ── Pop stack to correct parent level ──
             while len(stack) > 1 and indent <= stack[-1].indent:
@@ -727,6 +737,8 @@ class RpyParser:
                 continue
 
             node = self._parse_line(content, lineno, indent)
+            if isinstance(node, Node):
+                self._finish_node(node, content, len(line) - len(line.lstrip()))
 
             # ── Handle elif / else: attach to preceding If ──
             if isinstance(node, tuple):
@@ -754,6 +766,49 @@ class RpyParser:
 
         self.root.end_lineno = total
         return self.root
+
+    def _join_continuation(
+        self, content: str, indent: int, lineno: int
+    ) -> Optional[str]:
+        """Join the physical lines of a logical line left open by an unclosed
+        bracket or string.  Returns the joined text (and advances
+        ``self.pos``), or ``None`` when *content* is already complete.
+
+        A continuation is abandoned — and the first line parsed on its own,
+        with a parse error — when a following line dedents below the
+        statement, or sits at the statement's own indent while looking like
+        a complete statement itself.  That keeps a half-typed ``$ f(`` from
+        swallowing the rest of the file while the user is editing.
+        """
+        depth, quote = scan_code(content)
+        if depth <= 0 and quote is None:
+            return None
+        parts = [content]
+        pos = self.pos
+        limit = min(len(self.lines), pos + _MAX_CONTINUATION_LINES)
+        while pos < limit:
+            nxt_raw = self.lines[pos]
+            nxt = nxt_raw.strip()
+            if not nxt:
+                pos += 1
+                continue
+            nxt_indent = len(nxt_raw) - len(nxt_raw.lstrip())
+            if nxt_indent < indent:
+                break
+            if nxt_indent == indent and nxt[0] not in ")]}":
+                fresh_depth, fresh_quote = scan_code(nxt)
+                if fresh_depth == 0 and fresh_quote is None:
+                    break  # a complete statement of its own
+            pos += 1
+            parts.append(nxt)
+            d, quote = scan_code(nxt, quote)
+            depth += d
+            if depth <= 0 and quote is None:
+                self.pos = pos
+                return " ".join(parts)
+        what = "string" if quote is not None else "bracket"
+        self._errors.append((lineno, f"Unclosed {what}"))
+        return None
 
     @property
     def errors(self) -> List[Tuple[int, str]]:
@@ -816,41 +871,57 @@ class RpyParser:
 
     # ── private helpers ──
 
+    def iter_nodes(self, node: Optional[Node] = None):
+        """Yield *node* (default: the root) and every descendant, pre-order."""
+        stack = [node if node is not None else self.root]
+        children_of = self._children_of
+        while stack:
+            current = stack.pop()
+            yield current
+            kids = children_of(current)
+            if kids:
+                stack.extend(reversed(kids))
+
     def _collect(self, node: Node, cls: type) -> list:
-        """Recursively collect nodes of a given type."""
-        result = []
-        if isinstance(node, cls):
-            result.append(node)
-        for child in self._children_of(node):
-            result.extend(self._collect(child, cls))
-        return result
+        """Collect nodes of a given type (pre-order, document order)."""
+        return [n for n in self.iter_nodes(node) if isinstance(n, cls)]
 
     def _collect_multi(self, node: Node, type_map: dict) -> None:
         """Single-pass collection into *type_map* ``{type: list}``."""
-        node_type = type(node)
-        if node_type in type_map:
-            type_map[node_type].append(node)
-        for child in self._children_of(node):
-            self._collect_multi(child, type_map)
+        for n in self.iter_nodes(node):
+            bucket = type_map.get(type(n))
+            if bucket is not None:
+                bucket.append(n)
+
+    def nodes_at_line(self, lineno: int) -> List[Node]:
+        """Nodes starting on 1-based *lineno* (outermost first), via a
+        lazily built line index."""
+        index = self.__dict__.get("_line_index")
+        if index is None:
+            index = {}
+            for n in self.iter_nodes():
+                if n.lineno > 0:
+                    index.setdefault(n.lineno, []).append(n)
+            self._line_index = index
+        return index.get(lineno, [])
 
     @staticmethod
     def _children_of(node: Node) -> List[Node]:
-        """Return direct children of *node*."""
+        """Return direct children of *node* (each child exactly once)."""
         kids: List[Node] = []
-        if hasattr(node, "body") and isinstance(node.body, list):
-            kids.extend(node.body)
+        body = getattr(node, "body", None)
+        if isinstance(body, list):
+            kids.extend(body)
         if isinstance(node, If):
-            for ec in node.elif_clauses:
-                kids.append(ec)
-                kids.extend(ec.body)
+            kids.extend(node.elif_clauses)  # each Elif yields its own body
             kids.extend(node.else_body)
-        if isinstance(node, Menu):
-            kids.extend(node.body)
         return kids
 
     @staticmethod
     def _strip_trailing_comment(content: str) -> str:
         """Remove trailing # or ## comments that are not inside quotes."""
+        if "#" not in content:
+            return content
         in_single = False
         in_double = False
         i = 0
@@ -871,6 +942,42 @@ class RpyParser:
             i += 1
         return content
 
+    def _finish_node(self, node: Node, content: str, col_base: int) -> None:
+        """Resolve local label names and record ``name_col`` for *node*."""
+        if isinstance(node, Label):
+            if node.name.startswith("."):
+                node.name = (self._global_label or "") + node.name
+                short = node.name[node.name.index(".") :]
+            else:
+                if "." not in node.name:
+                    self._global_label = node.name
+                short = node.name
+            self._set_name_col(node, content, col_base, short)
+        elif isinstance(node, (Jump, Call)):
+            short = node.target
+            if not node.is_expression and short.startswith("."):
+                node.target = (self._global_label or "") + short
+            self._set_name_col(node, content, col_base, short)
+        elif isinstance(node, (CallScreen, ShowScreen, HideScreen)):
+            self._set_name_col(node, content, col_base, node.screen_name)
+        elif isinstance(node, (Scene, Show, Hide)):
+            self._set_name_col(node, content, col_base, node.image)
+        else:
+            name = getattr(node, "name", None)
+            if isinstance(name, str) and name:
+                self._set_name_col(node, content, col_base, name)
+
+    @staticmethod
+    def _set_name_col(node: Node, content: str, col_base: int, text: str) -> None:
+        """Locate *text* after the statement keyword(s) of *content*."""
+        if not text:
+            return
+        m = _RE_NAME_START.match(content)
+        idx = content.find(text, m.end() if m else 0)
+        if idx >= 0:
+            node.name_col = col_base + idx
+            node.name_len = len(text)
+
     def _parse_line(self, content: str, lineno: int, indent: int):
         """Classify a single stripped line and return a Node (or a tuple sentinel for elif/else)."""
 
@@ -886,6 +993,63 @@ class RpyParser:
         # ── Strip trailing comments (not inside quotes) ──
         content = self._strip_trailing_comment(content)
 
+        # Only lines starting with a statement keyword (or ``$``) can match
+        # the statement patterns; everything else — mostly dialogue — goes
+        # straight to the say/narration checks.
+        first = _RE_FIRST_WORD.match(content)
+        if content.startswith("$") or (
+            first is not None and first.group(0) in _STATEMENT_KEYWORDS
+        ):
+            node = self._parse_statement(content, lineno, indent)
+            if node is not None:
+                return node
+        elif content.startswith('"'):
+            # ── Menu item ──
+            m = _RE_MENU_ITEM.match(content)
+            if m:
+                return MenuItem(
+                    lineno=lineno,
+                    end_lineno=0,
+                    indent=indent,
+                    caption=m.group(1),
+                    condition=m.group(2),
+                )
+
+        # ── Say dialogue ──
+        m = _RE_SAY.match(content)
+        if m:
+            return Say(
+                lineno=lineno,
+                end_lineno=lineno,
+                indent=indent,
+                who=m.group(1),
+                what=m.group(2),
+            )
+
+        # ── Say without space (e.g. n"text") ──
+        m = _RE_SAY_NOSPACE.match(content)
+        if m:
+            return Say(
+                lineno=lineno,
+                end_lineno=lineno,
+                indent=indent,
+                who=m.group(1),
+                what=m.group(2),
+            )
+
+        m = _RE_NARRATOR.match(content)
+        if m:
+            return NarratorSay(
+                lineno=lineno, end_lineno=lineno, indent=indent, what=m.group(1)
+            )
+
+        # ── Unknown ──
+        self._errors.append((lineno, f"Unrecognized statement: {content}"))
+        return Unknown(lineno=lineno, end_lineno=lineno, indent=indent, text=content)
+
+    def _parse_statement(self, content: str, lineno: int, indent: int):
+        """Match *content* against the keyword statement patterns; returns a
+        Node, an elif/else tuple sentinel, or None."""
         # ── Label ──
         m = _RE_LABEL.match(content)
         if m:
@@ -1053,17 +1217,6 @@ class RpyParser:
         m = _RE_MENU.match(content)
         if m:
             return Menu(lineno=lineno, end_lineno=0, indent=indent, name=m.group(1))
-
-        # ── Menu item (must come after menu) ──
-        m = _RE_MENU_ITEM.match(content)
-        if m:
-            return MenuItem(
-                lineno=lineno,
-                end_lineno=0,
-                indent=indent,
-                caption=m.group(1),
-                condition=m.group(2),
-            )
 
         # ── Flow: jump / call / return / pass ──
         m = _RE_JUMP.match(content)
@@ -1272,37 +1425,7 @@ class RpyParser:
                 duration=m.group(1) or m.group(2),
             )
 
-        # ── Say dialogue ──
-        m = _RE_SAY.match(content)
-        if m:
-            return Say(
-                lineno=lineno,
-                end_lineno=lineno,
-                indent=indent,
-                who=m.group(1),
-                what=m.group(2),
-            )
-
-        # ── Say without space (e.g. n"text") ──
-        m = _RE_SAY_NOSPACE.match(content)
-        if m:
-            return Say(
-                lineno=lineno,
-                end_lineno=lineno,
-                indent=indent,
-                who=m.group(1),
-                what=m.group(2),
-            )
-
-        m = _RE_NARRATOR.match(content)
-        if m:
-            return NarratorSay(
-                lineno=lineno, end_lineno=lineno, indent=indent, what=m.group(1)
-            )
-
-        # ── Unknown ──
-        self._errors.append((lineno, f"Unrecognized statement: {content}"))
-        return Unknown(lineno=lineno, end_lineno=lineno, indent=indent, text=content)
+        return None
 
     # ── elif / else attachment ──
 

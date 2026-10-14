@@ -133,6 +133,7 @@ async function resolvePythonPath(extensionPath: string): Promise<string | undefi
 function getServerSettings() {
   const cfg = vscode.workspace.getConfiguration("renpy-lsp");
   return {
+    logLevel: cfg.get<string>("logLevel", "info"),
     formatting: {
       enabled: cfg.get<boolean>("formatting.enabled", true),
       indentSize: cfg.get<number>("formatting.indentSize", 4),
@@ -778,6 +779,10 @@ async function startLanguageServer(context: vscode.ExtensionContext) {
       fileEvents: [
         vscode.workspace.createFileSystemWatcher("**/*.{rpy,rpym}"),
         vscode.workspace.createFileSystemWatcher("**/.renpy-format.json"),
+        vscode.workspace.createFileSystemWatcher("**/*_ren.py"),
+        // Create/delete only: keeps the server's asset index (images, audio,
+        // fonts …) in sync without forwarding every save in the workspace.
+        vscode.workspace.createFileSystemWatcher("**/*", false, true, false),
       ],
     },
   };
