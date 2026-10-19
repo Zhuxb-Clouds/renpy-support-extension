@@ -65,7 +65,7 @@ _logging.getLogger("pygls.protocol.json_rpc").setLevel(_logging.ERROR)
 
 MAX_WORKERS = 4
 LSP_SERVER = LanguageServer(
-    name="renpy-server", version="1.10.0", max_workers=MAX_WORKERS
+    name="renpy-server", version="1.11.0", max_workers=MAX_WORKERS
 )
 
 # ── Server logger (prints to stderr, which VS Code captures in the Output channel) ──
