@@ -564,3 +564,18 @@ def test_stale_results_are_not_published(monkeypatch) -> None:
     fake_server.workspace.text_documents = {URI: SimpleNamespace(source=text)}
     diagnostics._publish_diagnostics(URI)
     assert len(published) == 1
+
+
+def test_unclosed_string_is_an_error_with_its_own_code(monkeypatch) -> None:
+    diags = collect(
+        monkeypatch,
+        """
+        define background = "images/bg
+        label start:
+            "hello"
+        """,
+    )
+    matching = [d for d in diags if d.code == "unclosed-string"]
+    assert matching
+    assert matching[0].severity == types.DiagnosticSeverity.Error
+    assert matching[0].range.start.line == 0

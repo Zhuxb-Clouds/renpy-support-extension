@@ -8,13 +8,18 @@
 
 - **语法高亮** — 完整的 Ren'Py 脚本语法高亮，包括 screen、style、ATL 和嵌入式 Python
 - **代码格式化** — 通过内置 LSP 服务器自动缩进和格式化
+- **上下文补全** — label、image、transform、transition、screen、style、`define`/`default` 变量（含 `music.` 这类点分命名空间）、screen/ATL/style 属性，以及**显示构件构造函数的关键字参数**（`Transform(` → `xalign=…`、`Text(` → `kerning=…`），支持跨行嵌套调用，并自动过滤已写过的参数
+- **签名帮助** — `call label(...)` / `call screen ...(...)` 显示真实参数；语句模板展示可用的子句关键字（`at`、`with`、`fadeout` 等）；显示构件构造函数（`Transform(`、`Text(`、`Fixed(` …）显示关键字参数签名，并按名称精确高亮光标所在的实参
 - **诊断功能** — 常见问题的警告和错误提示：
   - 未定义的 `jump`/`call` label、重复的 label/screen 定义、缺失的图像文件、未使用的 label
   - `show`/`scene`/`hide` 引用未定义的 image、`at` 引用未知的 transform、`style x is parent` 的父样式不存在
+  - 未闭合的字符串字面量，作为错误报告在引号所在行
+- **引擎 API 悬停文档** — 1070+ 条来自官方文档与引擎源码 docstring 的条目（`config.*`、`gui.*`、`renpy.*` 函数、style/transform 属性、displayable 类）；悬停 `kerning`、`config.screen_width` 或 `renpy.pause` 即可查看官方说明
+- **媒体预览** — 悬停 `show`/`scene`/`image` 行直接显示图片；`play`/`queue`/`voice` 行给出链接，可在预览面板中播放音频/视频
+- **工作区符号** — `Ctrl+T` 在全部 label、screen、transform、image、style、define、default 中模糊搜索
+- **调用层次** — `Shift+Alt+H` 查看 label（或 `jump`/`call` 位置）的调用方与跳转目标
 - **快速修复** — 针对诊断的 Code Action：一键创建缺失的 label、删除未使用的 label 块
-- **签名帮助** — `call label(...)` / `call screen ...(...)` 显示真实参数；语句模板展示可用的子句关键字（`at`、`with`、`fadeout` 等）
 - **翻译工具** — `tl/` 目录的过期翻译诊断、对话行与翻译条目之间的跳转、按语言的翻译覆盖率报告
-- **上下文补全** — label、image、transform、transition、screen、style、`define`/`default` 变量（含 `music.` 这类点分命名空间），以及 screen/ATL/style 属性
 - **翻译 ID 悬停** — 悬停对话行可查看 Ren'Py 翻译标识符
 - **Markdown 支持** — Markdown 文件中 Ren'Py 代码块的语法高亮
 
@@ -55,6 +60,7 @@
 | `renpy-lsp.diagnostics.enabled`   | `true` | 启用诊断功能                               |
 | `renpy-lsp.diagnostics.fullOnSave` | `false` | 保存时也重跑完整诊断(编辑时已随变更队列重跑;内容未变化的保存不会重跑) |
 | `renpy-lsp.diagnostics.severity`  | `{}` | 按检查项覆盖严重级别,如 `{ "unused-label": "none", "undefined-transform": "information" }`;`none` 表示彻底关闭该检查 |
+| `renpy-lsp.previews.enabled` | `true` | 悬停媒体预览:`show`/`scene`/`image` 行显示图片,`play`/`queue`/`voice` 行显示音频/视频预览链接 |
 | `renpy-lsp.logLevel`              | `info` | 输出面板中语言服务器日志的详细程度（`error`/`warning`/`info`/`debug`） |
 
 ### 项目级格式化配置
@@ -117,6 +123,7 @@ push 和 PR 会由 `.github/workflows/ci.yml` 检查（Python 测试 + 生产构
 - `src/extension.ts` — VS Code 客户端入口
 - `bundled/tools/lsp_server.py` — Python LSP 服务器（使用 pygls）
 - `bundled/tools/ast_parser.py` — 基于缩进的 Ren'Py 解析器
+- `bundled/tools/renpy_api_docs.json` — 引擎 API 悬停文档，由 `scripts/fetch_api.py` 生成（`python scripts/fetch_api.py --ref <renpy tag>` 重新生成；`--offline` 只解析本地缓存）
 - `syntaxes/` — TextMate 语法高亮文件
 
 ## 许可证

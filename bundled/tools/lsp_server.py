@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import re
 import sys
+from pathlib import Path
 
 # Ensure the bundled/tools directory is on sys.path so we can import ast_parser.
 _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -92,6 +93,7 @@ from completion import _completion_items_for_context
 import code_actions
 import signatures
 import translation
+import api_docs
 from translation import _renpy_translate_id, _find_say_at_line
 
 from typing import Dict, List, Optional, Tuple, Union
@@ -686,7 +688,7 @@ def _resolve_node_definition(
 @LSP_SERVER.feature(
     types.TEXT_DOCUMENT_COMPLETION,
     types.CompletionOptions(
-        trigger_characters=[" ", ".", '"', "'"], resolve_provider=True
+        trigger_characters=[" ", ".", "(", '"', "'"], resolve_provider=True
     ),
 )
 def completions(
@@ -719,6 +721,8 @@ def completion_resolve(
     """Attach keyword documentation lazily (only for the focused item)."""
     data = item.data if isinstance(item.data, dict) else None
     doc = KEYWORD_DOCS.get(data.get("doc", "")) if data else None
+    if doc is None and data and data.get("api"):
+        doc = api_docs.hover_markdown(data["api"])
     if doc:
         item.documentation = types.MarkupContent(
             kind=types.MarkupKind.Markdown, value=doc
@@ -787,6 +791,14 @@ def hover(ls: LanguageServer, params: types.HoverParams) -> Optional[types.Hover
     col = _utf16_col_to_utf32(line_text, params.position.character)
     word = _word_at_position(line_text, col)
     _log.debug("hover: %s L%d word=%r", _short_uri(uri), params.position.line + 1, word)
+
+    # 0) Media preview for show/scene/image/play/queue/voice lines.
+    if word:
+        _ast0, parser0 = ctx._get_parse(uri)
+        media = _media_preview_hover(uri, parser0, params.position.line, line_text)
+        if media is not None:
+            return media
+
     if not word:
         return None
 
@@ -798,6 +810,15 @@ def hover(ls: LanguageServer, params: types.HoverParams) -> Optional[types.Hover
                 value=KEYWORD_DOCS[word],
             )
         )
+
+    # 1b) Dotted engine APIs (config.*, gui.*, renpy.*) — engine docs take
+    # precedence over workspace symbols, which cannot define dotted names.
+    if "." in word:
+        api = api_docs.hover_markdown(word)
+        if api:
+            return types.Hover(
+                contents=types.MarkupContent(kind=types.MarkupKind.Markdown, value=api)
+            )
 
     ast, parser = ctx._get_parse(uri)
     word = _resolve_label_word(word, parser, params.position.line)
@@ -887,6 +908,13 @@ def hover(ls: LanguageServer, params: types.HoverParams) -> Optional[types.Hover
                 kind=types.MarkupKind.Markdown,
                 value=f"**Translation ID**: `{tid}`",
             )
+        )
+
+    # 8) Engine API documentation (style properties, displayables, vars).
+    api = api_docs.hover_markdown(word)
+    if api:
+        return types.Hover(
+            contents=types.MarkupContent(kind=types.MarkupKind.Markdown, value=api)
         )
 
     return None
@@ -1452,6 +1480,315 @@ def _dedup_ranges(locations: List[types.Location]) -> List[types.Location]:
             seen.add(key)
             result.append(loc)
     return result
+
+
+# ─────────────────────── Workspace Symbols ───────────────────────────────
+
+_WORKSPACE_SYMBOL_SOURCES = (
+    (ctx._get_all_workspace_labels, types.SymbolKind.Function),
+    (ctx._get_all_workspace_screens, types.SymbolKind.Function),
+    (ctx._get_all_workspace_transforms, types.SymbolKind.Function),
+    (ctx._get_all_workspace_images, types.SymbolKind.Variable),
+    (ctx._get_all_workspace_styles, types.SymbolKind.Class),
+    (ctx._get_all_workspace_defines, types.SymbolKind.Constant),
+    (ctx._get_all_workspace_defaults, types.SymbolKind.Variable),
+)
+
+
+@LSP_SERVER.feature(types.WORKSPACE_SYMBOL)
+def workspace_symbol(
+    ls: LanguageServer, params: types.WorkspaceSymbolParams
+) -> List[types.SymbolInformation]:
+    """Case-insensitive substring search over all workspace symbols
+    (labels, screens, transforms, images, styles, defines, defaults)."""
+    query = params.query.strip().lower()
+    _log.debug("workspaceSymbol: %r", query)
+    results: List[types.SymbolInformation] = []
+    for getter, kind in _WORKSPACE_SYMBOL_SOURCES:
+        try:
+            symbols = getter()
+        except RuntimeError:
+            # Workspace not initialized yet — nothing to search.
+            continue
+        for name, entries in symbols.items():
+            if query and query not in name.lower():
+                continue
+            target_uri, node = entries[0]
+            results.append(
+                types.SymbolInformation(
+                    name=name,
+                    kind=kind,
+                    location=_make_node_location(target_uri, node),
+                    container_name=os.path.basename(ctx._path_from_uri(target_uri)),
+                )
+            )
+    results.sort(key=lambda s: (s.name.lower(), s.location.uri))
+    return results[:500]
+
+
+# ─────────────────────── Media Preview ───────────────────────────────────
+
+# Media files referenced by show/scene/image defines and play/queue/voice.
+_MEDIA_FILE_RE = re.compile(
+    r'["\']([^"\']+?\.(?:png|jpg|jpeg|webp|gif|bmp|webm|mp4|mkv|avi|mov'
+    r"|ogg|opus|mp3|wav))['\"]",
+    re.IGNORECASE,
+)
+_IMAGE_EXT_RE = re.compile(r"\.(png|jpg|jpeg|webp|gif|bmp)$", re.IGNORECASE)
+_AUDIO_EXT_RE = re.compile(r"\.(ogg|opus|mp3|wav)$", re.IGNORECASE)
+_VIDEO_EXT_RE = re.compile(r"\.(webm|mp4|mkv|avi|mov)$", re.IGNORECASE)
+
+
+def _preview_media_command(file_uri: str, kind: str) -> str:
+    """Command-link markdown that opens the media preview panel."""
+    import json as _json
+    import urllib.parse
+
+    args = urllib.parse.quote(_json.dumps([file_uri, kind]))
+    label = "▶ Preview video" if kind == "video" else "▶ Preview audio"
+    return f"[{label}](command:renpy-lsp.previewMedia?{args})"
+
+
+def _resolve_image_files(image_name: str, source_uri: str) -> List[str]:
+    """Absolute file paths behind an image name (define expression paths)."""
+    images = dict(
+        (name, entries)
+        for name, entries in ctx._get_all_workspace_images().items()
+    )
+    entries = images.get(image_name)
+    if entries is None:
+        tag = image_name.split(" ")[0]
+        for name, candidate in images.items():
+            if name == tag or name.startswith(tag + " "):
+                entries = candidate
+                break
+    if not entries:
+        return []
+
+    target_uri, node = entries[0]
+    files: List[str] = []
+    for m in _MEDIA_FILE_RE.finditer(getattr(node, "expression", "") or ""):
+        resolved = ctx._resolve_renpy_file(m.group(1), source_uri=target_uri or source_uri)
+        if resolved:
+            files.append(resolved)
+    return files
+
+
+def _media_preview_hover(
+    uri: str, parser, line0: int, line_text: str
+) -> Optional[types.Hover]:
+    """Hover with an image preview or an audio/video preview link for
+    ``show``/``scene``/``image``/``play``/``queue``/``voice`` lines."""
+    if not ctx._settings["previews"]["enabled"]:
+        return None
+    stripped = line_text.strip()
+    if not stripped or stripped.startswith("#"):
+        return None
+
+    parts: List[str] = []
+
+    m = re.match(r"(?:show|scene)\s+(.+)$", stripped, re.IGNORECASE)
+    if m:
+        from diagnostics import _strip_image_clauses
+
+        name = _strip_image_clauses(m.group(1)).strip()
+        name = " ".join(name.split())
+        for path in _resolve_image_files(name, uri)[:4]:
+            if _IMAGE_EXT_RE.search(path):
+                parts.append(f"![preview]({Path(path).as_uri()})")
+    elif re.match(r"image\s+", stripped, re.IGNORECASE):
+        for img in parser.get_all_images():
+            if img.lineno - 1 != line0:
+                continue
+            for fm in _MEDIA_FILE_RE.finditer(img.expression or ""):
+                resolved = ctx._resolve_renpy_file(fm.group(1), source_uri=uri)
+                if resolved and _IMAGE_EXT_RE.search(resolved):
+                    parts.append(f"![preview]({Path(resolved).as_uri()})")
+    else:
+        m = re.match(r"(?:play|queue|voice)\s+", stripped, re.IGNORECASE)
+        if m:
+            fm = _MEDIA_FILE_RE.search(stripped)
+            resolved = None
+            if fm:
+                resolved = ctx._resolve_renpy_file(fm.group(1), source_uri=uri)
+            else:
+                # ``play music <name>`` → audio.<name> define.
+                token = re.match(
+                    r"(?:play|queue)\s+\w+\s+([\w.]+)", stripped, re.IGNORECASE
+                )
+                if token and token.group(1).lower() not in ("fadein", "fadeout"):
+                    defines = ctx._get_all_workspace_defines()
+                    audio_name = token.group(1)
+                    entries = defines.get(
+                        f"audio.{audio_name}"
+                    ) or defines.get(audio_name)
+                    if entries:
+                        expr = getattr(entries[0][1], "expression", "") or ""
+                        fm2 = _MEDIA_FILE_RE.search(expr)
+                        if fm2:
+                            resolved = ctx._resolve_renpy_file(
+                                fm2.group(1), source_uri=entries[0][0]
+                            )
+            if resolved:
+                if _AUDIO_EXT_RE.search(resolved):
+                    parts.append(_preview_media_command(Path(resolved).as_uri(), "audio"))
+                elif _VIDEO_EXT_RE.search(resolved):
+                    parts.append(_preview_media_command(Path(resolved).as_uri(), "video"))
+
+    if not parts:
+        return None
+    return types.Hover(
+        contents=types.MarkupContent(kind=types.MarkupKind.Markdown, value="\n\n".join(parts))
+    )
+
+
+
+
+
+# ─────────────────────── Call Hierarchy ──────────────────────────────────
+
+
+def _label_hierarchy_item(uri: str, lb) -> types.CallHierarchyItem:
+    """Call-hierarchy item for a label definition."""
+    _ast, parser = ctx._get_parse(uri)
+    return types.CallHierarchyItem(
+        name=lb.name,
+        kind=types.SymbolKind.Function,
+        uri=uri,
+        range=types.Range(
+            start=types.Position(line=lb.lineno - 1, character=0),
+            end=types.Position(
+                line=min(max(lb.end_lineno, lb.lineno), len(parser.lines)) - 1,
+                character=999,
+            ),
+        ),
+        selection_range=ctx._make_range(
+            uri, lb.lineno, getattr(lb, "name_col", 0) or 0, len(lb.name)
+        ),
+    )
+
+
+def _label_at(parser, line1: int, name: Optional[str] = None):
+    """Label whose block spans *line1* (1-based), optionally by name."""
+    best = None
+    for lb in parser.get_all_labels():
+        if name is not None and lb.name != name:
+            continue
+        if lb.lineno <= line1 <= max(lb.end_lineno, lb.lineno):
+            if best is None or lb.lineno > best.lineno:
+                best = lb
+    return best
+
+
+def _enclosing_label(uri: str, line1: int):
+    """Label containing *line1* in the file *uri*, if any."""
+    try:
+        _ast, parser = ctx._get_parse(uri)
+    except Exception:
+        return None
+    return _label_at(parser, line1)
+
+
+def _iter_jump_call(node):
+    """Yield every Jump/Call node in a label's body, nested blocks included."""
+    from ast_parser import Call, Jump
+
+    for child in getattr(node, "body", None) or []:
+        if isinstance(child, (Jump, Call)) and not child.is_expression:
+            yield child
+        yield from _iter_jump_call(child)
+
+
+@LSP_SERVER.feature(types.TEXT_DOCUMENT_PREPARE_CALL_HIERARCHY)
+def prepare_call_hierarchy(
+    ls: LanguageServer, params: types.CallHierarchyPrepareParams
+) -> Optional[List[types.CallHierarchyItem]]:
+    """Prepare the label at the cursor (definition or jump/call site)."""
+    uri = params.text_document.uri
+    doc = ls.workspace.get_text_document(uri)
+    pos = params.position
+    line_text = doc.lines[pos.line] if pos.line < len(doc.lines) else ""
+    col = _utf16_col_to_utf32(line_text, pos.character)
+    word = _word_at_position(line_text, col)
+    _ast, parser = ctx._get_parse(uri)
+
+    # A word under the cursor resolves to its target label first, so
+    # preparing on a ``jump``/``call`` site follows the reference.
+    if word:
+        word = _resolve_label_word(word, parser, pos.line)
+        entries = ctx._get_all_workspace_labels().get(word)
+        if entries:
+            lb_uri, target = entries[0]
+            return [_label_hierarchy_item(lb_uri, target)]
+        for lb in parser.get_all_labels():
+            if lb.name == word:
+                return [_label_hierarchy_item(uri, lb)]
+    lb = _label_at(parser, pos.line + 1)
+    if lb is not None:
+        return [_label_hierarchy_item(uri, lb)]
+    return None
+
+
+@LSP_SERVER.feature(types.CALL_HIERARCHY_INCOMING_CALLS)
+def incoming_calls(
+    ls: LanguageServer, params: types.CallHierarchyIncomingCallsParams
+) -> List[types.CallHierarchyIncomingCall]:
+    """Labels that jump/call to *params.item*."""
+    label = params.item.name
+    groups: Dict[Tuple[str, int], Tuple[object, List[types.Range]]] = {}
+    for ref_uri, ref in ctx._workspace_index.get_references("label", label):
+        caller = _enclosing_label(ref_uri, ref.line)
+        if caller is None:
+            continue
+        key = (ref_uri, caller.lineno)
+        rng = ctx._make_range(ref_uri, ref.line, ref.col, ref.length)
+        if key in groups:
+            groups[key][1].append(rng)
+        else:
+            groups[key] = (caller, [rng])
+    return [
+        types.CallHierarchyIncomingCall(
+            from_=_label_hierarchy_item(uri, lb),
+            from_ranges=ranges,
+        )
+        for (uri, _lineno), (lb, ranges) in groups.items()
+    ]
+
+
+@LSP_SERVER.feature(types.CALL_HIERARCHY_OUTGOING_CALLS)
+def outgoing_calls(
+    ls: LanguageServer, params: types.CallHierarchyOutgoingCallsParams
+) -> List[types.CallHierarchyOutgoingCall]:
+    """Labels that *params.item* jumps/calls to."""
+    uri = params.item.uri
+    try:
+        _ast, parser = ctx._get_parse(uri)
+    except RuntimeError:
+        return []
+    lb = _label_at(parser, params.item.range.start.line + 1, params.item.name)
+    if lb is None:
+        return []
+
+    all_labels = ctx._get_all_workspace_labels()
+    groups: Dict[Tuple[str, int], Tuple[object, List[types.Range]]] = {}
+    for site in _iter_jump_call(lb):
+        for target_uri, target in all_labels.get(site.target, ()):
+            key = (target_uri, target.lineno)
+            rng = ctx._make_range(
+                uri, site.lineno, getattr(site, "name_col", 0) or 0, len(site.target)
+            )
+            if key in groups:
+                groups[key][1].append(rng)
+            else:
+                groups[key] = (target, [rng])
+            break
+    return [
+        types.CallHierarchyOutgoingCall(
+            to=_label_hierarchy_item(t_uri, target),
+            from_ranges=ranges,
+        )
+        for (t_uri, _lineno), (target, ranges) in groups.items()
+    ]
 
 
 # ─────────────────────── Color Preview ───────────────────────────────────

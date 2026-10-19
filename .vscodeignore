@@ -10,6 +10,10 @@ tsconfig.json
 .eslintrc*
 .prettierrc*
 
+# Dev tooling (API docs fetcher)
+scripts/**
+.renpy-docs-cache/**
+
 # Python dev files
 .venv/**
 __pycache__/**

@@ -363,3 +363,84 @@ def test_local_symbols_sort_before_builtins(monkeypatch) -> None:
     patch_workspace_symbols(monkeypatch, parser)
     items = by_label(complete(lines, parser, 3))
     assert items["bounce"].sort_text < items["left"].sort_text
+
+
+# ── Displayable constructor keyword arguments ────────────────────────────
+
+
+def complete_at(lines, parser, line_no: int, col: int):
+    return _completion_items_for_context(
+        URI, parser, lines, line_no, col
+    )
+
+
+def test_constructor_kwargs_completion_in_multiline_nest(monkeypatch) -> None:
+    src = """
+        define game_logo = Fixed(
+            Image("images/ui/logo.png"),
+            Transform(
+                Text("SUMMER", font="wen.ttf", size=16, color="#fff"),
+                fit_first=True,
+            ),
+        )
+        """
+    lines, parser = parse(src)
+    patch_workspace_symbols(monkeypatch, parser)
+    l_text = next(i for i, l in enumerate(lines) if 'Text("SUMMER"' in l)
+    col = lines[l_text].index('font="wen.ttf"') + len('font="wen.ttf", ker')
+    items = by_label(complete_at(lines, parser, l_text, col))
+
+    assert "kerning" in items
+    assert items["kerning"].insert_text == "kerning="
+    # Keyword arguments already written before the cursor are filtered out.
+    assert "font" not in items
+    # Fixed()'s kwargs do not leak into the nested Text() call.
+    assert "fit_first" not in items
+
+
+def test_constructor_kwargs_at_open_paren(monkeypatch) -> None:
+    lines, parser = parse(
+        """
+        define logo = Fixed(
+            Image("images/ui/logo.png"),
+        )
+        """
+    )
+    patch_workspace_symbols(monkeypatch, parser)
+    l_fix = next(i for i, l in enumerate(lines) if "Fixed(" in l)
+    col = lines[l_fix].index("Fixed(") + len("Fixed(")
+    items = labels(complete_at(lines, parser, l_fix, col))
+
+    assert "fit_first" in items and "xalign" in items
+    assert "spacing" in items
+
+
+def test_constructor_kwargs_on_empty_continuation_line(monkeypatch) -> None:
+    src = """
+        define logo = Fixed(
+
+            fit_first=True,
+        )
+        """
+    lines, parser = parse(src)
+    patch_workspace_symbols(monkeypatch, parser)
+    items = labels(complete(lines, parser, 1))
+
+    assert "fit_first" in items and "xfit" in items
+
+
+def test_no_constructor_kwargs_outside_calls(monkeypatch) -> None:
+    lines, parser = parse(
+        """
+        label start:
+            "hello"
+
+        label end:
+            return
+        """
+    )
+    patch_workspace_symbols(monkeypatch, parser)
+    items = labels(complete(lines, parser, 2))
+
+    assert "kerning" not in items
+    assert "fit_first" not in items

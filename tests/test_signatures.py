@@ -111,3 +111,58 @@ def test_play_options_template(monkeypatch) -> None:
 def test_plain_line_has_no_signature(monkeypatch) -> None:
     result = help_at(monkeypatch, 'label start:\n    "hello world"', 1, 8)
     assert result is None
+
+
+def test_constructor_signature_inside_multiline_call(monkeypatch) -> None:
+    src = """
+        define shake = Transform(
+            Text("hi"),
+            xalign=1.0,
+        )
+        """
+    lines = dedent(src).strip("\n").splitlines()
+    l = next(i for i, l in enumerate(lines) if "xalign" in l)
+    result = help_at(monkeypatch, src, l, len(lines[l]))
+
+    assert result is not None
+    (sig,) = result.signatures
+    assert sig.label.startswith("Transform(")
+    assert "xalign=…" in sig.label
+
+
+def test_no_constructor_signature_on_plain_expression(monkeypatch) -> None:
+    result = help_at(
+        monkeypatch,
+        "label start:\n    $ x = 1 + 2",
+        1,
+        len("    $ x = 1 + "),
+    )
+    assert result is None
+
+
+def test_constructor_signature_active_parameter_by_keyword(monkeypatch) -> None:
+    src = """
+        define logo = Transform(
+            Text("hi", font="foo.ttf", size=16, color="#fff"),
+        )
+        """
+    lines = dedent(src).strip("\n").splitlines()
+    l = next(i for i, l in enumerate(lines) if "size=16" in l)
+    col = lines[l].index("size=16") + len("size=16")
+    result = help_at(monkeypatch, src, l, col)
+    assert result is not None
+    assert result.signatures[0].parameters[result.active_parameter].label == "size=…"
+
+
+def test_constructor_signature_after_trailing_comma(monkeypatch) -> None:
+    src = """
+        define logo = Fixed(
+            Image("a.png"),
+            fit_first=True,
+        )
+        """
+    lines = dedent(src).strip("\n").splitlines()
+    l = next(i for i, l in enumerate(lines) if "fit_first" in l)
+    result = help_at(monkeypatch, src, l, len(lines[l]))
+    # Cursor after "fit_first=True, " → the next positional slot (index 1).
+    assert result is not None and result.active_parameter >= 1

@@ -489,6 +489,123 @@ RENPY_STYLE_PROPERTIES: List[str] = [
     "ysize",
 ]
 
+# ───────────────── Displayable constructor keyword arguments ─────────────
+
+# Position/size properties accepted as keyword arguments by most
+# displayable constructors (Fixed, Solid, Frame, Image, …).
+_POSITION_PROPS: List[str] = [
+    "area",
+    "xalign",
+    "xanchor",
+    "xfill",
+    "xfit",
+    "xmaximum",
+    "xminimum",
+    "xoffset",
+    "xpos",
+    "xsize",
+    "yalign",
+    "yanchor",
+    "yfill",
+    "ymaximum",
+    "yminimum",
+    "yoffset",
+    "ypos",
+    "ysize",
+]
+
+# Text-related style properties accepted by ``Text(...)``.
+_TEXT_PROPS: List[str] = [
+    "adjust_spacing",
+    "antialias",
+    "black_color",
+    "bold",
+    "color",
+    "font",
+    "hinting",
+    "horizontal",
+    "italic",
+    "justify",
+    "kerning",
+    "language",
+    "layout",
+    "line_leading",
+    "line_overlap_split",
+    "line_spacing",
+    "mipmap",
+    "newline_indent",
+    "outlines",
+    "rest_indent",
+    "ruby_style",
+    "size",
+    "slow",
+    "slow_abortable",
+    "slow_cps",
+    "slow_cps_multiplier",
+    "strikethrough",
+    "text_align",
+    "text_y_fudge",
+    "underline",
+    "uppercase",
+    "vertical",
+]
+
+# ATL keywords that are statements inside ``transform:`` blocks, not
+# Transform() keyword arguments.
+_ATL_BLOCK_KEYWORDS = frozenset(
+    {
+        "block",
+        "choice",
+        "contains",
+        "ease",
+        "easein",
+        "easeout",
+        "linear",
+        "parallel",
+        "pause",
+        "repeat",
+        "time",
+        "warp",
+    }
+)
+
+# Keyword arguments for built-in displayable constructors, offered as
+# completion inside ``Name(...)`` calls in define/default expressions
+# (and as signature help).  Derived from the property lists above; the
+# first entries mirror each constructor's real positional parameters so
+# signature-help's positional mapping stays faithful.
+def _dedup(*groups: List[str]) -> List[str]:
+    seen: set = set()
+    out: List[str] = []
+    for group in groups:
+        for name in group:
+            if name not in seen:
+                seen.add(name)
+                out.append(name)
+    return out
+
+
+RENPY_CONSTRUCTOR_KWARGS: Dict[str, List[str]] = {
+    "Transform": _dedup(
+        [p for p in RENPY_ATL_PROPERTIES if p not in _ATL_BLOCK_KEYWORDS],
+        ["matrixcolor", "subpixel", "style"],
+    ),
+    "Text": _dedup(
+        ["text", "slow", "scope", "substitute", "style"],
+        _TEXT_PROPS,
+        _POSITION_PROPS,
+    ),
+    "Fixed": _dedup(["fit_first", "spacing", "style"], _POSITION_PROPS),
+    "Composite": _dedup(_POSITION_PROPS, ["style"]),
+    "LiveComposite": _dedup(_POSITION_PROPS, ["style"]),
+    "Solid": _dedup(["color"], _POSITION_PROPS, ["style"]),
+    "Frame": _dedup(
+        ["image", "left", "top", "right", "bottom"], _POSITION_PROPS, ["style"]
+    ),
+    "Image": _dedup(_POSITION_PROPS, ["style"]),
+    "Position": _POSITION_PROPS,
+}
+
 # ─────────────────────── Hover documentation ─────────────────────────────
 
 KEYWORD_DOCS: Dict[str, str] = {

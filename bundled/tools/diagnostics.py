@@ -84,6 +84,16 @@ def _collect_light_diagnostics(parser: RpyParser) -> List[types.Diagnostic]:
     diags: List[types.Diagnostic] = []
 
     for lineno, msg in parser.errors:
+        if msg.startswith("Unclosed string"):
+            diags.append(
+                _diag(
+                    lineno,
+                    "Unclosed string literal — a quote opened here is never closed",
+                    types.DiagnosticSeverity.Error,
+                    "unclosed-string",
+                )
+            )
+            continue
         code = "unclosed-delimiter" if msg.startswith("Unclosed") else "unknown-statement"
         diags.append(_diag(lineno, msg, types.DiagnosticSeverity.Warning, code))
 

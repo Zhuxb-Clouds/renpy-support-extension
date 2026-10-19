@@ -19,6 +19,8 @@ from typing import Dict, List, Optional, Tuple
 from lsprotocol import types
 
 import server_context as ctx
+from completion import _innermost_call_context
+from renpy_data import RENPY_CONSTRUCTOR_KWARGS
 
 _IDENTIFIER = r"[a-zA-Z_\u4e00-\u9fff\u3400-\u4dbf][\w\u4e00-\u9fff\u3400-\u4dbf]*"
 
@@ -485,6 +487,106 @@ def _template_help(
     )
 
 
+def _active_constructor_param(params_text: str, kwargs: List[str]) -> int:
+    """Index of the signature parameter the cursor sits at.
+
+    Keyword arguments are matched by name; positional arguments count from
+    the start of the table.  Falls back to the comma ordinal when the
+    argument list cannot be parsed (it arrives truncated at the cursor and
+    may end mid-token, e.g. ``xalign=1.``).
+    """
+    import ast as _pyast
+
+    candidates = [params_text, params_text + "0"]
+    last_comma = params_text.rfind(",")
+    if last_comma >= 0:
+        candidates.append(params_text[: last_comma + 1])
+    used = params_text
+    call = None
+    for cand in candidates:
+        try:
+            call = _pyast.parse(f"f({cand})").body[0].value
+            used = cand
+            break
+        except SyntaxError:
+            continue
+    if call is None or not (call.args or call.keywords):
+        return min(max(0, len(_split_top_level(params_text)) - 1), len(kwargs) - 1)
+
+    line_starts = [0]
+    for seg in used.split("\n")[:-1]:
+        line_starts.append(line_starts[-1] + len(seg) + 1)
+
+    def _span(node) -> Tuple[int, int]:
+        return (
+            line_starts[node.lineno - 1] + node.col_offset,
+            line_starts[node.end_lineno - 1] + node.end_col_offset,
+        )
+
+    entries: List[Tuple[int, int, Optional[str]]] = []
+    for arg in call.args:
+        entries.append((*_span(arg), None))
+    for kw in call.keywords:
+        if kw.arg is None:  # **kwargs spread — no name to match
+            continue
+        value_start, value_end = _span(kw.value)
+        name_start = used.rfind(f"{kw.arg}", 0, value_start)
+        entries.append((max(name_start, 0), value_end, kw.arg))
+    entries.sort(key=lambda e: e[0])
+    if not entries:
+        return 0
+
+    cursor = 2 + len(used)  # "f(" precedes the arguments
+    active_arg = len(entries)  # one past the last argument by default
+    for i, (start, end, _name) in enumerate(entries):
+        if start <= cursor <= end:
+            active_arg = i
+            break
+        if end < cursor:
+            active_arg = i + 1
+
+    name = entries[active_arg][2] if active_arg < len(entries) else None
+    if name is not None and name in kwargs:
+        return kwargs.index(name)
+    return min(active_arg, len(kwargs) - 1)
+
+
+def _constructor_call_help(
+    lines: List[str], line_no: int, col: int
+) -> Optional[types.SignatureHelp]:
+    """Signature for displayable constructors — ``Transform(``, ``Text(``,
+    ``Fixed(``, … — from the constructor keyword-argument table.  Works
+    across multi-line calls via the shared innermost-call detection."""
+    call_ctx = _innermost_call_context(lines, line_no, col)
+    if call_ctx is None:
+        return None
+    callee, _used, params_text = call_ctx
+    kwargs = RENPY_CONSTRUCTOR_KWARGS.get(callee)
+    if not kwargs:
+        return None
+    params = [f"{kw}=…" for kw in kwargs]
+    active = _active_constructor_param(params_text, kwargs)
+    return types.SignatureHelp(
+        signatures=[
+            types.SignatureInformation(
+                label=f"{callee}({', '.join(params)})",
+                parameters=[
+                    types.ParameterInformation(label=p) for p in params
+                ],
+                documentation=types.MarkupContent(
+                    kind=types.MarkupKind.Markdown,
+                    value=(
+                        f"Keyword arguments of the Ren'Py displayable "
+                        f"`{callee}`."
+                    ),
+                ),
+            )
+        ],
+        active_signature=0,
+        active_parameter=active,
+    )
+
+
 def compute_signature_help(
     lines: List[str],
     line_no: int,
@@ -498,4 +600,7 @@ def compute_signature_help(
         return types.SignatureHelp(
             signatures=[signature], active_signature=0, active_parameter=active
         )
+    constructor = _constructor_call_help(lines, line_no, col)
+    if constructor is not None:
+        return constructor
     return _template_help(line_text, col)

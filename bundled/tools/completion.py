@@ -12,18 +12,20 @@ character must not pop up keyword lists while writing dialogue.
 
 from __future__ import annotations
 
+import ast as _pyast
 import os
 import re
 from typing import Dict, Iterable, List, Optional, Tuple
 
 from lsprotocol import types
 
-from ast_parser import Node, RpyParser
+from ast_parser import Node, RpyParser, scan_code
 from renpy_data import (
     KEYWORD_DOCS,
     RENPY_API_MEMBERS,
     RENPY_ATL_PROPERTIES,
     RENPY_CONFIG_MEMBERS,
+    RENPY_CONSTRUCTOR_KWARGS,
     RENPY_KEYWORDS,
     RENPY_SCREEN_DISPLAYABLES,
     RENPY_SCREEN_PROPERTIES,
@@ -36,6 +38,7 @@ from renpy_data import (
 )
 
 import server_context as ctx
+import api_docs
 
 
 # Ren'Py keyword/transition/transform lists are in renpy_data.py.
@@ -276,6 +279,164 @@ def _enclosing_completion_block(lines: List[str], line_no: int, col: int) -> Opt
 
 def _prefix_matches(prefix: str, pattern: str) -> bool:
     return re.match(pattern, prefix, re.IGNORECASE) is not None
+
+
+# ── Innermost enclosing call (constructor keyword arguments) ─────────────
+
+
+_MAX_CALL_LOOKBACK_LINES = 120
+
+# Statement keywords introducing a Python expression, stripped before the
+# fragment is handed to ast.parse ("define x =", "image tag attr =", "$", …).
+_RE_STATEMENT_PREFIX = re.compile(
+    r"^\s*(?:"
+    r"(?:define|default)\s+[\w.]+\s*(?:\+|-)?=\s*"
+    r"|image\s+[\w.\-" + _CJK + r" ]+?=\s*"
+    r"|\$\s*"
+    r"|(?:if|elif|while|return)\s+"
+    r")"
+)
+
+# Prefixes worth running call detection for: mid-argument lists, a bare
+# partial word (a line of its own inside a multi-line call), or a partial
+# "name=" keyword argument.
+_RE_CALL_ARG_CANDIDATES = (
+    re.compile(r"[([{,]\s*$"),
+    re.compile(rf"[\w{_CJK}]*\s*=\s*[\w{_CJK}]*$"),
+    re.compile(rf"[\w{_CJK}]+$"),
+)
+
+
+def _looks_like_call_arg(prefix: str, trigger_character: Optional[str]) -> bool:
+    if trigger_character == "(":
+        return True
+    if not prefix.strip():
+        # An empty continuation line inside a multi-line call — cheap to let
+        # the detector decide (it bails out fast when no call wraps here).
+        return True
+    return any(r.search(prefix) for r in _RE_CALL_ARG_CANDIDATES)
+
+
+def _innermost_call_context(
+    lines: List[str], line_no: int, col: int
+) -> Optional[Tuple[str, set, str]]:
+    """``(callee_name, used_kwargs, params_text)`` for the innermost call
+    whose argument list encloses the cursor, or ``None``.
+
+    The fragment starts at the nearest line above the cursor that opens a
+    bracket still open at the cursor, so a ``Fixed(Transform(Text(…`` nest
+    spread over multiple lines resolves to the ``Text`` the cursor sits in.
+    ``params_text`` is the argument text between the call's ``(`` and the
+    cursor, used to derive the active parameter index for signature help.
+    """
+    lo = max(0, line_no - _MAX_CALL_LOOKBACK_LINES)
+    carried = 0  # net brackets opened by the lines scanned below line i
+    start = None
+    for i in range(line_no, lo - 1, -1):
+        delta, _quote = scan_code(lines[i])
+        if start is None and delta > 0 and carried + delta > 0:
+            start = i
+        carried += delta
+    if start is None:
+        return None
+    frag = list(lines[start : line_no + 1])
+
+    m = _RE_STATEMENT_PREFIX.match(frag[0])
+    if m is not None:
+        frag[0] = frag[0][m.end() :]
+    frag[-1] = frag[-1][:col]
+    # The fragment may begin mid-statement on an indented continuation
+    # line; dedent so ast.parse accepts it as a standalone expression.
+    indents = [len(l) - len(l.lstrip()) for l in frag if l.strip()]
+    if indents:
+        cut = min(indents)
+        if cut:
+            frag = [l[cut:] if l.strip() else l for l in frag]
+    prefix_text = "\n".join(frag)
+    cursor_off = len(prefix_text)
+
+    # Drop the partial word under the cursor so the fragment closes into
+    # parseable Python ("Text(\"x\", ker" + ")" would not parse).
+    tail = re.search(r"[\w]*$", prefix_text).group(0)
+    parse_text = prefix_text[: cursor_off - len(tail)]
+    # The cursor sits where the partial word was removed, in parse-text
+    # coordinates.
+    cursor_off -= len(tail)
+    _d, open_quote = scan_code(parse_text)
+    if open_quote is not None:
+        parse_text += open_quote
+    depth, _ = scan_code(parse_text)
+    if depth < 0:
+        return None
+    # A trailing ``size=`` (cursor mid-keyword-argument) needs a placeholder
+    # value to close into valid Python; try the plain form first.
+    tree = None
+    for candidate in (parse_text + ")" * depth, parse_text + "0" + ")" * depth):
+        try:
+            tree = _pyast.parse(candidate)
+            break
+        except SyntaxError:
+            continue
+    if tree is None:
+        return None
+
+    starts = [0]
+    for seg in parse_text.split("\n")[:-1]:
+        starts.append(starts[-1] + len(seg) + 1)
+
+    def _off(lineno: int, colno: int) -> int:
+        # ast line numbers are 1-based; ``starts`` is 0-based.
+        return starts[lineno - 1] + colno if 0 < lineno <= len(starts) else len(parse_text)
+
+    best: Optional[Tuple[int, _pyast.Call]] = None
+    for node in _pyast.walk(tree):
+        if not isinstance(node, _pyast.Call):
+            continue
+        s = _off(node.lineno, node.col_offset)
+        e = _off(node.end_lineno, node.end_col_offset)
+        if s <= cursor_off <= e and (best is None or s > best[0]):
+            best = (s, node)
+    if best is None:
+        return None
+    node = best[1]
+
+    if isinstance(node.func, _pyast.Name):
+        callee = node.func.id
+    elif isinstance(node.func, _pyast.Attribute):
+        callee = node.func.attr
+    else:
+        return None
+
+    used = {kw.arg for kw in node.keywords if kw.arg}
+    func_end = _off(node.func.end_lineno, node.func.end_col_offset)
+    params_text = parse_text[func_end + 1 : cursor_off]
+    return callee, used, params_text
+
+
+def _add_call_kwargs_completions(
+    items: List[types.CompletionItem],
+    seen: set,
+    callee: str,
+    used: set,
+) -> None:
+    """Keyword arguments of a known displayable constructor, skipping the
+    ones already written in the same call."""
+    for kw in RENPY_CONSTRUCTOR_KWARGS.get(callee, []):
+        if kw in used:
+            continue
+        if kw in seen:
+            continue
+        seen.add(kw)
+        items.append(
+            types.CompletionItem(
+                label=kw,
+                kind=types.CompletionItemKind.Property,
+                detail=f"{callee} keyword argument",
+                sort_text=f"{_SORT_BUILTIN}{kw}",
+                insert_text=f"{kw}=",
+                filter_text=kw,
+            )
+        )
 
 
 def _global_label_at(parser: RpyParser, line_no: int) -> Optional[str]:
@@ -589,8 +750,10 @@ def _add_namespace_member_completions(
     if static:
         members, kind = static
         for member in members:
+            full = f"{namespace}.{member}"
+            data = {"api": full} if api_docs.lookup(full) else None
             _add_completion_item(
-                items, seen, member, kind, f"{namespace}.{member}", _SORT_BUILTIN
+                items, seen, member, kind, full, _SORT_BUILTIN, data
             )
 
 
@@ -720,6 +883,16 @@ def _completion_items_for_context(
         )
         if items:
             return finish(col - len(_MEMBER_CHARS.search(prefix).group(0)))
+
+    # Inside a displayable constructor call in an expression —
+    # "define x = Transform(ker" → that constructor's keyword arguments.
+    if _looks_like_call_arg(prefix, trigger_character):
+        call_ctx = _innermost_call_context(lines, line_no, col)
+        if call_ctx is not None:
+            callee, used, _params = call_ctx
+            if callee in RENPY_CONSTRUCTOR_KWARGS:
+                _add_call_kwargs_completions(items, seen, callee, used)
+                return finish(col - len(_MEMBER_CHARS.search(prefix).group(0)))
 
     if _prefix_matches(
         prefix,

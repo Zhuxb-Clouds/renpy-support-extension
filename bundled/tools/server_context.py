@@ -107,6 +107,9 @@ _settings = {
         "fullOnSave": False,
         "severity": {},
     },
+    "previews": {
+        "enabled": True,
+    },
 }
 
 # Allowed values for the `blankLines` formatting mode:
@@ -241,6 +244,17 @@ def _update_settings(raw_settings: object) -> None:
         _settings["diagnostics"]["fullOnSave"],
         len(_settings["diagnostics"]["severity"]),
     )
+
+
+    previews = settings.get("previews", {})
+    if isinstance(previews, dict):
+        _settings["previews"]["enabled"] = _coerce_bool(
+            previews.get("enabled"), _settings["previews"]["enabled"]
+        )
+    elif "previews.enabled" in settings:
+        _settings["previews"]["enabled"] = _coerce_bool(
+            settings.get("previews.enabled"), _settings["previews"]["enabled"]
+        )
 
 
 def _find_format_config() -> Optional[str]:

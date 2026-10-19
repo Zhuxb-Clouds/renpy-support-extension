@@ -275,3 +275,132 @@ def test_invalidate_asset_caches_rebuilds_the_image_cache(monkeypatch) -> None:
     monkeypatch.setattr(ctx, "_image_cache_built", True)
     ctx.invalidate_asset_caches()
     assert ctx._image_cache_built is False and ctx._image_cache == {}
+
+
+# ── Workspace symbols ────────────────────────────────────────────────────
+
+
+def test_workspace_symbol_search_finds_labels_and_defines(project) -> None:
+    hits = lsp_server.workspace_symbol(
+        project.ls, types.WorkspaceSymbolParams(query="chapter")
+    )
+    names = {s.name for s in hits}
+    assert "chapter1" in names
+
+    everything = lsp_server.workspace_symbol(
+        project.ls, types.WorkspaceSymbolParams(query="")
+    )
+    by_name = {s.name: s for s in everything}
+    assert "chapter1" in by_name
+    assert "e" in by_name
+    assert by_name["chapter1"].container_name.endswith(".rpy")
+
+
+# ── Call hierarchy ───────────────────────────────────────────────────────
+
+
+def _prepare(project, path: Path, needle: str):
+    items = lsp_server.prepare_call_hierarchy(
+        project.ls,
+        types.CallHierarchyPrepareParams(
+            text_document=types.TextDocumentIdentifier(uri=uri_of(path)),
+            position=_position(path, needle),
+        ),
+    )
+    assert items, needle
+    return items[0]
+
+
+def test_call_hierarchy_incoming_and_outgoing(project) -> None:
+    script = project.game / "script.rpy"
+    chapter = project.game / "chapter.rpy"
+
+    start = _prepare(project, script, "label start")
+    chapter1 = _prepare(project, chapter, "label chapter1")
+
+    incoming = lsp_server.incoming_calls(
+        project.ls, types.CallHierarchyIncomingCallsParams(item=chapter1)
+    )
+    callers = {c.from_.name for c in incoming}
+    assert callers == {"start", "start.sub"}
+
+    outgoing = lsp_server.outgoing_calls(
+        project.ls, types.CallHierarchyOutgoingCallsParams(item=start)
+    )
+    targets = {c.to.name for c in outgoing}
+    assert targets == {"chapter1", "start.sub"}
+
+
+def test_call_hierarchy_prepare_on_reference_resolves_target(project) -> None:
+    script = project.game / "script.rpy"
+    items = lsp_server.prepare_call_hierarchy(
+        project.ls,
+        types.CallHierarchyPrepareParams(
+            text_document=types.TextDocumentIdentifier(uri=uri_of(script)),
+            position=_position(script, "call chapter1", offset=5),
+        ),
+    )
+    assert items
+    assert items[0].name == "chapter1"
+
+
+# ── Media preview hover ──────────────────────────────────────────────────
+
+
+def _hover_at(project, path: Path, line_no: int):
+    params = types.HoverParams(
+        text_document=types.TextDocumentIdentifier(uri=uri_of(path)),
+        position=types.Position(line=line_no, character=4),
+    )
+    return lsp_server.hover(project.ls, params)
+
+
+def test_media_hover_image_and_audio(project) -> None:
+    game = project.game
+    (game / "images").mkdir()
+    (game / "images" / "bg_room.png").write_bytes(b"\x89PNG\r\n")
+    (game / "audio").mkdir()
+    (game / "audio" / "oldtime.ogg").write_bytes(b"OggS")
+    media = game / "media.rpy"
+    media.write_text(
+        'image bg room = "images/bg_room.png"\n'
+        'define audio.oldtime = "audio/oldtime.ogg"\n'
+        "label main:\n"
+        "    show bg room\n"
+        "    play music oldtime\n"
+        '    play sound "audio/oldtime.ogg"\n',
+        encoding="utf-8",
+    )
+    project.index._rpy_files = None  # force re-glob for the new file
+
+    image_hover = _hover_at(project, media, 3)
+    assert image_hover is not None
+    assert "![preview](file://" in image_hover.contents.value
+    assert image_hover.contents.value.endswith("bg_room.png)")
+
+    define_hover = _hover_at(project, media, 4)
+    assert define_hover is not None
+    assert "command:renpy-lsp.previewMedia" in define_hover.contents.value
+
+    direct_hover = _hover_at(project, media, 5)
+    assert direct_hover is not None
+    assert "command:renpy-lsp.previewMedia" in direct_hover.contents.value
+
+
+def test_media_hover_disabled_by_setting(project) -> None:
+    media = project.game / "media2.rpy"
+    media.write_text(
+        'image bg room = "images/bg_room.png"\n'
+        "label main2:\n"
+        "    show bg room\n",
+        encoding="utf-8",
+    )
+    project.index._rpy_files = None
+    with ctx._settings_lock if hasattr(ctx, "_settings_lock") else ctx._cache_lock:
+        old = ctx._settings["previews"]["enabled"]
+        ctx._settings["previews"]["enabled"] = False
+    try:
+        hover = _hover_at(project, media, 2)
+        assert hover is None or "![preview]" not in hover.contents.value
+    finally:
+        ctx._settings["previews"]["enabled"] = old

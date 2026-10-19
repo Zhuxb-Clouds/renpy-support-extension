@@ -197,6 +197,13 @@ export function activate(context: vscode.ExtensionContext) {
       log("Command: launchProject");
       launchProject();
     }),
+    vscode.commands.registerCommand("renpy-lsp.previewMedia", (fileUri?: string, kind?: string) => {
+      log(`Command: previewMedia ${kind ?? "audio"} ${fileUri ?? "(none)"}`);
+      if (!fileUri) {
+        return;
+      }
+      openMediaPreview(fileUri, kind === "video" ? "video" : "audio");
+    }),
 
   );
 
@@ -785,6 +792,38 @@ async function startLanguageServer(context: vscode.ExtensionContext) {
         vscode.workspace.createFileSystemWatcher("**/*", false, true, false),
       ],
     },
+    // Rebuild hover contents as a trusted MarkdownString so image previews
+    // (file: URIs) render and the previewMedia command links stay clickable.
+    middleware: {
+      provideHover: (document, position, token, next) => {
+        const result: Thenable<vscode.Hover | null | undefined> = Promise.resolve(
+          next(document, position, token),
+        );
+        return result.then((hover): vscode.Hover | undefined => {
+          if (!hover) {
+            return undefined;
+          }
+          const raw: unknown = hover.contents;
+          if (
+            raw === null ||
+            typeof raw !== "object" ||
+            Array.isArray(raw) ||
+            !("kind" in raw) ||
+            (raw as { kind: unknown }).kind !== "markdown"
+          ) {
+            return hover;
+          }
+          const value = (raw as unknown as { value: unknown }).value;
+          if (typeof value !== "string") {
+            return hover;
+          }
+          const md = new vscode.MarkdownString(value);
+          md.isTrusted = { enabledCommands: ["renpy-lsp.previewMedia"] };
+          md.supportHtml = true;
+          return new vscode.Hover(md, hover.range);
+        });
+      },
+    },
   };
 
   client = new LanguageClient("renpy-lsp", "Ren'Py Language Server", serverOptions, clientOptions);
@@ -801,6 +840,32 @@ async function startLanguageServer(context: vscode.ExtensionContext) {
       client = undefined;
     },
   );
+}
+
+/**
+ * Opens a media file (audio/video) in a webview panel next to the editor.
+ * Called from hover command links produced by the language server.
+ */
+function openMediaPreview(fileUri: string, kind: "audio" | "video"): void {
+  const mediaUri = vscode.Uri.parse(fileUri);
+  const panel = vscode.window.createWebviewPanel(
+    "renpyMediaPreview",
+    `Ren'Py ${kind === "video" ? "Video" : "Audio"} Preview`,
+    vscode.ViewColumn.Beside,
+    { enableScripts: false },
+  );
+  const webUri = panel.webview.asWebviewUri(mediaUri);
+  const tag =
+    kind === "video"
+      ? `<video controls autoplay style="max-width:100%"><source src="${webUri}"></video>`
+      : `<audio controls autoplay style="width:100%"><source src="${webUri}"></audio>`;
+  panel.webview.html = `<!DOCTYPE html>
+<html>
+<body style="font-family:sans-serif;background:#1e1e1e;color:#cccccc;padding:16px">
+  ${tag}
+  <p style="font-size:12px;opacity:0.7">${mediaUri.fsPath.split(/[\\/]/).pop()} — 若无法播放,该格式可能不受 VS Code 支持。</p>
+</body>
+</html>`;
 }
 
 async function stopLanguageServer(): Promise<void> {
