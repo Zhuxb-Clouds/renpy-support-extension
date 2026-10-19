@@ -2,7 +2,7 @@
   "name": "renpy-support-extension",
   "publisher": "zhuxb-clouds",
   "displayName": "Ren'Py Language Support",
-  "version": "1.11.1",
+  "version": "1.11.2",
   "description": "Language support for Ren'Py script files (.rpy)",
   "icon": "icons/renpy.png",
   "main": "./dist/extension.js",
@@ -204,6 +204,12 @@
           "type": "boolean",
           "default": true,
           "description": "Show media previews on hover: images for show/scene/image lines, audio/video preview links for play/queue/voice lines."
+        },
+        "renpy-lsp.previews.maxSize": {
+          "type": "number",
+          "default": 400,
+          "minimum": 50,
+          "description": "Maximum width and height (pixels) of hover image previews. Larger images are scaled down to fit while keeping their aspect ratio; smaller images are never scaled up."
         },
         "renpy-lsp.logLevel": {
           "type": "string",

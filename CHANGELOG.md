@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.11.2] - 2026-10-20
+
+### Fixed
+
+- **Hover image previews no longer overflow the hover widget.** Pictures bigger than the new `renpy-lsp.previews.maxSize` setting (default `400` px) are scaled down to fit while keeping their aspect ratio — no more scrolling inside the hover; smaller images are never upscaled. When an image's pixel dimensions cannot be read (corrupt or exotic header), the width alone is capped so the height scales proportionally.
+
 ## [1.11.1] - 2026-10-19
 
 ### Fixed
