@@ -3,6 +3,8 @@ cross-file refresh, and the asset/Python-definition caches."""
 
 from __future__ import annotations
 
+import struct
+import zlib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -355,10 +357,22 @@ def _hover_at(project, path: Path, line_no: int):
     return lsp_server.hover(project.ls, params)
 
 
+def _png_bytes(width: int, height: int) -> bytes:
+    """Minimal valid PNG header carrying the given dimensions."""
+    ihdr = struct.pack(">II5B", width, height, 8, 6, 0, 0, 0)
+    chunk = b"IHDR" + ihdr
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + struct.pack(">I", len(ihdr))
+        + chunk
+        + struct.pack(">I", zlib.crc32(chunk))
+    )
+
+
 def test_media_hover_image_and_audio(project) -> None:
     game = project.game
     (game / "images").mkdir()
-    (game / "images" / "bg_room.png").write_bytes(b"\x89PNG\r\n")
+    (game / "images" / "bg_room.png").write_bytes(_png_bytes(128, 64))
     (game / "audio").mkdir()
     (game / "audio" / "oldtime.ogg").write_bytes(b"OggS")
     media = game / "media.rpy"
@@ -375,8 +389,10 @@ def test_media_hover_image_and_audio(project) -> None:
 
     image_hover = _hover_at(project, media, 3)
     assert image_hover is not None
-    assert "![preview](file://" in image_hover.contents.value
-    assert image_hover.contents.value.endswith("bg_room.png)")
+    value = image_hover.contents.value
+    assert "![preview](file://" in value
+    # 128x64 already fits the default 400px box: no upscaling
+    assert "| width=128, height=64)" in value
 
     define_hover = _hover_at(project, media, 4)
     assert define_hover is not None
@@ -385,6 +401,42 @@ def test_media_hover_image_and_audio(project) -> None:
     direct_hover = _hover_at(project, media, 5)
     assert direct_hover is not None
     assert "command:renpy-lsp.previewMedia" in direct_hover.contents.value
+
+
+def test_media_hover_image_contained_to_max_size(project) -> None:
+    game = project.game
+    (game / "images").mkdir()
+    (game / "images" / "bg_big.png").write_bytes(_png_bytes(800, 600))
+    (game / "images" / "bg_fake.png").write_bytes(b"\x89PNG\r\n")
+    media = game / "media3.rpy"
+    media.write_text(
+        'image bg big = "images/bg_big.png"\n'
+        'image bg fake = "images/bg_fake.png"\n'
+        "label main3:\n"
+        "    show bg big\n"
+        "    show bg fake\n",
+        encoding="utf-8",
+    )
+    project.index._rpy_files = None
+
+    big_hover = _hover_at(project, media, 3)
+    assert big_hover is not None
+    # 800x600 scales down to the default 400px box, ratio preserved
+    assert "| width=400, height=300)" in big_hover.contents.value
+
+    # unreadable dimensions: width-only fallback (height scales in the renderer)
+    fake_hover = _hover_at(project, media, 4)
+    assert fake_hover is not None
+    assert "| width=400)" in fake_hover.contents.value
+
+    old = ctx._settings["previews"]["maxSize"]
+    try:
+        ctx._settings["previews"]["maxSize"] = 200
+        smaller_hover = _hover_at(project, media, 3)
+        assert smaller_hover is not None
+        assert "| width=200, height=150)" in smaller_hover.contents.value
+    finally:
+        ctx._settings["previews"]["maxSize"] = old
 
 
 def test_media_hover_disabled_by_setting(project) -> None:

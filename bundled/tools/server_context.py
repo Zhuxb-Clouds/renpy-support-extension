@@ -109,6 +109,7 @@ _settings = {
     },
     "previews": {
         "enabled": True,
+        "maxSize": 400,
     },
 }
 
@@ -251,10 +252,18 @@ def _update_settings(raw_settings: object) -> None:
         _settings["previews"]["enabled"] = _coerce_bool(
             previews.get("enabled"), _settings["previews"]["enabled"]
         )
-    elif "previews.enabled" in settings:
-        _settings["previews"]["enabled"] = _coerce_bool(
-            settings.get("previews.enabled"), _settings["previews"]["enabled"]
+        _settings["previews"]["maxSize"] = _coerce_int(
+            previews.get("maxSize"), _settings["previews"]["maxSize"]
         )
+    else:
+        if "previews.enabled" in settings:
+            _settings["previews"]["enabled"] = _coerce_bool(
+                settings.get("previews.enabled"), _settings["previews"]["enabled"]
+            )
+        if "previews.maxSize" in settings:
+            _settings["previews"]["maxSize"] = _coerce_int(
+                settings.get("previews.maxSize"), _settings["previews"]["maxSize"]
+            )
 
 
 def _find_format_config() -> Optional[str]:

@@ -177,3 +177,27 @@ def test_update_settings_keeps_severity_when_absent() -> None:
         assert ctx._diagnostic_severity_overrides() == {"unused-label": "none"}
     finally:
         _restore_diag_settings(state)
+
+
+def test_update_settings_previews_max_size() -> None:
+    state = dict(ctx._settings["previews"])
+    try:
+        lsp_server._update_settings({"previews": {"maxSize": 200}})
+        assert ctx._settings["previews"]["maxSize"] == 200
+
+        lsp_server._update_settings(
+            {"renpy-lsp": {"previews": {"enabled": False, "maxSize": 640}}}
+        )
+        assert ctx._settings["previews"]["maxSize"] == 640
+        assert ctx._settings["previews"]["enabled"] is False
+
+        # non-integer junk keeps the previous value
+        lsp_server._update_settings({"previews": {"maxSize": "bogus"}})
+        assert ctx._settings["previews"]["maxSize"] == 640
+
+        # absent updates leave it untouched
+        lsp_server._update_settings({"previews": {"enabled": True}})
+        assert ctx._settings["previews"]["maxSize"] == 640
+    finally:
+        ctx._settings["previews"].clear()
+        ctx._settings["previews"].update(state)

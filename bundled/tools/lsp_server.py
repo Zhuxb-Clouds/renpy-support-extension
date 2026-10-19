@@ -94,6 +94,7 @@ import code_actions
 import signatures
 import translation
 import api_docs
+from media_utils import contained_dimensions
 from translation import _renpy_translate_id, _find_say_at_line
 
 from typing import Dict, List, Optional, Tuple, Union
@@ -1549,6 +1550,30 @@ def _preview_media_command(file_uri: str, kind: str) -> str:
     return f"[{label}](command:renpy-lsp.previewMedia?{args})"
 
 
+_DEFAULT_PREVIEW_MAX_SIZE = 400
+
+
+def _image_preview_markdown(path: str) -> str:
+    """Markdown image contained to ``previews.maxSize`` so large pictures
+    render fully inside the hover widget instead of requiring scroll.
+
+    Uses the VS Code image-size syntax ``![alt](src | width=W, height=H)``;
+    when the pixel dimensions cannot be read, falls back to capping the
+    width only (the height then scales proportionally).
+    """
+    uri = Path(path).as_uri()
+    try:
+        max_size = int(ctx._settings["previews"].get("maxSize"))
+    except (TypeError, ValueError):
+        max_size = _DEFAULT_PREVIEW_MAX_SIZE
+    if max_size <= 0:
+        return f"![preview]({uri})"
+    dims = contained_dimensions(path, max_size)
+    if dims:
+        return f"![preview]({uri} | width={dims[0]}, height={dims[1]})"
+    return f"![preview]({uri} | width={max_size})"
+
+
 def _resolve_image_files(image_name: str, source_uri: str) -> List[str]:
     """Absolute file paths behind an image name (define expression paths)."""
     images = dict(
@@ -1595,7 +1620,7 @@ def _media_preview_hover(
         name = " ".join(name.split())
         for path in _resolve_image_files(name, uri)[:4]:
             if _IMAGE_EXT_RE.search(path):
-                parts.append(f"![preview]({Path(path).as_uri()})")
+                parts.append(_image_preview_markdown(path))
     elif re.match(r"image\s+", stripped, re.IGNORECASE):
         for img in parser.get_all_images():
             if img.lineno - 1 != line0:
@@ -1603,7 +1628,7 @@ def _media_preview_hover(
             for fm in _MEDIA_FILE_RE.finditer(img.expression or ""):
                 resolved = ctx._resolve_renpy_file(fm.group(1), source_uri=uri)
                 if resolved and _IMAGE_EXT_RE.search(resolved):
-                    parts.append(f"![preview]({Path(resolved).as_uri()})")
+                    parts.append(_image_preview_markdown(resolved))
     else:
         m = re.match(r"(?:play|queue|voice)\s+", stripped, re.IGNORECASE)
         if m:

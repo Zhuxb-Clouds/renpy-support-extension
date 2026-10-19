@@ -61,6 +61,7 @@
 | `renpy-lsp.diagnostics.fullOnSave` | `false` | 保存时也重跑完整诊断(编辑时已随变更队列重跑;内容未变化的保存不会重跑) |
 | `renpy-lsp.diagnostics.severity`  | `{}` | 按检查项覆盖严重级别,如 `{ "unused-label": "none", "undefined-transform": "information" }`;`none` 表示彻底关闭该检查 |
 | `renpy-lsp.previews.enabled` | `true` | 悬停媒体预览:`show`/`scene`/`image` 行显示图片,`play`/`queue`/`voice` 行显示音频/视频预览链接 |
+| `renpy-lsp.previews.maxSize` | `400` | 悬停图片预览的最大宽高(像素);超出的图片等比缩小到框内,小图不放大 |
 | `renpy-lsp.logLevel`              | `info` | 输出面板中语言服务器日志的详细程度（`error`/`warning`/`info`/`debug`） |
 
 ### 项目级格式化配置

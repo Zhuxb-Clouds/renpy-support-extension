@@ -61,6 +61,7 @@ Open Command Palette (`Ctrl+Shift+P` / `Cmd+Shift+P`) and type:
 | `renpy-lsp.diagnostics.fullOnSave` | `false` | Also re-run the full pass on save (edits already re-run it; saves re-run only when the content changed) |
 | `renpy-lsp.diagnostics.severity` | `{}` | Per-check severity overrides, e.g. `{ "unused-label": "none", "undefined-transform": "information" }` — `none` disables a check |
 | `renpy-lsp.previews.enabled` | `true` | Media previews on hover: pictures for `show`/`scene`/`image` lines, audio/video preview links for `play`/`queue`/`voice` lines |
+| `renpy-lsp.previews.maxSize` | `400` | Maximum width/height (pixels) of hover image previews; oversized images are scaled down to fit, aspect ratio preserved |
 | `renpy-lsp.logLevel` | `info` | Language server log verbosity in the Output panel (`error`/`warning`/`info`/`debug`) |
 
 ### Per-project format config
