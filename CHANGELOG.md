@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.11.1] - 2026-10-19
+
+### Fixed
+
+- **Marketplace publishing was silently failing since 1.10.0** — the extension icon (`icons/renpy.png`, 1473×1545) exceeded the newly enforced 1024×1024 limit, so `vsce publish` aborted and only 1.9.2 ever reached the Marketplace (GitHub Releases were unaffected). The icon is now 1024×1024.
+- The release workflow no longer swallows Marketplace publish errors: the GitHub Release is created first, then `vsce publish` runs without `continue-on-error`, so a failed publish turns the run red instead of leaving a green check with nothing on the Marketplace.
+
 ## [1.11.0] - 2026-10-19
 
 ### Added
