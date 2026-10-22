@@ -620,7 +620,7 @@ KEYWORD_DOCS: Dict[str, str] = {
     "show": "**show** *image* [**at** *transform*] [**with** *transition*]\n\nShows an image on the screen.\n\n[📖 Ren'Py Docs](https://www.renpy.org/doc/html/displaying_images.html#show-statement)",
     "hide": "**hide** *image* [**with** *transition*]\n\nHides the named image.\n\n[📖 Ren'Py Docs](https://www.renpy.org/doc/html/displaying_images.html#hide-statement)",
     "with": "**with** *transition*\n\nApplies a transition effect (e.g., dissolve, fade).\n\n[📖 Ren'Py Docs](https://www.renpy.org/doc/html/displaying_images.html#with-statement)",
-    "play": '**play** *channel* "*file*" [**fadein** *sec*]\n\nPlays audio on the specified channel.\n\n[📖 Ren\'Py Docs](https://www.renpy.org/doc/html/audio.html#play-statement)',
+    "play": '**play** *channel* *file(s)* [*properties*…]\n\nPlays audio on the specified channel. *file(s)* is one or more filenames, variables, or a list mixing both — `play music [ "a.ogg", sfx_page, "<silence 5>" ] loop`.\n\n[📖 Ren\'Py Docs](https://www.renpy.org/doc/html/audio.html#play-statement)',
     "stop": "**stop** *channel* [**fadeout** *sec*]\n\nStops audio on the specified channel.\n\n[📖 Ren'Py Docs](https://www.renpy.org/doc/html/audio.html#stop-statement)",
     "voice": '**voice** "*file*"\n\nPlays a voice file for the next line of dialogue.\n\n[📖 Ren\'Py Docs](https://www.renpy.org/doc/html/voice.html)',
     "screen": "**screen** *name*([*params*]):\n\nDefines a screen for the screen language.\n\n[📖 Ren'Py Docs](https://www.renpy.org/doc/html/screens.html)",

@@ -294,11 +294,16 @@ class With(Node):
 
 @dataclass
 class PlayMusic(Node):
-    """``play channel "file" [options]``."""
+    """``play channel file [options]`` — *file* is a quoted filename, a
+    variable, or a bracketed list mixing both
+    (``play sound_0 [ sfx_page, "<silence 5>" ] loop``)."""
 
     channel: str = ""
+    # Raw file spec as written — for a list this includes the brackets.
     filename: str = ""
     options: str = ""
+    # Parsed file items: quoted strings unquoted, variables kept as names.
+    filenames: List[str] = field(default_factory=list, compare=False)
 
 
 @dataclass
@@ -311,10 +316,11 @@ class StopMusic(Node):
 
 @dataclass
 class QueueMusic(Node):
-    """``queue channel "file"``."""
+    """``queue channel file`` — same file forms as :class:`PlayMusic`."""
 
     channel: str = ""
     filename: str = ""
+    filenames: List[str] = field(default_factory=list, compare=False)
 
 
 @dataclass
@@ -523,6 +529,93 @@ _RE_QUEUE = re.compile(
     r"^queue\s+(\w+)\s+(?:[\"']([^\"']+)[\"']|([a-zA-Z_\u4e00-\u9fff\u3400-\u4dbf]\w*))(.*)$"
 )
 _RE_VOICE = re.compile(r"^voice\s+[\"'](.+?)[\"']$")
+# ``play <channel>`` / ``queue <channel>`` head — the file list follows.
+_RE_PLAY_HEAD = re.compile(r"^(play|queue)\s+(\w+)\s+")
+
+
+def _find_bracket_end(text: str) -> int:
+    """Index just past the ``]`` closing the ``[`` at ``text[0]``, counting
+    brackets outside string literals, or -1 when it is never closed."""
+    depth = 0
+    quote = None
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if quote is not None:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch in "\"'":
+            quote = ch
+        elif ch in "[(":
+            depth += 1
+        elif ch in "])":
+            depth -= 1
+            if depth <= 0:
+                return i + 1
+        i += 1
+    return -1
+
+
+def _split_list_items(inner: str) -> List[str]:
+    """Top-level comma-separated items of a play/queue file list, with
+    surrounding quotes stripped (``sfx_page, "<silence 5>"`` stays two
+    items; quotes inside ``"<silence 5>"`` shield the space and any comma)."""
+    items: List[str] = []
+    buf: List[str] = []
+    quote = None
+    i, n = 0, len(inner)
+    while i < n:
+        ch = inner[i]
+        if quote is not None:
+            if ch == "\\" and i + 1 < n:
+                buf.append(inner[i : i + 2])
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch in "\"'":
+            quote = ch
+        elif ch == ",":
+            items.append("".join(buf).strip())
+            buf = []
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    items.append("".join(buf).strip())
+    out = []
+    for item in items:
+        if len(item) >= 2 and item[0] == item[-1] and item[0] in "\"'":
+            item = item[1:-1].strip()
+        if item:
+            out.append(item)
+    return out
+
+
+def _parse_audio_statement(content: str) -> Optional[Tuple[str, str, List[str], str]]:
+    """Parse a play/queue statement whose file spec is a ``[…]`` list, e.g.
+    ``play sound_0 [ sfx_page, "<silence 5>" ] loop``.
+
+    Returns ``(channel, raw_spec, items, options)`` — the list is cut at its
+    balanced ``]`` so trailing options (``loop``, ``fadein 1.0`` …) survive.
+    An unclosed list (mid-edit after the continuation join gave up) swallows
+    the rest of the line instead of stacking a second parse error.  Returns
+    None when the statement does not start ``play/queue <channel> [``.
+    """
+    m = _RE_PLAY_HEAD.match(content)
+    if m is None or m.end() >= len(content) or content[m.end()] != "[":
+        return None
+    rest = content[m.end() :]
+    end = _find_bracket_end(rest)
+    if end == -1:
+        raw, items, options = rest, _split_list_items(rest[1:]), ""
+    else:
+        raw, items = rest[:end], _split_list_items(rest[1 : end - 1])
+        options = rest[end:].strip()
+    return m.group(2), raw, items, options
 
 _RE_NVL = re.compile(r"^nvl\s+(clear|show|hide)$")
 
@@ -1399,13 +1492,15 @@ class RpyParser:
         # ── Audio: play / stop / queue / voice ──
         m = _RE_PLAY.match(content)
         if m:
+            spec = m.group(2) or m.group(3)
             return PlayMusic(
                 lineno=lineno,
                 end_lineno=lineno,
                 indent=indent,
                 channel=m.group(1),
-                filename=m.group(2) or m.group(3),
+                filename=spec,
                 options=m.group(4).strip(),
+                filenames=[spec],
             )
 
         m = _RE_STOP.match(content)
@@ -1420,12 +1515,38 @@ class RpyParser:
 
         m = _RE_QUEUE.match(content)
         if m:
+            spec = m.group(2) or m.group(3)
             return QueueMusic(
                 lineno=lineno,
                 end_lineno=lineno,
                 indent=indent,
                 channel=m.group(1),
-                filename=m.group(2) or m.group(3),
+                filename=spec,
+                filenames=[spec],
+            )
+
+        # File-list form shared by play and queue:
+        #   play sound_0 [ sfx_page, "<silence 5>" ] loop
+        audio_list = _parse_audio_statement(content)
+        if audio_list is not None:
+            channel, raw, items, options = audio_list
+            if content.startswith("play"):
+                return PlayMusic(
+                    lineno=lineno,
+                    end_lineno=lineno,
+                    indent=indent,
+                    channel=channel,
+                    filename=raw,
+                    options=options,
+                    filenames=items,
+                )
+            return QueueMusic(
+                lineno=lineno,
+                end_lineno=lineno,
+                indent=indent,
+                channel=channel,
+                filename=raw,
+                filenames=items,
             )
 
         m = _RE_VOICE.match(content)

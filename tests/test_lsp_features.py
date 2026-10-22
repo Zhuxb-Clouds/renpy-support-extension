@@ -456,3 +456,39 @@ def test_media_hover_disabled_by_setting(project) -> None:
         assert hover is None or "![preview]" not in hover.contents.value
     finally:
         ctx._settings["previews"]["enabled"] = old
+
+
+def test_media_hover_and_definition_inside_play_file_list(project) -> None:
+    game = project.game
+    (game / "audio").mkdir(exist_ok=True)
+    (game / "audio" / "page_turn.ogg").write_bytes(b"OggS")
+    media = game / "media_list.rpy"
+    media.write_text(
+        'define sfx_page_turn = "audio/page_turn.ogg"\n'
+        "label media_list:\n"
+        '    play sound_0 [ sfx_page_turn, "<silence 5>" ] loop\n',
+        encoding="utf-8",
+    )
+    project.index._rpy_files = None  # force re-glob for the new file
+
+    # Hover on the bare variable inside the list → audio preview link.
+    hover = lsp_server.hover(
+        project.ls,
+        types.HoverParams(
+            text_document=types.TextDocumentIdentifier(uri=uri_of(media)),
+            position=_position(media, "sound_0 [ sfx_page_turn", offset=14),
+        ),
+    )
+    assert hover is not None
+    assert "command:renpy-lsp.previewMedia" in hover.contents.value
+
+    # Go-to-definition on the same item → the define.
+    defs = lsp_server.goto_definition(
+        project.ls,
+        types.DefinitionParams(
+            text_document=types.TextDocumentIdentifier(uri=uri_of(media)),
+            position=_position(media, "sound_0 [ sfx_page_turn", offset=14),
+        ),
+    )
+    assert defs
+    assert "media_list.rpy" in defs[0].uri

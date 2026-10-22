@@ -113,7 +113,12 @@ _register(
         ("play",),
         "play",
         [
-            _Param('channel "file"', "Channel (music, sound, audio, …) and the file to play"),
+            _Param(
+                'channel "file" | [file, …]',
+                "Channel (music, sound, audio, …) and the file(s) to play — a "
+                "filename, a variable, or a list mixing both: "
+                '`play sound_0 [ sfx_page, "<silence 5>" ]`',
+            ),
             _Param("[fadeout sec]", "Seconds of fade-out before the new track", ("fadeout",)),
             _Param("[fadein sec]", "Seconds of fade-in", ("fadein",)),
             _Param("[loop]", "Loop the track (default for music)", ("loop",)),
@@ -129,7 +134,10 @@ _register(
         ("queue",),
         "queue",
         [
-            _Param('channel "file"', "Channel and the file to queue"),
+            _Param(
+                'channel "file" | [file, …]',
+                "Channel and the file(s) to queue — same forms as play",
+            ),
             _Param("[fadeout sec]", "Seconds of fade-out", ("fadeout",)),
             _Param("[fadein sec]", "Seconds of fade-in", ("fadein",)),
             _Param("[loop]", "Loop the track", ("loop",)),

@@ -933,7 +933,9 @@ def _completion_items_for_context(
         return finish(col - len(last_word))
     if _prefix_matches(
         prefix,
-        rf"^\s*(?:play|queue)\s+\w+\s+{_COMPLETION_IDENTIFIER_RE}$",
+        # The optional ``[…]`` part matches an open play/queue file list
+        # before the cursor: ``play sound_0 [ sfx_a, sfx_`` completes too.
+        rf"^\s*(?:play|queue)\s+\w+\s+(?:\[[^\]\[]*)?{_COMPLETION_IDENTIFIER_RE}$",
     ):
         _add_audio_define_completions(items, seen, uri, parser)
         return finish(name_start)

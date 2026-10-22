@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- **`play`/`queue` file lists are no longer flagged as "Unrecognized statement".** The audio statements accept a bracketed list of files — `play sound_0 [ sfx_page_turn, "<silence 5>" ] loop`, the standard `play music [ "a.ogg", "b.ogg" ] fadein 1.0`, and the same form on `queue` — mixing quoted filenames, bare variables (resolved via `define audio.*` or plain defines) and audio tags like `<silence 5>`. Lists may span multiple lines, and an unclosed `[` mid-edit degrades gracefully instead of stacking a second parse error. Inside a list: audio-define completion after `[` or a comma, hover with the audio preview link on a variable item, and go-to-definition jumping to the item under the cursor.
+
 ## [1.11.3] - 2026-10-22
 
 ### Fixed

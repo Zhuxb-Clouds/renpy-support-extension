@@ -444,3 +444,57 @@ def test_no_constructor_kwargs_outside_calls(monkeypatch) -> None:
 
     assert "kerning" not in items
     assert "fit_first" not in items
+
+
+def test_audio_define_completion_inside_play_file_list(monkeypatch) -> None:
+    lines, parser = parse(
+        """
+        define audio.theme = "audio/theme.ogg"
+        define audio.sfx_page = "audio/page.ogg"
+        label start:
+            play sound_0 [ sfx_
+        """
+    )
+    patch_workspace_symbols(monkeypatch, parser)
+
+    items = complete(lines, parser, 3)
+
+    assert {"theme", "sfx_page"} <= labels(items)
+
+
+def test_audio_define_completion_mid_list_and_after_open_bracket(monkeypatch) -> None:
+    lines_mid, parser_mid = parse(
+        """
+        define audio.theme = "audio/theme.ogg"
+        define audio.sfx_page = "audio/page.ogg"
+        label start:
+            play sound_0 [ theme, sfx_
+        """
+    )
+    patch_workspace_symbols(monkeypatch, parser_mid)
+    assert {"theme", "sfx_page"} <= labels(complete(lines_mid, parser_mid, 3))
+
+    lines_open, parser_open = parse(
+        """
+        define audio.sfx_page = "audio/page.ogg"
+        label start:
+            play sound_0 [ 
+        """
+    )
+    patch_workspace_symbols(monkeypatch, parser_open)
+    assert "sfx_page" in labels(complete(lines_open, parser_open, 2))
+
+
+def test_no_audio_completion_after_the_list_closes(monkeypatch) -> None:
+    lines, parser = parse(
+        """
+        define audio.theme = "audio/theme.ogg"
+        label start:
+            play sound_0 [ theme ] lo
+        """
+    )
+    patch_workspace_symbols(monkeypatch, parser)
+
+    items = complete(lines, parser, 2)
+
+    assert "theme" not in labels(items)

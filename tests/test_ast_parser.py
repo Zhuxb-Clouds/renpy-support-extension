@@ -7,6 +7,8 @@ from ast_parser import (
     Camera,
     HideScreen,
     Label,
+    PlayMusic,
+    QueueMusic,
     RpyParser,
     Say,
     Show,
@@ -304,3 +306,86 @@ def test_name_columns_point_at_the_name_as_written() -> None:
         assert written in (node.name if isinstance(node, Label) else node.target, ".sub")
     (screen_call,) = parser._collect(parser.root, CallScreen)
     assert lines[3][screen_call.name_col :] == "inventory"
+
+
+# ── play / queue file lists ──────────────────────────────────────────────
+
+
+def test_play_and_queue_file_list_statements() -> None:
+    parser = parse(
+        """
+        label start:
+            play sound_0 [ sfx_page_turn,"<silence 5>" ] loop
+            play music [ "a.ogg", 'b.ogg', sfx_c ] fadein 1.0 volume 0.5
+            queue sound_0 [ sfx_page_turn ] loop
+            play sound "sfx/x.ogg"
+            play music oldtime
+        """
+    )
+    assert parser.errors == []
+    plays = parser._collect(parser.root, PlayMusic)
+    queues = parser._collect(parser.root, QueueMusic)
+    assert len(plays) == 4 and len(queues) == 1
+
+    assert plays[0].channel == "sound_0"
+    assert plays[0].filenames == ["sfx_page_turn", "<silence 5>"]
+    assert plays[0].filename == '[ sfx_page_turn,"<silence 5>" ]'
+    assert plays[0].options == "loop"
+
+    assert plays[1].filenames == ["a.ogg", "b.ogg", "sfx_c"]
+    assert plays[1].options == "fadein 1.0 volume 0.5"
+
+    assert queues[0].channel == "sound_0"
+    assert queues[0].filenames == ["sfx_page_turn"]
+
+    # Plain single-file forms keep their previous shape.
+    assert plays[2].filename == "sfx/x.ogg"
+    assert plays[2].filenames == ["sfx/x.ogg"]
+    assert plays[3].filenames == ["oldtime"]
+
+
+def test_play_file_list_scanner_is_string_aware() -> None:
+    parser = parse(
+        """
+        label start:
+            play music [ "weird]name.ogg", "with,comma.ogg" ] loop
+        """
+    )
+    assert parser.errors == []
+    (play,) = parser._collect(parser.root, PlayMusic)
+    assert play.filenames == ["weird]name.ogg", "with,comma.ogg"]
+    assert play.options == "loop"
+
+
+def test_play_file_list_spans_multiple_lines() -> None:
+    parser = parse(
+        """
+        label start:
+            play sound_0 [
+                sfx_page_turn,
+                "<silence 5>",
+            ] loop
+            return
+        """
+    )
+    assert parser.errors == []
+    (play,) = parser._collect(parser.root, PlayMusic)
+    assert play.channel == "sound_0"
+    assert play.filenames == ["sfx_page_turn", "<silence 5>"]
+    assert play.options == "loop"
+
+
+def test_unclosed_play_file_list_still_yields_a_node() -> None:
+    parser = parse(
+        """
+        label start:
+            play sound_0 [ sfx_page_turn,
+            return
+        """
+    )
+    # The continuation join reports the unclosed bracket; the statement
+    # itself must not add a second "Unrecognized statement" error.
+    assert [msg for _, msg in parser.errors] == ["Unclosed bracket"]
+    (play,) = parser._collect(parser.root, PlayMusic)
+    assert play.channel == "sound_0"
+    assert play.filenames == ["sfx_page_turn"]

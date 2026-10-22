@@ -579,3 +579,16 @@ def test_unclosed_string_is_an_error_with_its_own_code(monkeypatch) -> None:
     assert matching
     assert matching[0].severity == types.DiagnosticSeverity.Error
     assert matching[0].range.start.line == 0
+
+
+def test_play_file_list_is_not_an_unknown_statement(monkeypatch) -> None:
+    diags = collect(
+        monkeypatch,
+        """
+        define audio.sfx_page = "sfx/page_turn.ogg"
+        label start:
+            play sound_0 [ sfx_page, "<silence 5>" ] loop
+            return
+        """,
+    )
+    assert codes(diags) == []

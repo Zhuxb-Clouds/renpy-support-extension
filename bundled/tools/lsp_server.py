@@ -573,6 +573,42 @@ def goto_definition(
     return None
 
 
+def _resolve_audio_names(
+    names: List[str],
+    source_uri: Optional[str],
+    line_text: Optional[str],
+    col: Optional[int],
+) -> Optional[List[types.Location]]:
+    """Resolve play/queue file items to their audio files or defines.
+
+    *names* holds the parsed items of the file spec — a single entry for
+    ``play music "a.ogg"`` / ``play music oldtime``, several for the list
+    form ``play sound_0 [ sfx_page, "<silence 5>" ] loop``.  When the word
+    under the cursor matches one item, only that item is resolved.
+    """
+    if line_text is not None and col is not None:
+        word = _word_at_position(line_text, col)
+        if word:
+            for name in names:
+                if name.strip() == word:
+                    names = [name]
+                    break
+    all_defines = ctx._get_all_workspace_defines()
+    for name in names:
+        name = name.strip()
+        if not name:
+            continue
+        resolved = ctx._resolve_renpy_file(name, source_uri=source_uri)
+        if resolved:
+            return [_make_file_location(resolved)]
+        # The item may be a define name, bare (play music OldTime) or via
+        # Ren'Py's audio namespace (define audio.sfx_page = …).
+        for candidate in (name, f"audio.{name}"):
+            if candidate in all_defines:
+                return [_make_node_location(u, d) for u, d in all_defines[candidate]]
+    return None
+
+
 def _resolve_node_definition(
     node: Node,
     source_uri: Optional[str] = None,
@@ -638,38 +674,9 @@ def _resolve_node_definition(
         return None
 
     # ── Play / Queue → audio file or audio define ──
-    if isinstance(node, PlayMusic):
-        filename = node.filename.strip()
-        if filename:
-            resolved = ctx._resolve_renpy_file(filename, source_uri=source_uri)
-            if resolved:
-                return _make_file_location(resolved)
-        # filename might be a define name (e.g.  play music OldTime)
-        all_defines = ctx._get_all_workspace_defines()
-        # Try the raw text after channel as a define name
-        if filename in all_defines:
-            return [_make_node_location(u, d) for u, d in all_defines[filename]]
-        # Also try with "audio." prefix (common Ren'Py convention)
-        audio_prefixed = f"audio.{filename}"
-        if audio_prefixed in all_defines:
-            return [_make_node_location(u, d) for u, d in all_defines[audio_prefixed]]
-        return None
-
-    if isinstance(node, QueueMusic):
-        filename = node.filename.strip()
-        if filename:
-            resolved = ctx._resolve_renpy_file(filename, source_uri=source_uri)
-            if resolved:
-                return _make_file_location(resolved)
-        # filename might be a define name
-        all_defines = ctx._get_all_workspace_defines()
-        if filename in all_defines:
-            return [_make_node_location(u, d) for u, d in all_defines[filename]]
-        # Also try with "audio." prefix
-        audio_prefixed = f"audio.{filename}"
-        if audio_prefixed in all_defines:
-            return [_make_node_location(u, d) for u, d in all_defines[audio_prefixed]]
-        return None
+    if isinstance(node, (PlayMusic, QueueMusic)):
+        names = node.filenames or ([node.filename.strip()] if node.filename else [])
+        return _resolve_audio_names(names, source_uri, line_text, col)
 
     # ── ImageDef with expression → try to open the image file ──
     if isinstance(node, ImageDef) and node.expression:
@@ -796,7 +803,7 @@ def hover(ls: LanguageServer, params: types.HoverParams) -> Optional[types.Hover
     # 0) Media preview for show/scene/image/play/queue/voice lines.
     if word:
         _ast0, parser0 = ctx._get_parse(uri)
-        media = _media_preview_hover(uri, parser0, params.position.line, line_text)
+        media = _media_preview_hover(uri, parser0, params.position.line, line_text, word)
         if media is not None:
             return media
 
@@ -1600,7 +1607,7 @@ def _resolve_image_files(image_name: str, source_uri: str) -> List[str]:
 
 
 def _media_preview_hover(
-    uri: str, parser, line0: int, line_text: str
+    uri: str, parser, line0: int, line_text: str, word: str = ""
 ) -> Optional[types.Hover]:
     """Hover with an image preview or an audio/video preview link for
     ``show``/``scene``/``image``/``play``/``queue``/``voice`` lines."""
@@ -1632,33 +1639,59 @@ def _media_preview_hover(
     else:
         m = re.match(r"(?:play|queue|voice)\s+", stripped, re.IGNORECASE)
         if m:
-            fm = _MEDIA_FILE_RE.search(stripped)
-            resolved = None
-            if fm:
+            # Every quoted media path on the line — a play/queue file list
+            # can name several (``play music [ "a.ogg", "b.ogg" ]``).
+            resolved_any = False
+            for fm in _MEDIA_FILE_RE.finditer(stripped):
                 resolved = ctx._resolve_renpy_file(fm.group(1), source_uri=uri)
-            else:
-                # ``play music <name>`` → audio.<name> define.
-                token = re.match(
-                    r"(?:play|queue)\s+\w+\s+([\w.]+)", stripped, re.IGNORECASE
-                )
-                if token and token.group(1).lower() not in ("fadein", "fadeout"):
-                    defines = ctx._get_all_workspace_defines()
-                    audio_name = token.group(1)
-                    entries = defines.get(
-                        f"audio.{audio_name}"
-                    ) or defines.get(audio_name)
-                    if entries:
-                        expr = getattr(entries[0][1], "expression", "") or ""
-                        fm2 = _MEDIA_FILE_RE.search(expr)
-                        if fm2:
-                            resolved = ctx._resolve_renpy_file(
-                                fm2.group(1), source_uri=entries[0][0]
-                            )
-            if resolved:
+                if not resolved:
+                    continue
+                resolved_any = True
                 if _AUDIO_EXT_RE.search(resolved):
                     parts.append(_preview_media_command(Path(resolved).as_uri(), "audio"))
                 elif _VIDEO_EXT_RE.search(resolved):
                     parts.append(_preview_media_command(Path(resolved).as_uri(), "video"))
+            if not resolved_any:
+                # No literal path — try define names: the token right after
+                # the channel (``play music <name>``) or the word under the
+                # cursor (an item inside ``[…]``, e.g. a bare variable).
+                token = re.match(
+                    r"(?:play|queue)\s+\w+\s+([\w.]+)", stripped, re.IGNORECASE
+                )
+                candidates = [word] if word else []
+                if token and token.group(1) not in candidates:
+                    candidates.append(token.group(1))
+                defines = ctx._get_all_workspace_defines()
+                for audio_name in candidates:
+                    if audio_name.lower() in ("fadein", "fadeout", "loop", "noloop"):
+                        continue
+                    entries = defines.get(
+                        f"audio.{audio_name}"
+                    ) or defines.get(audio_name)
+                    if not entries:
+                        continue
+                    expr = getattr(entries[0][1], "expression", "") or ""
+                    fm2 = _MEDIA_FILE_RE.search(expr)
+                    if fm2:
+                        resolved = ctx._resolve_renpy_file(
+                            fm2.group(1), source_uri=entries[0][0]
+                        )
+                        if resolved:
+                            resolved_any = True
+                            if _AUDIO_EXT_RE.search(resolved):
+                                parts.append(
+                                    _preview_media_command(
+                                        Path(resolved).as_uri(), "audio"
+                                    )
+                                )
+                            elif _VIDEO_EXT_RE.search(resolved):
+                                parts.append(
+                                    _preview_media_command(
+                                        Path(resolved).as_uri(), "video"
+                                    )
+                                )
+                    if resolved_any:
+                        break
 
     if not parts:
         return None
