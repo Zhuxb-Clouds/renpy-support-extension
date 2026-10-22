@@ -609,6 +609,29 @@ _STATEMENT_KEYWORDS = frozenset(
 # against an unclosed bracket swallowing the rest of a huge file.
 _MAX_CONTINUATION_LINES = 400
 
+# A say statement possibly carrying image attributes: ``e "text"``,
+# ``e happy "text"``, ``e"text"`` …  The speaker need not be a known keyword,
+# so statement-lookahead has to match these structurally.
+_RE_SAY_LIKE = re.compile(
+    r'^\w+(?:\s+[\w.@]+)*\s*(?:"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\')'
+    r'(?:\s+with\s+\w+)?$'
+)
+
+
+def _looks_like_statement(line: str) -> bool:
+    """Heuristic: does *line* plausibly start a new Ren'Py statement?
+
+    Only used to abandon a string continuation whose quote was never closed
+    while the user is editing: real dialogue content does not start with
+    ``$``, a statement keyword, or a complete quoted say statement.
+    """
+    if line.startswith("$"):
+        return True
+    first = _RE_FIRST_WORD.match(line)
+    if first and first.group(0) in _STATEMENT_KEYWORDS:
+        return True
+    return bool(_RE_SAY_LIKE.match(line) or _RE_NARRATOR.match(line))
+
 
 # ──────────────────────────── Parser ─────────────────────────────────────
 
@@ -774,11 +797,18 @@ class RpyParser:
         bracket or string.  Returns the joined text (and advances
         ``self.pos``), or ``None`` when *content* is already complete.
 
-        A continuation is abandoned — and the first line parsed on its own,
-        with a parse error — when a following line dedents below the
-        statement, or sits at the statement's own indent while looking like
-        a complete statement itself.  That keeps a half-typed ``$ f(`` from
+        A *bracket* continuation is abandoned — and the first line parsed on
+        its own, with a parse error — when a following line dedents below the
+        statement, or sits at the statement's own indent while looking like a
+        complete statement itself.  That keeps a half-typed ``$ f(`` from
         swallowing the rest of the file while the user is editing.
+
+        A *string* continuation follows Ren'Py itself, where a string literal
+        runs until its closing quote across physical lines regardless of
+        indentation: dialogue lines join at any indent (Ren'Py accepts
+        ``e "first\nsecond"`` written on two lines at the same indent).  Only
+        a following line that clearly starts a new statement aborts the join,
+        so a stray unclosed quote is reported instead of eating the file.
         """
         depth, quote = scan_code(content)
         if depth <= 0 and quote is None:
@@ -792,16 +822,25 @@ class RpyParser:
             if not nxt:
                 pos += 1
                 continue
-            nxt_indent = len(nxt_raw) - len(nxt_raw.lstrip())
-            if nxt_indent < indent:
-                break
-            if nxt_indent == indent and nxt[0] not in ")]}":
-                fresh_depth, fresh_quote = scan_code(nxt)
-                if fresh_depth == 0 and fresh_quote is None:
-                    break  # a complete statement of its own
+            if quote is not None:
+                # Inside a string every following line is content, whatever
+                # its indentation — bail only when it clearly opens the next
+                # statement, meaning the quote above was never closed.
+                d, next_quote = scan_code(nxt, quote)
+                if next_quote is not None and _looks_like_statement(nxt):
+                    break
+                quote = next_quote
+            else:
+                nxt_indent = len(nxt_raw) - len(nxt_raw.lstrip())
+                if nxt_indent < indent:
+                    break
+                if nxt_indent == indent and nxt[0] not in ")]}":
+                    fresh_depth, fresh_quote = scan_code(nxt)
+                    if fresh_depth == 0 and fresh_quote is None:
+                        break  # a complete statement of its own
+                d, quote = scan_code(nxt)
             pos += 1
             parts.append(nxt)
-            d, quote = scan_code(nxt, quote)
             depth += d
             if depth <= 0 and quote is None:
                 self.pos = pos

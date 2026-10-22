@@ -183,6 +183,78 @@ def test_multiline_brackets_and_strings_still_join() -> None:
     assert not parser.errors
 
 
+def test_multiline_string_at_statement_indent_joins() -> None:
+    # Real-world dialogue: the quoted text spans physical lines at the
+    # statement's own indent, closing either inline or on its own line.
+    # Ren'Py accepts this (strings run to their closing quote across
+    # newlines), so the parser must join instead of flagging "Unclosed".
+    parser = parse(
+        """
+        lanfan_os_center "
+        因此，这篇文章出现的理由又会是什么呢？\\n{p}
+        ——初版的草稿还要经历许多筛选和修改，我会尽可能将自己能想到的灵感一一列举出来。{p}
+        难道你能证明，自己能写出一本无需多做思考便创作出的精品小说吗？"
+        lanfan_os_center "
+        为此，你才会使用反问句来回避断定命题的责任？\\n{p}
+        无论如何劝说自己，她依旧能感受到自己抽泣的声音越来越大。{p}
+        她试图憋住呼吸，至少不要这么轻易屈服。
+        "
+        """
+    )
+    says = parser._collect(parser.root, Say)
+    assert len(says) == 2
+    assert {s.who for s in says} == {"lanfan_os_center"}
+    assert "精品小说" in says[0].what
+    assert "憋住呼吸" in says[1].what
+    assert not parser.errors
+
+
+def test_multiline_string_closing_quote_may_dedent() -> None:
+    # String content ignores indentation, even for the closing quote.
+    parser = parse(
+        """
+        label start:
+            e "first
+        second"
+            return
+        """
+    )
+    says = parser._collect(parser.root, Say)
+    assert [s.what for s in says] == ["first second"]
+    assert [lb.name for lb in parser.get_all_labels()] == ["start"]
+    assert not parser.errors
+
+
+def test_unclosed_string_does_not_swallow_following_statements() -> None:
+    # A stray unclosed quote is reported, and the following statements
+    # (keyword statement, say line, jump) are still parsed normally.
+    parser = parse(
+        """
+        label start:
+            $ config.foo = "oops
+            show eileen happy
+            e "hello"
+            jump ending
+        label ending:
+            return
+        """
+    )
+    assert [lb.name for lb in parser.get_all_labels()] == ["start", "ending"]
+    assert [j.target for j in parser.get_all_jumps()] == ["ending"]
+    assert parser.errors == [(2, "Unclosed string")]
+
+
+def test_unclosed_string_before_say_line_reports_and_parses_next() -> None:
+    parser = parse(
+        """
+        e "never closed
+        e "next line"
+        """
+    )
+    assert (1, "Unclosed string") in parser.errors
+    assert [s.what for s in parser._collect(parser.root, Say)] == ["next line"]
+
+
 def test_unclosed_bracket_does_not_swallow_the_rest_of_the_file() -> None:
     parser = parse(
         """
