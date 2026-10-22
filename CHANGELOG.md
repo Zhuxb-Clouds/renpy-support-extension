@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.11.3] - 2026-10-22
+
+### Fixed
+
+- **Multi-line quoted dialogue is no longer falsely flagged as "Unclosed string literal".** In Ren'Py, a string literal runs until its closing quote across physical lines, regardless of indentation — so a say statement whose quoted text spans lines at the statement's own indent (closing quote inline, on its own line, even dedented below the statement) is valid script. The parser's same-indent continuation bailout, designed for half-typed bracket continuations such as `$ f(`, no longer applies while a quote is open: continuation lines join as string content at any indentation. The join still aborts when a following line clearly starts a new statement (`$`, a statement keyword, or a complete quoted say line), so a stray unclosed quote keeps being reported at its opening line without swallowing the rest of the file. Bracket continuation behavior is unchanged.
+
 ## [1.11.2] - 2026-10-20
 
 ### Fixed
