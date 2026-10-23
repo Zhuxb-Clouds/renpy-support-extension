@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.11.5] - 2026-10-23
+
+### Added
+
+- **Rename (`F2`) for dotted defines — rename a BGM's name everywhere.** On `define audio.紧张 = …`, its last segment, bare `play`/`queue` file items (`play music 紧张`, including list items) and full-name occurrences (`$ renpy.music.play(audio.紧张)`) across the workspace — the `audio.` prefix, the audio file path inside the value and dialogue prose are untouched. Works from the declaration and from any usage site, for any dotted define (`gui.*`, `config.*` too). Plain non-dotted defines stay non-renamable on purpose: their names can legitimately appear in dialogue text, so a text-scan rename would rewrite prose. When a bare segment names a define of its own (`define 紧张` **and** `define audio.紧张`), bare play items belong to the plain define and are excluded from the audio define's references/rename.
+
 ## [1.11.4] - 2026-10-23
 
 ### Fixed
