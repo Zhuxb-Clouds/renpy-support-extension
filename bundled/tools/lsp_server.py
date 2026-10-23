@@ -1465,7 +1465,11 @@ def _define_reference_locations(
     pattern = re.compile(rf"(?<![\w.]){re.escape(word)}(?!\w)")
     # Bare form of an audio-namespace define: only a play/queue file item is
     # a real usage — a bare word in dialogue or filenames must not match.
+    # When the bare segment names a define/default of its own, the play item
+    # references that plain define instead, so skip the bare form entirely.
     audio_segment = word[len("audio."):] if word.startswith("audio.") else None
+    if audio_segment and (audio_segment in all_defines or audio_segment in all_defaults):
+        audio_segment = None
     audio_pattern = (
         re.compile(rf"(?<![\w.]){re.escape(audio_segment)}(?!\w)")
         if audio_segment
@@ -2048,11 +2052,14 @@ _RE_RENAME_NAME = re.compile(r"^[a-zA-Z_\u4e00-\u9fff\u3400-\u4dbf][\w\u4e00-\u9
 
 
 def _rename_target(ls: LanguageServer, uri: str, position: types.Position):
-    """Resolve the label/screen under the cursor.
+    """Resolve the label/screen/define under the cursor.
 
     Returns ``(kind, full_name, line_text, span)`` where *span* is the
     (start, end) Python column range of the renamable segment — the last
     dotted component, so ``start.sub`` / ``.sub`` rename just ``sub``.
+    For defines only dotted names (``audio.紧张``, ``gui.字体大小``) are
+    renamable: their occurrences are precise tokens, while a plain name
+    can appear in dialogue text and must not be blindly rewritten.
     """
     doc = ls.workspace.get_text_document(uri)
     line_text = doc.lines[position.line] if position.line < len(doc.lines) else ""
@@ -2069,7 +2076,16 @@ def _rename_target(ls: LanguageServer, uri: str, position: types.Position):
     elif full in ctx._get_all_workspace_screens():
         kind = "screen"
     else:
-        return None
+        define_name = (
+            full if "." in full else _audio_define_word(full, parser, position.line)
+        )
+        if define_name and (
+            define_name in ctx._get_all_workspace_defines()
+            or define_name in ctx._get_all_workspace_defaults()
+        ):
+            kind, full = "define", define_name
+        else:
+            return None
     last_dot = word.rfind(".")
     if last_dot >= 0:
         start += last_dot + 1
@@ -2121,11 +2137,14 @@ def _word_boundaries(line: str, col: int) -> Tuple[int, int]:
 def rename(
     ls: LanguageServer, params: types.RenameParams
 ) -> Optional[types.WorkspaceEdit]:
-    """Rename a label or screen — definitions and every reference
-    (statements, ``use``, and ``Jump("…")``-style strings) — workspace-wide.
+    """Rename a label, screen or dotted define — definitions and every
+    reference workspace-wide (statements, ``use``, ``Jump("…")``-style
+    strings; for defines the whole-name occurrences and bare play/queue
+    items of audio-namespace names).
 
-    For a dotted label only the last component is renamed: ``start.sub`` →
-    ``start.new`` and local references ``.sub`` → ``.new``.
+    For a dotted name only the last component is renamed: ``start.sub`` →
+    ``start.new``, local references ``.sub`` → ``.new``, and
+    ``audio.紧张`` → ``audio.新的名字`` (bare play items included).
     """
     uri = params.text_document.uri
     target = _rename_target(ls, uri, params.position)
@@ -2155,6 +2174,18 @@ def rename(
                 new_text=new_segment,
             )
         )
+
+    # Defines/defaults: declaration and occurrences come from the shared
+    # reference scan (locations are LSP UTF-16; add_edit takes Python cols).
+    if kind == "define":
+        for loc in _define_reference_locations(old_full, include_declaration=True) or ():
+            lines = ctx._source_lines(loc.uri)
+            line0 = loc.range.start.line
+            raw = lines[line0] if 0 <= line0 < len(lines) else ""
+            start32 = _utf16_col_to_utf32(raw, loc.range.start.character)
+            end32 = _utf16_col_to_utf32(raw, loc.range.end.character)
+            add_edit(loc.uri, line0 + 1, start32, raw[start32:end32], lines)
+        return types.WorkspaceEdit(changes=edits) if edits else None
 
     definitions = (
         ctx._get_all_workspace_labels() if kind == "label" else ctx._get_all_workspace_screens()

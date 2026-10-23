@@ -264,6 +264,70 @@ def test_word_map_includes_dotted_tokens() -> None:
     assert words["text_size"] == [2]
 
 
+# ── Rename: audio-namespace and dotted defines ──
+
+_EXPECTED_AUDIO_RENAME_EDITS = {
+    ("audio_def.rpy", 0, 13),   # define audio.紧张 — last segment only
+    ("audio_use.rpy", 1, 15),   # play music 紧张
+    ("audio_use.rpy", 2, 29),   # renpy.music.play(audio.紧张) — segment
+    ("audio_use.rpy", 3, 16),   # play music [紧张, …]
+}
+
+
+def _rename_edits(edit) -> set:
+    return {
+        (Path(ctx._path_from_uri(u)).name, e.range.start.line, e.range.start.character)
+        for u, edits in edit.changes.items()
+        for e in edits
+    }
+
+
+def test_rename_audio_define_from_declaration(project) -> None:
+    _add_audio_project_files(project)
+    audio_def = project.game / "audio_def.rpy"
+    params = types.RenameParams(
+        text_document=types.TextDocumentIdentifier(uri=uri_of(audio_def)),
+        position=_position(audio_def, "紧张"),
+        new_name="激烈",
+    )
+    edit = lsp_server.rename(project.ls, params)
+    assert _rename_edits(edit) == _EXPECTED_AUDIO_RENAME_EDITS
+    texts = [e.new_text for es in edit.changes.values() for e in es]
+    assert texts == ["激烈"] * 4
+
+
+def test_rename_audio_define_from_bare_usage(project) -> None:
+    _add_audio_project_files(project)
+    use = project.game / "audio_use.rpy"
+    params = types.RenameParams(
+        text_document=types.TextDocumentIdentifier(uri=uri_of(use)),
+        position=_position(use, "紧张"),
+        new_name="激烈",
+    )
+    # Same edit set as from the declaration — the bare play item resolves
+    # through the audio namespace.
+    assert _rename_edits(lsp_server.rename(project.ls, params)) == (
+        _EXPECTED_AUDIO_RENAME_EDITS
+    )
+
+
+def test_rename_plain_define_is_refused(project) -> None:
+    # Plain (non-dotted) defines can share their name with dialogue words,
+    # so renaming them by text scan is not offered.
+    chapter = project.game / "chapter.rpy"
+    doc = types.TextDocumentIdentifier(uri=uri_of(chapter))
+    position = _position(chapter, "define e", 7)
+    prepare = lsp_server.prepare_rename(
+        project.ls, types.PrepareRenameParams(text_document=doc, position=position)
+    )
+    assert prepare is None
+    edit = lsp_server.rename(
+        project.ls,
+        types.RenameParams(text_document=doc, position=position, new_name="m"),
+    )
+    assert edit is None
+
+
 def test_rename_label_edits_every_reference_exactly_once(project) -> None:
     chapter = project.game / "chapter.rpy"
     params = types.RenameParams(
