@@ -480,6 +480,14 @@ def goto_definition(
         # Screen definition → show all call/show/hide screen and use usages
         if isinstance(node, ScreenDef):
             return _dedup_locations(_ref_locations("screen", node.name)) or None
+        # Define / default definition → show all usages, like labels and
+        # screens (jumping to the definition itself would be a no-op).
+        # Only when the cursor is on the name — clicking into the value
+        # still resolves the referenced file (step 2).
+        if isinstance(node, (Define, Default)) and node.name == word:
+            usages = _define_reference_locations(node.name, include_declaration=False)
+            if usages:
+                return usages
 
     # ── 1) AST-based resolution: find node at cursor line ──
     for node in nodes:
@@ -1406,6 +1414,102 @@ def format_document(ls: LanguageServer, params: types.DocumentFormattingParams):
 
 # ─────────────────────── Find All References ─────────────────────────────
 
+# ``play <channel> <file…>`` / ``queue <channel> <file…>`` head — the only
+# place where Ren'Py resolves a bare name through the audio namespace.
+_RE_PLAY_OR_QUEUE_LINE = re.compile(r"^\s*(?:play|queue)\s+\S+\s")
+
+
+def _audio_define_word(word: str, parser, line0: int) -> Optional[str]:
+    """``audio.{word}`` when the cursor is on a bare file item of a
+    play/queue statement and only the audio-namespace define exists.
+
+    Ren'Py's audio namespace means ``play music foo`` reads the define
+    ``audio.foo``; the bare item should resolve to it (references, rename)
+    unless ``foo`` is itself defined.
+    """
+    if not word or "." in word:
+        return None
+    all_defines = ctx._get_all_workspace_defines()
+    if word in all_defines or word in ctx._get_all_workspace_defaults():
+        return None
+    for node in _find_nodes_at_line(parser, line0 + 1):
+        if isinstance(node, (PlayMusic, QueueMusic)) and word in (node.filenames or ()):
+            if f"audio.{word}" in all_defines:
+                return f"audio.{word}"
+    return None
+
+
+def _define_reference_locations(
+    word: str, include_declaration: bool
+) -> Optional[List[types.Location]]:
+    """All references to the ``define``/``default`` name *word* workspace-wide.
+
+    Covers the declaration (optionally), whole-name occurrences (dotted names
+    like ``audio.紧张`` or ``gui.text_size`` match as written), and — for
+    audio-namespace defines — bare items of play/queue statements.  Returns
+    None when *word* is not a define/default name.
+    """
+    all_defines = ctx._get_all_workspace_defines()
+    all_defaults = ctx._get_all_workspace_defaults()
+    if word not in all_defines and word not in all_defaults:
+        return None
+
+    results: List[types.Location] = []
+    decl_lines: set = set()
+    for defs in (all_defines.get(word, ()), all_defaults.get(word, ())):
+        for def_uri, d in defs:
+            decl_lines.add((ctx._normalize_path_key(ctx._path_from_uri(def_uri)), d.lineno))
+            if include_declaration:
+                results.append(_make_node_location(def_uri, d))
+
+    pattern = re.compile(rf"(?<![\w.]){re.escape(word)}(?!\w)")
+    # Bare form of an audio-namespace define: only a play/queue file item is
+    # a real usage — a bare word in dialogue or filenames must not match.
+    audio_segment = word[len("audio."):] if word.startswith("audio.") else None
+    audio_pattern = (
+        re.compile(rf"(?<![\w.]){re.escape(audio_segment)}(?!\w)")
+        if audio_segment
+        else None
+    )
+    for fp in ctx._get_workspace_rpy_files():
+        file_uri, _file_ast, file_parser = ctx._get_parse_for_file(fp)
+        word_lines = ctx._file_word_lines(file_uri)
+        line_numbers = set(word_lines.get(word, ()))
+        if audio_pattern:
+            line_numbers.update(word_lines.get(audio_segment, ()))
+        if not line_numbers:
+            continue
+        norm = ctx._normalize_path_key(fp)
+        file_lines = file_parser.lines
+        for lineno in sorted(line_numbers):
+            if (norm, lineno) in decl_lines or lineno > len(file_lines):
+                continue
+            raw = file_lines[lineno - 1]
+            for m in pattern.finditer(raw):
+                results.append(
+                    types.Location(
+                        uri=file_uri,
+                        range=ctx._make_range(
+                            file_uri, lineno, m.start(), len(word), lines=file_lines
+                        ),
+                    )
+                )
+            if audio_pattern and _RE_PLAY_OR_QUEUE_LINE.match(raw):
+                for m in audio_pattern.finditer(raw):
+                    results.append(
+                        types.Location(
+                            uri=file_uri,
+                            range=ctx._make_range(
+                                file_uri,
+                                lineno,
+                                m.start(),
+                                len(audio_segment),
+                                lines=file_lines,
+                            ),
+                        )
+                    )
+    return _dedup_ranges(results) or None
+
 
 @LSP_SERVER.feature(types.TEXT_DOCUMENT_REFERENCES)
 def find_references(
@@ -1437,39 +1541,14 @@ def find_references(
             results.extend(_ref_locations(kind, word))
             return _dedup_ranges(results) or None
 
-    # Defines / defaults: whole-word occurrences, served from the per-file
-    # word map (open buffers included) instead of re-reading every file.
-    all_defines = ctx._get_all_workspace_defines()
-    all_defaults = ctx._get_all_workspace_defaults()
-    if word in all_defines or word in all_defaults:
-        decl_lines = set()
-        for defs in (all_defines.get(word, ()), all_defaults.get(word, ())):
-            for def_uri, d in defs:
-                decl_lines.add((ctx._normalize_path_key(ctx._path_from_uri(def_uri)), d.lineno))
-                if include_decl:
-                    results.append(_make_node_location(def_uri, d))
-        pattern = re.compile(rf"(?<![\w.]){re.escape(word)}(?!\w)")
-        for fp in ctx._get_workspace_rpy_files():
-            file_uri, _file_ast, file_parser = ctx._get_parse_for_file(fp)
-            line_numbers = ctx._file_word_lines(file_uri).get(word)
-            if not line_numbers:
-                continue
-            norm = ctx._normalize_path_key(fp)
-            file_lines = file_parser.lines
-            for lineno in sorted(set(line_numbers)):
-                if (norm, lineno) in decl_lines or lineno > len(file_lines):
-                    continue
-                raw = file_lines[lineno - 1]
-                for m in pattern.finditer(raw):
-                    results.append(
-                        types.Location(
-                            uri=file_uri,
-                            range=ctx._make_range(
-                                file_uri, lineno, m.start(), len(word), lines=file_lines
-                            ),
-                        )
-                    )
-        return _dedup_ranges(results) or None
+    # Defines / defaults: declaration plus whole-word occurrences, served
+    # from the per-file word map (open buffers included) instead of
+    # re-reading every file.  A bare play/queue file item resolves through
+    # Ren'Py's audio namespace (``play music foo`` → ``define audio.foo``).
+    target = _audio_define_word(word, parser, pos.line) or word
+    define_locs = _define_reference_locations(target, include_decl)
+    if define_locs is not None:
+        return define_locs
 
     return None
 

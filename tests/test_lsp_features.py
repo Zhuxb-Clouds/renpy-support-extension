@@ -150,6 +150,120 @@ def test_goto_on_label_definition_lists_usages_once(project) -> None:
     assert len(locations) == 3 == len(_spans(locations))
 
 
+# ── Define references: dotted names and the audio namespace ──
+
+_AUDIO_DEFINE = (
+    'define audio.紧张 = "<from 0 to 50>audio/music/紧张的的对峙.wav" # 1\n'
+)
+
+
+def _add_audio_project_files(project) -> None:
+    (project.game / "audio_def.rpy").write_text(_AUDIO_DEFINE, encoding="utf-8")
+    (project.game / "audio_use.rpy").write_text(
+        "label soundtest:\n"
+        "    play music 紧张\n"
+        '    $ renpy.music.play(audio.紧张)\n'
+        '    play music [紧张, "<silence 1>"]\n'
+        '    "他看起来很紧张。"\n',
+        encoding="utf-8",
+    )
+
+
+def test_references_for_audio_namespace_define(project) -> None:
+    _add_audio_project_files(project)
+    audio_def = project.game / "audio_def.rpy"
+    params = types.ReferenceParams(
+        text_document=types.TextDocumentIdentifier(uri=uri_of(audio_def)),
+        position=_position(audio_def, "紧张"),
+        context=types.ReferenceContext(include_declaration=True),
+    )
+    spans = _spans(lsp_server.find_references(project.ls, params))
+    assert spans == {
+        ("audio_def.rpy", 0, 7, 15),     # define audio.紧张 (declaration)
+        ("audio_use.rpy", 1, 15, 17),    # play music 紧张
+        ("audio_use.rpy", 2, 23, 31),    # renpy.music.play(audio.紧张)
+        ("audio_use.rpy", 3, 16, 18),    # play music [紧张, …]
+    }
+
+
+def test_references_for_audio_define_from_bare_usage(project) -> None:
+    _add_audio_project_files(project)
+    use = project.game / "audio_use.rpy"
+    params = types.ReferenceParams(
+        text_document=types.TextDocumentIdentifier(uri=uri_of(use)),
+        position=_position(use, "紧张"),
+        context=types.ReferenceContext(include_declaration=True),
+    )
+    # Same full set as from the declaration — bare play/queue items resolve
+    # through the audio namespace.
+    spans = _spans(lsp_server.find_references(project.ls, params))
+    assert spans == {
+        ("audio_def.rpy", 0, 7, 15),
+        ("audio_use.rpy", 1, 15, 17),
+        ("audio_use.rpy", 2, 23, 31),
+        ("audio_use.rpy", 3, 16, 18),
+    }
+
+
+def test_references_for_audio_define_ignores_prose_mentions(project) -> None:
+    _add_audio_project_files(project)
+    use = project.game / "audio_use.rpy"
+    params = types.ReferenceParams(
+        text_document=types.TextDocumentIdentifier(uri=uri_of(use)),
+        position=_position(use, "他看起来很紧张"),
+        context=types.ReferenceContext(include_declaration=True),
+    )
+    assert lsp_server.find_references(project.ls, params) is None
+
+
+def test_references_for_dotted_define_across_files(project) -> None:
+    (project.game / "gui_def.rpy").write_text(
+        "define gui.字体大小 = 22\n", encoding="utf-8"
+    )
+    (project.game / "gui_use.rpy").write_text(
+        "init python:\n    if gui.字体大小 > 20:\n        pass\n", encoding="utf-8"
+    )
+    gui_def = project.game / "gui_def.rpy"
+    params = types.ReferenceParams(
+        text_document=types.TextDocumentIdentifier(uri=uri_of(gui_def)),
+        position=_position(gui_def, "gui.字体大小"),
+        context=types.ReferenceContext(include_declaration=True),
+    )
+    spans = _spans(lsp_server.find_references(project.ls, params))
+    assert spans == {
+        ("gui_def.rpy", 0, 7, 15),
+        ("gui_use.rpy", 1, 7, 15),
+    }
+
+
+def test_goto_on_define_definition_lists_usages(project) -> None:
+    _add_audio_project_files(project)
+    audio_def = project.game / "audio_def.rpy"
+    params = types.DefinitionParams(
+        text_document=types.TextDocumentIdentifier(uri=uri_of(audio_def)),
+        position=_position(audio_def, "紧张"),
+    )
+    # Like labels/screens: ctrl+click on the definition shows usages, never
+    # a self-referential jump.
+    spans = _spans(lsp_server.goto_definition(project.ls, params))
+    assert spans == {
+        ("audio_use.rpy", 1, 15, 17),
+        ("audio_use.rpy", 2, 23, 31),
+        ("audio_use.rpy", 3, 16, 18),
+    }
+
+
+def test_word_map_includes_dotted_tokens() -> None:
+    words = ctx._word_map_from_text(
+        'define audio.紧张 = "audio/music/紧张的的对峙.wav" # 1\nif gui.text_size:\n'
+    )
+    assert words["audio.紧张"] == [1]
+    assert words["gui.text_size"] == [2]
+    # Bare tokens are still emitted for the non-dotted lookups.
+    assert words["紧张"] == [1]
+    assert words["text_size"] == [2]
+
+
 def test_rename_label_edits_every_reference_exactly_once(project) -> None:
     chapter = project.game / "chapter.rpy"
     params = types.RenameParams(

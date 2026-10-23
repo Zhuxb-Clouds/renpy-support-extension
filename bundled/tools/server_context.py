@@ -728,11 +728,27 @@ _word_map_cache: Dict[str, Tuple[int, Dict[str, List[int]]]] = {}
 _ENGINE_READ_NAMES = {"save_name"}
 
 
+# Dotted name runs (``audio.紧张``, ``gui.text_size``) on top of the bare
+# ``\w+`` tokens — the find-references prefilter looks names like
+# ``audio.foo`` up verbatim, and ``\w+`` alone would split them apart.
+_RE_DOTTED_TOKEN = re.compile(r"\w+(?:\.\w+)+")
+
+
 def _word_map_from_text(text: str) -> Dict[str, List[int]]:
-    """Word → 1-based line numbers for *text* (pure)."""
+    """Word → 1-based line numbers for *text* (pure).
+
+    Emits both bare ``\\w+`` tokens and dotted runs (``gui.text_size``),
+    so callers can prefilter lines for a dotted name as written.
+    """
     words: Dict[str, List[int]] = {}
     for lineno, line in enumerate(text.splitlines(), start=1):
         for word in re.findall(r"\w+", line):
+            lines_for_word = words.get(word)
+            if lines_for_word is None:
+                words[word] = [lineno]
+            else:
+                lines_for_word.append(lineno)
+        for word in _RE_DOTTED_TOKEN.findall(line):
             lines_for_word = words.get(word)
             if lines_for_word is None:
                 words[word] = [lineno]
