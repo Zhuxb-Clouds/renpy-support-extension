@@ -1,8 +1,10 @@
 # Changelog
 
-## [Unreleased]
+## [1.11.4] - 2026-10-23
 
 ### Fixed
+
+- **Find-references and Ctrl+click now work for dotted defines (`audio.*`, `gui.*`, `config.*`).** The line prefilter tokenized on `.` so a name like `audio.紧张` (or `gui.text_size`) never matched any file — references returned only the declaration, and Ctrl+clicking the define's own name was a silent no-op self-jump. The word map now indexes dotted names as written, so references cover whole-name occurrences across files (`$ renpy.music.play(audio.紧张)`, `if gui.text_size > 20`). For Ren'Py's audio namespace, bare items of `play`/`queue` statements (`play music 紧张` with `define audio.紧张 = …`, including list items) resolve to the define from both directions: find-references from either side returns the full set. Ctrl+click on a define/default's own name now lists its usages, matching the existing label/screen behavior. Bare words in dialogue or filenames are never treated as audio references.
 
 - **`play`/`queue` file lists are no longer flagged as "Unrecognized statement".** The audio statements accept a bracketed list of files — `play sound_0 [ sfx_page_turn, "<silence 5>" ] loop`, the standard `play music [ "a.ogg", "b.ogg" ] fadein 1.0`, and the same form on `queue` — mixing quoted filenames, bare variables (resolved via `define audio.*` or plain defines) and audio tags like `<silence 5>`. Lists may span multiple lines, and an unclosed `[` mid-edit degrades gracefully instead of stacking a second parse error. Inside a list: audio-define completion after `[` or a comma, hover with the audio preview link on a variable item, and go-to-definition jumping to the item under the cursor.
 
