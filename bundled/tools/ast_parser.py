@@ -425,11 +425,14 @@ class Unknown(Node):
 _RE_LABEL = re.compile(
     r"^label\s+(\.?[a-zA-Z_\u4e00-\u9fff\u3400-\u4dbf][\w.]*)\s*(?:\((.*)\))?\s*:$"
 )
+# Both statements accept an optional signed init priority between the
+# keyword and the name (``define -1 x = 1``); ``define`` also allows the
+# ``+=``/``|=`` operators (renpy/parser.py define_statement).
 _RE_DEFINE = re.compile(
-    r"^define\s+([a-zA-Z_\u4e00-\u9fff\u3400-\u4dbf][\w.]*)\s*=\s*(.+)$"
+    r"^define\s+(?:[+-]?\d+\s+)?([a-zA-Z_\u4e00-\u9fff\u3400-\u4dbf][\w.]*)\s*(?:\+=|\|=|=)\s*(.+)$"
 )
 _RE_DEFAULT = re.compile(
-    r"^default\s+([a-zA-Z_\u4e00-\u9fff\u3400-\u4dbf][\w.]*)\s*=\s*(.+)$"
+    r"^default\s+(?:[+-]?\d+\s+)?([a-zA-Z_\u4e00-\u9fff\u3400-\u4dbf][\w.]*)\s*=\s*(.+)$"
 )
 _RE_IMAGE = re.compile(
     r"^image\s+([\w\u4e00-\u9fff\u3400-\u4dbf\-][\w\u4e00-\u9fff\u3400-\u4dbf\- ]*?)\s*(?:=\s*(.+)|:)\s*$"

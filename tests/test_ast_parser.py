@@ -73,6 +73,37 @@ def test_parser_collects_core_symbols_and_skips_screen_atl_bodies() -> None:
     assert cameras[0].with_transition == "dissolve"
 
 
+def test_define_default_with_priority_and_operators() -> None:
+    # renpy/parser.py lets both statements take an optional signed init
+    # priority (``define -1 x = 1``) and lets ``define`` use ``+=``/``|=``.
+    parser = parse(
+        """
+        define -1 mm_writeon_fps = 60.0
+        define +2 late_var = "late"
+        define counter += 1
+        define flags |= 4
+        default -1 early_default = False
+        label start:
+            return
+        """
+    )
+
+    assert parser.errors == []
+    assert [d.name for d in parser.get_all_defines()] == [
+        "mm_writeon_fps",
+        "late_var",
+        "counter",
+        "flags",
+    ]
+    assert [d.expression for d in parser.get_all_defines()] == [
+        "60.0",
+        '"late"',
+        "1",
+        "4",
+    ]
+    assert [d.name for d in parser.get_all_defaults()] == ["early_default"]
+
+
 def test_show_as_clause_is_not_part_of_at_transform() -> None:
     parser = parse(
         """
