@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.11.6] - 2026-10-28
+
+### Fixed
+
+- **`define`/`default` with an init priority are no longer flagged as "Unrecognized statement".** Ren'Py lets both statements carry an optional signed priority between the keyword and the name — `define -1 mm_writeon_fps = 60.0`, `define +2 late_var = …` — which wraps the statement in an init block of that priority (negative priorities run earlier). The parsed name and expression are unchanged, so references, hover, completion and F2 rename behave exactly as for priority-less defines. `define` additionally accepts the `+=` and `|=` operators (`define counter += 1`), matching `renpy/parser.py`; `default` still requires plain `=`.
+
 ## [1.11.5] - 2026-10-23
 
 ### Added
