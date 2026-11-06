@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.11.7] - 2026-11-06
+
+### Fixed
+
+- **Formatter no longer splits scientific-notation literals — `1e-3` stopped producing "invalid decimal literal" errors.** The expression-spacing normalizer looked only at the characters around a `-`/`+` to decide binary vs. unary, so the exponent sign of `1e-3` (prev `e`, next `3`) was classified as a binary minus and spaced out into `1e - 3` — which Ren'Py rejects with *invalid decimal literal* (same for `2.5E+4`). A mantissa-boundary check now detects the exponent sign (`1e-3`, `2.5E+4`, `.5e-2`) and binds it tightly to the mantissa; formatting an already-mangled `1e - 3` repairs it back to `1e-3`. Hex digits (`0x1e - 3` stays a subtraction) and identifiers whose trailing digits are part of the name (`matrix1e - 3`) are excluded via a lookbehind, and string/comment content is untouched.
+
 ## [1.11.6] - 2026-10-28
 
 ### Fixed
