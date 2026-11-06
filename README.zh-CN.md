@@ -44,9 +44,12 @@
 | `Ren'Py LSP: Stop Language Server`    | 停止语言服务器                 |
 | `Ren'Py LSP: Restart Language Server` | 重启语言服务器                 |
 | `Ren'Py LSP: Format All Ren'Py Files` | 格式化工作区中所有 `.rpy` 文件 |
+| `Ren'Py LSP: Refresh Workspace Cache` | 强制语言服务器重建工作区索引 |
+| `Ren'Py LSP: Show Project Statistics` | 显示项目的文件、行数、标签与界面数量统计 |
 | `Ren'Py LSP: Show Translation Report` | 按语言显示翻译覆盖率 |
 | `Ren'Py LSP: Run Ren'Py Lint` | 运行 Ren'Py SDK 的 lint（需设置 `renpy-lsp.sdkPath`） |
 | `Ren'Py LSP: Launch Project` | 通过 SDK 启动游戏 |
+| `Ren'Py LSP: Preview Media` | 打开媒体文件的音频/视频预览（悬停预览链接即调用此命令） |
 
 ## 设置
 

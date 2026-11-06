@@ -44,9 +44,12 @@ Open Command Palette (`Ctrl+Shift+P` / `Cmd+Shift+P`) and type:
 | `Ren'Py LSP: Stop Language Server` | Stop the LSP server |
 | `Ren'Py LSP: Restart Language Server` | Restart the LSP server |
 | `Ren'Py LSP: Format All Ren'Py Files` | Format all `.rpy` files in workspace |
+| `Ren'Py LSP: Refresh Workspace Cache` | Force the server to re-index the workspace |
+| `Ren'Py LSP: Show Project Statistics` | File / line / label / screen counts for the project |
 | `Ren'Py LSP: Show Translation Report` | Per-language translation coverage |
 | `Ren'Py LSP: Run Ren'Py Lint` | Run the Ren'Py SDK lint (requires `renpy-lsp.sdkPath`) |
 | `Ren'Py LSP: Launch Project` | Launch the game via the SDK launcher |
+| `Ren'Py LSP: Preview Media` | Open the audio/video preview for a media file (hover preview links call this) |
 
 ## Settings
 
