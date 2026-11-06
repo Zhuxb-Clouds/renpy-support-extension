@@ -1123,6 +1123,33 @@ def _collapse_image_name_dashes(text: str) -> str:
     return re.sub(r"\s*-\s*", "-", text)
 
 
+# A number literal ending in an exponent marker (``1e``, ``2.5E``, ``.5e``).
+# The lookbehind keeps hex digits (``0x1e``) and identifiers whose trailing
+# digits are part of the name (``matrix1e``) out of the match.
+_EXPONENT_LITERAL_RE = re.compile(
+    r"(?<![A-Za-z_])(?:\d[\d_]*(?:\.[\d_]*)?|\.\d[\d_]*)[eE]\Z"
+)
+
+
+def _at_exponent_sign(text: str, i: int) -> bool:
+    """True when the ``+``/``-`` at index *i* is the exponent sign of a
+    scientific-notation literal such as ``1e-3`` or ``2.5E+4``.
+
+    A space between mantissa and sign (``1e - 3``) is also accepted so the
+    formatter can repair its own previously mangled output; no valid
+    expression contains a number ending in ``e`` followed by a signed digit.
+    """
+    before = text[:i].rstrip(" \t")
+    if not before or before[-1] not in "eE":
+        return False
+    if not _EXPONENT_LITERAL_RE.search(before):
+        return False
+    j = i + 1
+    while j < len(text) and text[j] in " \t":
+        j += 1
+    return j < len(text) and text[j].isdigit()
+
+
 def _normalize_expression_spacing(text: str) -> str:
     """Normalize common expression spacing outside strings and comments."""
     result: List[str] = []
@@ -1252,6 +1279,14 @@ def _normalize_expression_spacing(text: str) -> str:
                 continue
 
         if ch in "+-*/%":
+            if ch in "+-" and _at_exponent_sign(text, i):
+                # Exponent sign of a scientific literal: bind it tightly to
+                # the mantissa, repairing an already split ``1e - 3``.
+                while result and result[-1] in " \t":
+                    result.pop()
+                result.append(ch)
+                i = _skip_following_spaces(i + 1)
+                continue
             prev_ch = _prev_significant()
             next_ch = _next_significant(i + 1)
             if _can_be_binary_operator(ch, prev_ch, next_ch):

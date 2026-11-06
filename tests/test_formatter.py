@@ -479,3 +479,36 @@ def test_format_tightens_splat_and_unary_operators() -> None:
         '    show char at center\n'
         '    $ camera_pos = pos (45, -400)\n'
     )
+
+
+def test_normalize_expression_spacing_keeps_scientific_notation_intact() -> None:
+    # Regression: the exponent sign of a scientific-notation literal was
+    # treated as a binary ``-``/``+``, splitting ``1e-3`` into the invalid
+    # ``1e - 3`` (a Ren'Py "invalid decimal literal" parse error).
+    assert (
+        lsp_server._normalize_expression_spacing(
+            "d_eff = dist if dist > 1e-3 else 1e-3"
+        )
+        == "d_eff = dist if dist > 1e-3 else 1e-3"
+    )
+    assert lsp_server._normalize_expression_spacing("$ v = 2.5E+4") == "$ v = 2.5E+4"
+    assert lsp_server._normalize_expression_spacing("$ x = .5e-2") == "$ x = .5e-2"
+
+
+def test_normalize_expression_spacing_repairs_split_scientific_notation() -> None:
+    # Already-mangled output is repaired back into a valid literal.
+    assert (
+        lsp_server._normalize_expression_spacing(
+            "d_eff = dist if dist > 1e - 3 else 1e - 3"
+        )
+        == "d_eff = dist if dist > 1e-3 else 1e-3"
+    )
+
+
+def test_normalize_expression_spacing_keeps_binary_minus_after_e_names() -> None:
+    # Hex digits and identifiers ending in digits + 'e' are not exponents.
+    assert lsp_server._normalize_expression_spacing("$ a = 0x1e - 3") == "$ a = 0x1e - 3"
+    assert (
+        lsp_server._normalize_expression_spacing("$ b = matrix1e - 3")
+        == "$ b = matrix1e - 3"
+    )
